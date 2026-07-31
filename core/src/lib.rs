@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
 
+pub mod device;
 pub mod error;
 pub mod luks;
 pub mod secret;
