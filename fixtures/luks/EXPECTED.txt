@@ -1,0 +1,340 @@
+# Ground truth from real cryptsetup. Compared against our parser in
+# core/tests/luks2_real_fixtures.rs
+# cryptsetup 2.7.0 flags: UDEV BLKID KEYRING FIPS KERNEL_CAPI HW_OPAL 
+# password: test
+
+=== luks2-argon2id-512 ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	f0778ad1-e26b-4133-982e-8edb8f3e8eee
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 512 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       26 e4 40 0f e0 6b c0 c4 06 bd ea 08 81 6c 29 55 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       1d 27 62 61 2f a0 2b a0 0b 89 6d 4e 8f 61 54 dd 
+	Digest:     52 e2 99 c5 11 ec 01 eb 88 59 b2 0a 2f 54 77 2b 
+
+=== luks2-argon2id-4096 ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	de61af96-4136-41bb-ae95-678bbaa2c372
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       65 5a 04 4d f5 3b ee 00 15 1b dd 0a ac 30 72 de 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       2c 2c 5b cd c7 c2 bc 1e b9 10 4c c8 5c 0b d1 08 
+	Digest:     93 3b fd 9b 45 4c f4 ee 02 67 b7 4f 41 8c 6a 86 
+
+=== luks2-argon2i ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	f48804e0-139f-4137-a030-3aff69c46e2a
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2i
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       c7 f3 72 9d a3 45 8d 18 83 08 90 98 34 21 14 4c 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       f8 0d d0 70 3c e9 3e a4 30 df 33 59 5f 45 dc d9 
+	Digest:     eb 1b da 79 3e ce a3 1b 61 cb 4b 44 d7 91 35 54 
+
+=== luks2-pbkdf2 ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	bd26383d-f455-444e-a664-738cd0d06dea
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       4a b7 6b e8 95 d9 aa 1c 5a ea bb c7 30 ae 8c ea 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       43 9d 74 87 56 73 49 7c 27 a7 29 7f d6 1d 5b e9 
+	Digest:     5c be b9 9c 45 b2 84 79 17 bc ad fc 0d af 19 ba 
+
+=== luks2-metadata-64k ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	65536 [bytes]
+Keyslots area: 	16646144 [bytes]
+UUID:          	792cfbc4-0a1a-4bcf-95c0-902d2c538b99
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       1d e2 81 24 70 ae 44 91 a9 96 29 2b 61 c5 7c 80 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:131072 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       c6 30 39 ae 6f 4b 49 16 4a 44 6a 78 13 8e f4 d1 
+	Digest:     28 ce 7e 74 85 b2 0c 97 5e d1 ff ad 97 16 32 f1 
+
+=== luks2-cbc-essiv ===
+LUKS header information
+Version:       	2
+Epoch:         	3
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	deb9fabf-8ba7-4f86-b717-058f21fddf58
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-cbc-essiv:sha256
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        256 bits
+	Priority:   normal
+	Cipher:     aes-cbc-essiv:sha256
+	Cipher key: 256 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       e6 73 0c 8d c9 5e f5 ab 49 09 09 b4 70 53 ea 18 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:131072 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       22 dd 63 88 8d 80 ff 72 28 cf a0 a4 62 fc 56 71 
+	Digest:     49 50 b2 10 91 4d ef 12 1e 0b d1 36 35 ea 02 2e 
+
+=== luks2-two-keyslots ===
+LUKS header information
+Version:       	2
+Epoch:         	4
+Metadata area: 	16384 [bytes]
+Keyslots area: 	16744448 [bytes]
+UUID:          	2352e288-3f3b-47e1-8642-fb9c8b46dae8
+Label:         	(no label)
+Subsystem:     	(no subsystem)
+Flags:       	(no flags)
+
+Data segments:
+  0: crypt
+	offset: 16777216 [bytes]
+	length: (whole device)
+	cipher: aes-xts-plain64
+	sector: 4096 [bytes]
+
+Keyslots:
+  0: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     32
+	Threads:    1
+	Salt:       4b 4b 3e 53 d5 a9 be cb f3 24 08 11 d0 4a 15 0c 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:32768 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+  1: luks2
+	Key:        512 bits
+	Priority:   normal
+	Cipher:     aes-xts-plain64
+	Cipher key: 512 bits
+	PBKDF:      argon2id
+	Time cost:  4
+	Memory:     64
+	Threads:    1
+	Salt:       0d 6d f4 09 a3 32 81 1f 92 1d 1a e3 0d df 25 03 
+	AF stripes: 4000
+	AF hash:    sha256
+	Area offset:290816 [bytes]
+	Area length:258048 [bytes]
+	Digest ID:  0
+Tokens:
+Digests:
+  0: pbkdf2
+	Hash:       sha256
+	Iterations: 1000
+	Salt:       75 01 42 40 5a f9 18 91 1a 9a 53 5c f7 4b 12 db 
+	Digest:     fb 37 cd a6 37 d8 72 bc 2b 5d 4a ba 20 d2 cb cb 
+
+=== luks1 ===
+LUKS header information for /tmp/tmp.lbyxJJjMdb/luks1.container
+
+Version:       	1
+Cipher name:   	aes
+Cipher mode:   	xts-plain64
+Hash spec:     	sha256
+Payload offset:	4096
+MK bits:       	512
+MK digest:     	fb 6f fb 33 f0 5a 74 b9 59 f5 d7 dc 94 a0 84 f1 1f 45 32 66 
+MK salt:       	af ac 9f 3f 52 b2 b7 3a 4a 3b f2 98 0a 08 b0 4c 
+MK iterations: 	1000
+UUID:          	4348ba74-5834-4f97-96e0-3879f9303a0d
+
+Key Slot 0: ENABLED
+	Iterations:         	1000
+	Salt:               	e4 48 0e e2 8e f9 1b 52 16 22 04 62 a9 1e 00 cd 
+	Key material offset:	8
+	AF stripes:            	4000
+Key Slot 1: DISABLED
+Key Slot 2: DISABLED
+Key Slot 3: DISABLED
+Key Slot 4: DISABLED
+Key Slot 5: DISABLED
+Key Slot 6: DISABLED
+Key Slot 7: DISABLED
+
