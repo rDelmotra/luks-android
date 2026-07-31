@@ -1,0 +1,108 @@
+# ============================================================
+# Default-deny: nothing is visible unless explicitly allowed
+# below.
+# ============================================================
+*
+!*/
+
+# ---- source code ----
+!*.rs
+!*.kt
+!*.kts
+!*.java
+!*.c
+!*.h
+!*.xml
+
+# ---- build / project config ----
+!.gitignore
+!Cargo.toml
+!Cargo.lock
+!.cargo/config.toml
+!*.toml
+!*.lock
+!*.gradle
+!*.gradle.kts
+!gradle.properties
+!settings.gradle
+!settings.gradle.kts
+!AndroidManifest.xml
+!proguard-rules.pro
+!**/gradle/wrapper/gradle-wrapper.properties
+!**/gradle/wrapper/gradle-wrapper.jar
+!gradlew
+!gradlew.bat
+
+# ---- shell tooling ----
+!tools/*.sh
+!tools/*.c
+
+# ---- docs & license (public facing) ----
+!README.md
+!LICENSE
+
+# ---- the tiny fixtures needed to run tests without any generation step ----
+!fixtures/luks/*.img
+!fixtures/luks/EXPECTED.txt
+!fixtures/transfer/*.trace
+
+# ============================================================
+# Hard re-block
+# ============================================================
+*.md
+!README.md
+*.txt
+!fixtures/luks/EXPECTED.txt
+*.img
+!fixtures/luks/*.img
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.pdf
+*.log
+*.bin
+*.header
+*.luksheader
+header-backup*
+
+# ---- credentials ----
+*.env
+.env*
+*.pem
+*.key
+*.jks
+*.keystore
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# ---- build artifacts / generated ----
+target/
+**/target/
+build/
+**/build/
+.gradle/
+.kotlin/
+jniLibs/
+**/*.so
+local.properties
+
+# ---- everything else fixture-shaped, secrets/staging ----
+secrets/
+staging/
+fixtures/
+!fixtures/luks/
+!fixtures/transfer/
+
+# ---- local IDE & agent directories ----
+.idea/
+**/.idea/
+*.iml
+**/*.iml
+.claude/
+scratch/
+DELETE/
+notes/

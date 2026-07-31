@@ -1,0 +1,34 @@
+[package]
+name = "luks_core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-platform userspace LUKS + filesystem engine"
+
+[lib]
+name = "luks_core"
+# rlib for now. `cdylib` gets added in Phase 1 when we emit the Android .so
+# (that is also the point at which the NDK linker becomes required).
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+zeroize = { version = "1.8", features = ["derive"] }
+base64 = "0.22"
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[features]
+default = []
+# V1 is read-only. Write opcodes are not compiled unless this is explicitly
+# enabled, so a bug cannot corrupt a drive: the instruction is not in the binary.
+dangerous-write-support = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
