@@ -199,6 +199,24 @@ pub struct Segment {
     pub encryption: String,
     /// Cipher block size. 4096 is legal and changes the tweak numbering.
     pub sector_size: u32,
+    /// Segment flags. `iv-large-sectors` switches the IV from counting in
+    /// 512-byte units to counting in whole encryption sectors.
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
+impl Segment {
+    /// How much the XTS tweak advances per encryption sector.
+    ///
+    /// dm-crypt counts the IV in 512-byte units by default, so a 4096-byte
+    /// sector advances the tweak by 8. `iv-large-sectors` makes it advance by 1.
+    pub fn tweak_step(&self) -> u128 {
+        if self.flags.iter().any(|f| f == "iv-large-sectors") {
+            1
+        } else {
+            (self.sector_size as u128 / 512).max(1)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

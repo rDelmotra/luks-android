@@ -60,6 +60,42 @@ pub enum LuksError {
 
     #[error("read past end of volume")]
     OutOfBounds,
+
+    // --- filesystem layer ---
+    #[error("not an ext4 filesystem: magic 0x{0:04x}, expected 0xef53")]
+    NotExt4(u16),
+
+    #[error("filesystem uses unsupported feature: {0}")]
+    UnsupportedFsFeature(String),
+
+    /// The journal has unreplayed transactions, so the on-disk state is stale.
+    /// Reading it would show a filesystem that never existed.
+    #[error("filesystem was not cleanly unmounted and needs journal recovery")]
+    FsNeedsRecovery,
+
+    #[error("invalid extent header (magic 0x{0:04x}, expected 0xf30a)")]
+    BadExtentHeader(u16),
+
+    #[error("extent tree is malformed: {0}")]
+    BadExtentTree(&'static str),
+
+    #[error("inode {0} is out of range")]
+    BadInode(u64),
+
+    #[error("no such file or directory: {0}")]
+    NotFound(String),
+
+    #[error("not a directory: {0}")]
+    NotADirectory(String),
+
+    #[error("is a directory: {0}")]
+    IsADirectory(String),
+
+    #[error("too many levels of symbolic links resolving {0}")]
+    SymlinkLoop(String),
+
+    #[error("corrupt filesystem structure: {0}")]
+    CorruptFs(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, LuksError>;

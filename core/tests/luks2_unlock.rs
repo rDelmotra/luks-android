@@ -209,3 +209,47 @@ fn master_key_is_not_printable() {
     assert_eq!(rendered, "[REDACTED 64 bytes]");
     assert!(!rendered.contains("beda42"));
 }
+
+// --- regression: XTS tweak step for large sectors --------------------------
+
+/// dm-crypt counts the IV in 512-byte units, so a 4096-byte sector advances the
+/// tweak by 8. Sector 0 decrypts correctly either way, which is why an earlier
+/// version of this suite — reading only the ext4 magic at offset 1024 — passed
+/// while every later sector decrypted to garbage.
+#[test]
+fn tweak_step_follows_the_sector_size() {
+    let data = container("unlock-argon2id-4096.img");
+    let header = luks::parse(&data).unwrap();
+    let seg = header.primary_segment().unwrap();
+    assert_eq!(seg.sector_size, 4096);
+    assert!(!seg.flags.iter().any(|f| f == "iv-large-sectors"));
+    assert_eq!(seg.tweak_step(), 8);
+
+    let data = container("unlock-argon2id-512.img");
+    let header = luks::parse(&data).unwrap();
+    assert_eq!(header.primary_segment().unwrap().tweak_step(), 1);
+}
+
+/// Both containers hold a filesystem made with identical `mkfs.ext4` options,
+/// so structural metadata past the first sector must agree. With the wrong
+/// tweak step the 4096-byte volume yields noise here.
+#[test]
+fn content_past_the_first_sector_agrees_across_sector_sizes() {
+    let mut descriptors = Vec::new();
+    for name in ["unlock-argon2id-512.img", "unlock-argon2id-4096.img"] {
+        let data = container(name);
+        let header = luks::parse(&data).unwrap();
+        let vol = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+
+        // Block group descriptor at block 1: inode table pointer at +8.
+        let mut gd = [0u8; 16];
+        vol.read_at(4096, &mut gd).unwrap();
+        descriptors.push(u32::from_le_bytes([gd[8], gd[9], gd[10], gd[11]]));
+    }
+    assert_eq!(
+        descriptors[0], descriptors[1],
+        "inode table pointer differs across sector sizes: {descriptors:?}"
+    );
+    // Sanity: a plausible early block, not noise.
+    assert!(descriptors[0] > 0 && descriptors[0] < 1000, "{descriptors:?}");
+}

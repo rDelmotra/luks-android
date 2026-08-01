@@ -14,6 +14,7 @@
 
 pub mod device;
 pub mod error;
+pub mod fs;
 pub mod luks;
 pub mod secret;
 

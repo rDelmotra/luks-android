@@ -24,6 +24,7 @@ pub struct LuksVolume<'a, D: ReadAt + ?Sized> {
     segment_len: Option<u64>,
     sector_size: usize,
     iv_tweak: u128,
+    tweak_step: u128,
     master_key: Secret,
 }
 
@@ -67,6 +68,7 @@ impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
             },
             sector_size: seg.sector_size as usize,
             iv_tweak: seg.iv_tweak as u128,
+            tweak_step: seg.tweak_step(),
             master_key,
         })
     }
@@ -118,7 +120,8 @@ impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
             self.master_key.expose(),
             &mut scratch,
             self.sector_size,
-            self.iv_tweak + first_sector as u128,
+            self.iv_tweak + first_sector as u128 * self.tweak_step,
+            self.tweak_step,
         )?;
 
         let skip = (offset - first_sector * ss) as usize;

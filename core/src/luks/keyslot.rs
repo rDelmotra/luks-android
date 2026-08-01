@@ -83,12 +83,26 @@ fn decrypt_keyslot_area(encryption: &str, key: &Secret, buf: &mut [u8]) -> Resul
     if encryption != "aes-xts-plain64" {
         return Err(LuksError::UnsupportedCipher(encryption.to_string()));
     }
-    xts_decrypt(key.expose(), buf, KEYSLOT_SECTOR_SIZE, 0)
+    // Keyslot areas are always 512-byte blocks, so the step is 1.
+    xts_decrypt(key.expose(), buf, KEYSLOT_SECTOR_SIZE, 0, 1)
 }
 
-/// AES-XTS-plain64 decryption over `buf`, split into `sector_size` chunks, with
-/// the tweak for chunk *i* being `first_sector + i` as a little-endian u128.
-pub fn xts_decrypt(key: &[u8], buf: &mut [u8], sector_size: usize, first_sector: u128) -> Result<()> {
+/// AES-XTS-plain64 decryption over `buf`, split into `sector_size` chunks.
+///
+/// The tweak for chunk *i* is `first_tweak + i * tweak_step`.
+///
+/// `tweak_step` exists because dm-crypt counts the IV in **512-byte units**
+/// regardless of the encryption sector size. A volume with 4096-byte sectors
+/// therefore advances its tweak by 8 per sector, not by 1, unless it sets the
+/// `iv-large-sectors` flag. Getting this wrong decrypts sector 0 correctly and
+/// everything after it into garbage — which is exactly how it hides.
+pub fn xts_decrypt(
+    key: &[u8],
+    buf: &mut [u8],
+    sector_size: usize,
+    first_tweak: u128,
+    tweak_step: u128,
+) -> Result<()> {
     use aes::cipher::KeyInit;
     use aes::{Aes128, Aes256};
     use xts_mode::{get_tweak_default, Xts128};
@@ -100,14 +114,20 @@ pub fn xts_decrypt(key: &[u8], buf: &mut [u8], sector_size: usize, first_sector:
                 Aes256::new_from_slice(&key[..32]).map_err(|_| LuksError::BadKeyLength(64))?,
                 Aes256::new_from_slice(&key[32..]).map_err(|_| LuksError::BadKeyLength(64))?,
             );
-            xts.decrypt_area(buf, sector_size, first_sector, get_tweak_default);
+            for (i, chunk) in buf.chunks_mut(sector_size).enumerate() {
+                let tweak = first_tweak + (i as u128) * tweak_step;
+                xts.decrypt_sector(chunk, get_tweak_default(tweak));
+            }
         }
         32 => {
             let xts = Xts128::new(
                 Aes128::new_from_slice(&key[..16]).map_err(|_| LuksError::BadKeyLength(32))?,
                 Aes128::new_from_slice(&key[16..]).map_err(|_| LuksError::BadKeyLength(32))?,
             );
-            xts.decrypt_area(buf, sector_size, first_sector, get_tweak_default);
+            for (i, chunk) in buf.chunks_mut(sector_size).enumerate() {
+                let tweak = first_tweak + (i as u128) * tweak_step;
+                xts.decrypt_sector(chunk, get_tweak_default(tweak));
+            }
         }
         other => return Err(LuksError::BadKeyLength(other)),
     }
