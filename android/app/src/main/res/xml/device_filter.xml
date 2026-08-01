@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  USB Mass Storage, SCSI transparent command set, Bulk-Only Transport.
+
+    class    8  = Mass Storage
+    subclass 6  = SCSI transparent command set
+    protocol 80 = 0x50, Bulk-Only Transport
+
+  Deliberately not filtered by vendor/product: this is meant to work with any
+  drive, and a vendor list would be a permanent maintenance burden that still
+  missed devices.
+-->
+<resources>
+    <usb-device class="8" subclass="6" protocol="80" />
+</resources>

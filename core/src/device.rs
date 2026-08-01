@@ -22,6 +22,23 @@ pub trait ReadAt {
     }
 }
 
+/// Lets a reference stand in for the thing it points at.
+///
+/// This is what makes the owning layers above (`LuksVolume<D>`, `Ext4<D>`)
+/// usable both ways. A test passes `&image` and gets `D = &Vec<u8>`, borrowing;
+/// the JNI layer passes the device by value and gets a `'static` type with no
+/// self-reference, which is the only shape that can live behind a raw handle
+/// without `unsafe`.
+impl<D: ReadAt + ?Sized> ReadAt for &D {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        (**self).read_at(offset, buf)
+    }
+
+    fn len(&self) -> Option<u64> {
+        (**self).len()
+    }
+}
+
 impl ReadAt for [u8] {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let start = usize::try_from(offset).map_err(|_| LuksError::Truncated {

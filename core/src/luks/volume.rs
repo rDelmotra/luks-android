@@ -14,8 +14,16 @@ use crate::luks::header::{Luks2Header, SegmentSize};
 use crate::luks::keyslot::{self, xts_decrypt};
 use crate::secret::Secret;
 
-pub struct LuksVolume<'a, D: ReadAt + ?Sized> {
-    device: &'a D,
+/// Owns its device rather than borrowing it.
+///
+/// `D` is usually a reference (`&Vec<u8>`, `&FileDevice`) thanks to the blanket
+/// `impl ReadAt for &D`, so borrowing callers are unaffected. Owning matters for
+/// the JNI bridge: `Ext4<LuksVolume<ScsiBlockDevice<UsbFsTransport>>>` is a
+/// single `'static` value that can sit behind a raw handle. Were the layers
+/// borrowing, that handle would be a self-referential struct — unrepresentable
+/// in safe Rust.
+pub struct LuksVolume<D: ReadAt> {
+    device: D,
     /// Byte offset of the partition on the underlying device.
     partition_offset: u64,
     /// Byte offset of the ciphertext, relative to the partition.
@@ -28,15 +36,15 @@ pub struct LuksVolume<'a, D: ReadAt + ?Sized> {
     master_key: Secret,
 }
 
-impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
+impl<D: ReadAt> LuksVolume<D> {
     /// Derive the master key and open the volume. This is the slow call.
     pub fn open(
-        device: &'a D,
+        device: D,
         partition_offset: u64,
         header: &Luks2Header,
         password: &[u8],
     ) -> Result<Self> {
-        let master_key = keyslot::unlock(device, partition_offset, header, password)?;
+        let master_key = keyslot::unlock(&device, partition_offset, header, password)?;
         Self::with_master_key(device, partition_offset, header, master_key)
     }
 
@@ -44,7 +52,7 @@ impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
     /// is what makes it possible to test decryption against cryptsetup's
     /// `--dump-master-key` output without going through our own derivation.
     pub fn with_master_key(
-        device: &'a D,
+        device: D,
         partition_offset: u64,
         header: &Luks2Header,
         master_key: Secret,
@@ -75,6 +83,12 @@ impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
 
     pub fn sector_size(&self) -> usize {
         self.sector_size
+    }
+
+    /// The device underneath, for callers that need to keep talking to it
+    /// (a JNI handle asking the SCSI layer for its capacity, say).
+    pub fn device(&self) -> &D {
+        &self.device
     }
 
     /// Plaintext length, if the header pins it down.
@@ -131,7 +145,7 @@ impl<'a, D: ReadAt + ?Sized> LuksVolume<'a, D> {
 }
 
 /// Lets the filesystem layer read straight through the decryption layer.
-impl<D: ReadAt + ?Sized> ReadAt for LuksVolume<'_, D> {
+impl<D: ReadAt> ReadAt for LuksVolume<D> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         LuksVolume::read_at(self, offset, buf)
     }

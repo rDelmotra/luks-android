@@ -7,8 +7,11 @@ description = "Cross-platform userspace LUKS + filesystem engine"
 
 [lib]
 name = "luks_core"
-# rlib for `cargo test`; cdylib for the Android `.so` loaded over JNI.
-crate-type = ["rlib", "cdylib"]
+# rlib only. The Android `.so` is `luks_jni`, which links this statically and
+# exports the `Java_*` symbols; a second cdylib here would be a dead 300 KB in
+# the APK. `cargo build -p luks_jni --target aarch64-linux-android` is still the
+# build that proves the NDK linker works, since an rlib never invokes a linker.
+crate-type = ["rlib"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

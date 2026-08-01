@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "usbfs"]
+members = ["core", "usbfs", "jni"]
 
 # Profiles only take effect at the workspace root, so they live here rather than
 # in core/Cargo.toml.

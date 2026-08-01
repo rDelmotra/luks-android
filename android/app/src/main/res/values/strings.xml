@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">LUKS</string>
+    <string name="unlock_channel_name">Unlocking</string>
+    <string name="unlock_channel_description">Keeps the app alive while a drive is being unlocked</string>
+</resources>

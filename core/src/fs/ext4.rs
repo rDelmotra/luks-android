@@ -193,19 +193,24 @@ impl Inode {
 }
 
 /// A mounted, read-only ext2/3/4 filesystem.
-pub struct Ext4<'a, D: ReadAt + ?Sized> {
-    device: &'a D,
+///
+/// Owns its device. `D` is usually a reference (`&LuksVolume<..>`) via the
+/// blanket `impl ReadAt for &D`, so `Ext4::mount(&volume)` still works; the
+/// owning form is what lets a JNI handle hold the whole stack. See the note on
+/// [`crate::luks::LuksVolume`].
+pub struct Ext4<D: ReadAt> {
+    device: D,
     sb: Superblock,
     /// Block number of each group's inode table.
     inode_tables: Vec<u64>,
 }
 
-impl<'a, D: ReadAt + ?Sized> Ext4<'a, D> {
+impl<D: ReadAt> Ext4<D> {
     /// Read the superblock and group descriptors.
     ///
     /// Refuses filesystems whose on-disk state cannot be read correctly rather
     /// than returning plausible-looking wrong data.
-    pub fn mount(device: &'a D) -> Result<Self> {
+    pub fn mount(device: D) -> Result<Self> {
         let mut sb_buf = [0u8; 1024];
         device.read_at(SUPERBLOCK_OFFSET, &mut sb_buf)?;
         let sb = Superblock::parse(&sb_buf)?;
@@ -229,7 +234,7 @@ impl<'a, D: ReadAt + ?Sized> Ext4<'a, D> {
             return Err(LuksError::UnsupportedFsFeature("meta_bg layout".into()));
         }
 
-        let inode_tables = Self::read_group_descriptors(device, &sb)?;
+        let inode_tables = Self::read_group_descriptors(&device, &sb)?;
         Ok(Ext4 {
             device,
             sb,

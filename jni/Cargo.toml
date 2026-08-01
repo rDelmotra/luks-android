@@ -1,0 +1,20 @@
+[package]
+name = "luks_jni"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "JNI bridge exposing luks_core + luks_usbfs to the Android app"
+
+[lib]
+name = "luks_jni"
+# cdylib only. Nothing links this as a Rust library; the JVM dlopen()s it.
+# `rlib` as well so the crate's own integration tests can call into `bridge`.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+luks_core = { path = "../core" }
+luks_usbfs = { path = "../usbfs" }
+jni = "0.21"
+serde_json = "1"
+# Streaming verification of a file on the drive without materialising it.
+sha2 = "0.10"

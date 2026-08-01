@@ -1,0 +1,8 @@
+<resources>
+    <!-- Compose draws everything; this only needs to exist for the manifest and
+         to avoid a white flash before the first frame. -->
+    <style name="Theme.LuksAndroid" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/black</item>
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+</resources>
