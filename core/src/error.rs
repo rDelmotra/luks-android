@@ -96,6 +96,24 @@ pub enum LuksError {
 
     #[error("corrupt filesystem structure: {0}")]
     CorruptFs(&'static str),
+
+    // --- USB / SCSI transport ---
+    #[error("SCSI protocol error: {0}")]
+    ScsiProtocol(&'static str),
+
+    /// The device returned CSW status 1. Call REQUEST SENSE for the reason.
+    #[error("SCSI command failed")]
+    ScsiCommandFailed,
+
+    #[error("USB transfer failed: {0}")]
+    UsbTransfer(String),
+
+    // --- partition tables ---
+    #[error("no MBR or GPT partition table found")]
+    NoPartitionTable,
+
+    #[error("GPT is invalid: {0}")]
+    BadGpt(&'static str),
 }
 
 pub type Result<T> = std::result::Result<T, LuksError>;

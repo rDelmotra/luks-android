@@ -8,5 +8,6 @@ pub use header::{
     detect_version, parse, Area, Digest, HeaderCopy, Kdf, Keyslot, Luks2Header, LuksVersion,
     Metadata, Segment, SegmentSize,
 };
+pub use header::read_from;
 pub use keyslot::{derive_key, unlock};
 pub use volume::LuksVolume;

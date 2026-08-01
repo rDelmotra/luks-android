@@ -301,6 +301,35 @@ pub fn detect_version(data: &[u8]) -> Result<LuksVersion> {
     }
 }
 
+/// Read and parse a LUKS2 header directly from a device.
+///
+/// Reads the fixed binary header first to learn `hdr_size`, then fetches both
+/// copies. `partition_offset` is the byte offset of the partition on the device.
+pub fn read_from<D: crate::device::ReadAt + ?Sized>(
+    device: &D,
+    partition_offset: u64,
+) -> Result<Luks2Header> {
+    let mut probe = vec![0u8; BINARY_HEADER_LEN];
+    device.read_at(partition_offset, &mut probe)?;
+
+    let declared = if probe.len() >= 16 {
+        be_u64(&probe[8..16])
+    } else {
+        0
+    };
+    // Fall back to the largest plausible metadata size if the field is unusable,
+    // so a damaged primary can still be recovered from the backup.
+    let span = if (MIN_HDR_SIZE..=MAX_HDR_SIZE).contains(&declared) {
+        declared * 2
+    } else {
+        MIN_HDR_SIZE * 2
+    };
+
+    let mut buf = vec![0u8; span as usize];
+    device.read_at(partition_offset, &mut buf)?;
+    parse(&buf)
+}
+
 /// Parse a LUKS2 header from the start of a partition.
 ///
 /// `data` must cover both header copies (`2 * hdr_size`, normally 32 KiB).

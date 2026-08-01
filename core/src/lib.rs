@@ -16,6 +16,8 @@ pub mod device;
 pub mod error;
 pub mod fs;
 pub mod luks;
+pub mod partition;
+pub mod usb;
 pub mod secret;
 
 pub use error::{LuksError, Result};
