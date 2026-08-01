@@ -114,6 +114,16 @@ pub enum LuksError {
 
     #[error("GPT is invalid: {0}")]
     BadGpt(&'static str),
+
+    // --- host I/O ---
+    /// Reading a file or block device on the host failed. Only produced by
+    /// `FileDevice`; the Android path never touches the host filesystem.
+    #[error("I/O error on {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, LuksError>;

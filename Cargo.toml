@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "usbfs"]
+
+# Profiles only take effect at the workspace root, so they live here rather than
+# in core/Cargo.toml.
+[profile.release]
+lto = true
+codegen-units = 1
+# NOT panic = "abort". The JNI layer must wrap every entry point in
+# catch_unwind, which requires unwinding. We parse attacker-controlled GPT,
+# LUKS and ext4 metadata; with abort, a malformed drive kills the whole app,
+# whereas unwinding lets it surface as a Java exception and an error message.
+strip = true

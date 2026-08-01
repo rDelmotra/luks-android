@@ -28,17 +28,16 @@ crc32fast = "1"
 [dev-dependencies]
 sha2 = "0.10"
 
+[lints.rust]
+# `aes_armv8` is a custom cfg set in ../.cargo/config.toml — see the long note
+# there. Declared so `cfg!(aes_armv8)` does not trip the unexpected_cfgs lint.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_armv8)'] }
+
 [features]
 default = []
 # V1 is read-only. Write opcodes are not compiled unless this is explicitly
 # enabled, so a bug cannot corrupt a drive: the instruction is not in the binary.
 dangerous-write-support = []
 
-[profile.release]
-lto = true
-codegen-units = 1
-# NOT panic = "abort". The JNI layer must wrap every entry point in
-# catch_unwind, which requires unwinding. We parse attacker-controlled GPT,
-# LUKS and ext4 metadata; with abort, a malformed drive kills the whole app,
-# whereas unwinding lets it surface as a Java exception and an error message.
-strip = true
+# [profile.release] moved to the workspace root Cargo.toml — Cargo ignores
+# profile settings in non-root members and warns about them.

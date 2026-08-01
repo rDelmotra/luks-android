@@ -1,0 +1,41 @@
+# Repo-wide Rust build configuration.
+#
+# ────────────────────────────────────────────────────────────────────────────
+#  Do not remove `--cfg aes_armv8`. It is worth 60x.
+# ────────────────────────────────────────────────────────────────────────────
+#
+# The `aes` 0.8 crate gates its ARMv8 hardware-AES backend behind a *custom cfg
+# flag*, not behind `target_feature`. From aes-0.8.4/src/lib.rs:
+#
+#     if #[cfg(all(target_arch = "aarch64", aes_armv8, not(aes_force_soft)))]
+#
+# So on aarch64 the crate silently compiles the pure-software (fixslice)
+# implementation unless this flag is passed — even though every Apple Silicon
+# Mac and every modern Android phone has hardware AES, and even though
+# `cfg!(target_feature = "aes")` reports true.
+#
+# Measured on this machine (`cargo run --release --example xts_bench`),
+# AES-256-XTS decryption:
+#
+#     without the flag      65 MiB/s      <- software fixslice
+#     with the flag       3900 MiB/s      <- ARMv8 crypto extensions
+#
+# 65 MiB/s would have capped the whole product below even a USB 2.0 link, and
+# it fails *silently* — correct output, just 60x slow. That is precisely the
+# kind of bug that does not announce itself, so `tests/aes_backend.rs` asserts
+# the flag is present rather than trusting this file to survive.
+#
+# Safety on Android: with this flag the crate pulls in `autodetect`, which uses
+# `cpufeatures` to pick armv8-vs-software at RUNTIME. Both backends are
+# compiled in. A hypothetical ARMv8 device without crypto extensions falls back
+# to software rather than executing an illegal instruction.
+#
+# Harmless elsewhere: on x86_64 the cfg_if arm above never matches and AES-NI
+# autodetection applies as usual.
+#
+# Follow-up: `aes` 0.9 enables ARMv8 automatically and needs no flag, but it
+# requires `cipher` 0.5 while `xts-mode` 0.5.1 is still on `cipher` 0.4.
+# Revisit when xts-mode updates, then delete this.
+
+[build]
+rustflags = ["--cfg", "aes_armv8"]

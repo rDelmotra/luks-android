@@ -1,0 +1,13 @@
+[package]
+name = "luks_usbfs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Linux/Android usbfs implementation of luks_core's BulkTransport"
+
+[dependencies]
+luks_core = { path = "../core" }
+libc = "0.2"
+
+[dev-dependencies]
+luks_core = { path = "../core" }
