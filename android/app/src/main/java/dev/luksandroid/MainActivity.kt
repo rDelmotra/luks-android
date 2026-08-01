@@ -1,21 +1,32 @@
 package dev.luksandroid
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -25,21 +36,27 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * Pass 2: open a detected device and read its real partition table over USB.
+ * Pass 3: unlock and browse.
  *
- * Still no unlock — that needs the foreground service, which is pass 3. This
- * pass exists to isolate one question: does `UsbFsTransport` work at all
- * against real hardware? Everything below `nativeOpenDevice` (SCSI INQUIRY,
- * READ CAPACITY, GPT parsing, LUKS-magic probing) has 106 tests behind it but
- * has never once talked to a real bulk pipe before this.
+ * Adds password entry, the [UnlockService]-wrapped unlock, and a root
+ * directory listing with a streaming SHA-256 check per file — the last being
+ * the actual acceptance test for the whole stack, since it can verify a
+ * multi-gigabyte file against `STICK-MANIFEST.txt` without ever holding it in
+ * memory.
  */
 class MainActivity : ComponentActivity() {
+
+    private val requestNotifications =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* advisory */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,6 +65,16 @@ class MainActivity : ComponentActivity() {
         // Set here rather than on the unlock screen alone: the file listing of
         // an encrypted drive is itself something the user chose to encrypt.
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+
+        // Advisory only. Without this the foreground service still runs and
+        // still protects the process — the notification is simply not shown.
+        // So it is requested, not required, and nothing branches on the answer.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
@@ -67,6 +94,21 @@ private sealed interface DeviceState {
     data class Failed(val message: String) : DeviceState
 }
 
+/**
+ * Unlock state for the screen as a whole, not per device.
+ *
+ * One partition is unlocked at a time by construction — each unlock costs a
+ * full KDF run, so a UI that invited several at once would be inviting the user
+ * to wait several times over.
+ */
+private sealed interface VolumeState {
+    data object None : VolumeState
+    data class Prompting(val partition: PartitionInfo) : VolumeState
+    data class Unlocking(val partition: PartitionInfo) : VolumeState
+    data class Unlocked(val volume: LuksVolume, val entries: List<Entry>) : VolumeState
+    data class Failed(val partition: PartitionInfo, val message: String) : VolumeState
+}
+
 @Composable
 private fun DiagnosticsScreen() {
     val context = LocalContext.current
@@ -81,6 +123,7 @@ private fun DiagnosticsScreen() {
     // `findTargets()` returns fresh UsbDevice instances on every rescan, so
     // object identity would forget every open device on the next scan.
     var states by remember { mutableStateOf(mapOf<String, DeviceState>()) }
+    var volume by remember { mutableStateOf<VolumeState>(VolumeState.None) }
 
     fun keyOf(t: UsbMassStorage.Target) =
         "${t.device.vendorId}:${t.device.productId}:${t.usbInterface.id}"
@@ -159,34 +202,19 @@ private fun DiagnosticsScreen() {
                         }
 
                         is DeviceState.Open -> {
-                            val info = state.device.info
-                            Text(
-                                "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} " +
-                                    "· ${info.blockSize}B blocks · ${info.tableKind}",
-                                style = MaterialTheme.typography.bodySmall,
+                            OpenDeviceBody(
+                                device = state.device,
+                                volume = volume,
+                                onVolumeChange = { volume = it },
+                                onClose = {
+                                    (volume as? VolumeState.Unlocked)?.volume?.close()
+                                    volume = VolumeState.None
+                                    state.device.close()
+                                    states = states + (key to DeviceState.Idle)
+                                },
+                                scope = scope,
+                                context = context,
                             )
-                            if (info.partitions.isEmpty()) {
-                                Text(
-                                    "No partition table found.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-                            info.partitions.forEach { p ->
-                                Text("  ${p.label}", style = MaterialTheme.typography.bodySmall)
-                            }
-                            if (state.device.luksPartitions.isEmpty()) {
-                                Text(
-                                    "No LUKS partition on this drive. (Unlock UI comes " +
-                                        "in the next pass regardless.)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
-                            }
-                            Button(onClick = {
-                                state.device.close()
-                                states = states + (key to DeviceState.Idle)
-                            }) {
-                                Text("Close")
-                            }
                         }
 
                         is DeviceState.Failed -> {
@@ -205,6 +233,176 @@ private fun DiagnosticsScreen() {
     }
 }
 
+@Composable
+private fun OpenDeviceBody(
+    device: LuksDevice,
+    volume: VolumeState,
+    onVolumeChange: (VolumeState) -> Unit,
+    onClose: () -> Unit,
+    scope: kotlinx.coroutines.CoroutineScope,
+    context: Context,
+) {
+    val info = device.info
+
+    Text(
+        "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} " +
+            "· ${info.blockSize}B blocks · ${info.tableKind}",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    if (info.partitions.isEmpty()) {
+        Text("No partition table found.", style = MaterialTheme.typography.bodySmall)
+    }
+    info.partitions.forEach { p ->
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text("  ${p.label}", style = MaterialTheme.typography.bodySmall)
+            if (p.isLuks && volume is VolumeState.None) {
+                TextButton(onClick = { onVolumeChange(VolumeState.Prompting(p)) }) {
+                    Text("Unlock")
+                }
+            }
+        }
+    }
+    if (device.luksPartitions.isEmpty()) {
+        Text("No LUKS partition on this drive.", style = MaterialTheme.typography.bodySmall)
+    }
+
+    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+    when (volume) {
+        is VolumeState.None -> Unit
+
+        is VolumeState.Prompting -> PasswordPrompt(
+            partition = volume.partition,
+            onCancel = { onVolumeChange(VolumeState.None) },
+            onSubmit = { password ->
+                onVolumeChange(VolumeState.Unlocking(volume.partition))
+                scope.launch {
+                    onVolumeChange(unlock(context, device, volume.partition, password))
+                }
+            },
+        )
+
+        is VolumeState.Unlocking -> {
+            CircularProgressIndicator(modifier = Modifier.padding(4.dp))
+            Text(
+                "Deriving the key. On a 1 GiB Argon2 keyslot this takes several " +
+                    "seconds and allocates a gigabyte — the foreground service is " +
+                    "holding the process while it runs.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+
+        is VolumeState.Unlocked -> UnlockedBody(
+            state = volume,
+            onVolumeChange = onVolumeChange,
+            scope = scope,
+        )
+
+        is VolumeState.Failed -> {
+            Text("Unlock failed: ${volume.message}", style = MaterialTheme.typography.bodySmall)
+            Button(onClick = { onVolumeChange(VolumeState.Prompting(volume.partition)) }) {
+                Text("Try again")
+            }
+        }
+    }
+
+    Button(onClick = onClose) { Text("Close device") }
+}
+
+@Composable
+private fun PasswordPrompt(
+    partition: PartitionInfo,
+    onCancel: () -> Unit,
+    onSubmit: (ByteArray) -> Unit,
+) {
+    var text by remember { mutableStateOf("") }
+
+    fun submit() {
+        // ⚠️ Known gap: `text` is a Kotlin String, which is immutable and
+        // cannot be scrubbed — it lives on the GC heap until collected. The
+        // password crosses JNI correctly as a ByteArray into a zeroing Secret,
+        // and LuksDevice.unlock zeroes that array in a finally, so the
+        // invariant holds everywhere it can. Closing this last gap needs a
+        // BasicTextField over a mutable CharArray. Tracked in STATE.md.
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        text = ""
+        onSubmit(bytes)
+    }
+
+    Text("Unlock ${partition.label}", style = MaterialTheme.typography.bodyMedium)
+    OutlinedTextField(
+        value = text,
+        onValueChange = { text = it },
+        label = { Text("Passphrase") },
+        singleLine = true,
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(
+            keyboardType = KeyboardType.Password,
+            imeAction = ImeAction.Go,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = ::submit, enabled = text.isNotEmpty()) { Text("Unlock") }
+        TextButton(onClick = onCancel) { Text("Cancel") }
+    }
+}
+
+@Composable
+private fun UnlockedBody(
+    state: VolumeState.Unlocked,
+    onVolumeChange: (VolumeState) -> Unit,
+    scope: kotlinx.coroutines.CoroutineScope,
+) {
+    val info = state.volume.info
+    var digest by remember { mutableStateOf<String?>(null) }
+
+    Text(
+        "Unlocked: ${info.label.ifBlank { "(no label)" }} · ${formatSize(info.sizeBytes)} " +
+            "· ${info.blockSize}B blocks",
+        style = MaterialTheme.typography.bodyMedium,
+    )
+    Text(info.uuid, style = MaterialTheme.typography.bodySmall)
+
+    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+
+    state.entries.forEach { entry ->
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                if (entry.isDir) "📁 ${entry.name}" else "   ${entry.name}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if (!entry.isDir) {
+                TextButton(onClick = {
+                    digest = "hashing ${entry.name}…"
+                    scope.launch {
+                        digest = hashFile(state.volume, "/${entry.name}")
+                    }
+                }) {
+                    Text("SHA-256")
+                }
+            }
+        }
+    }
+
+    digest?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall)
+    }
+
+    Button(onClick = {
+        state.volume.close()
+        onVolumeChange(VolumeState.None)
+    }) {
+        Text("Lock")
+    }
+}
+
 /**
  * Requests permission if needed, then opens the device and reads its
  * partition table. All of it runs off the main thread: `requestPermission`
@@ -212,7 +410,7 @@ private fun DiagnosticsScreen() {
  * transfers (INQUIRY, READ CAPACITY, the LUKS-magic probe of every partition).
  */
 private suspend fun openDevice(
-    context: android.content.Context,
+    context: Context,
     target: UsbMassStorage.Target,
 ): DeviceState {
     val granted = UsbMassStorage.requestPermission(context, target.device)
@@ -227,4 +425,45 @@ private suspend fun openDevice(
     } catch (e: Exception) {
         DeviceState.Failed(e.message ?: e.toString())
     }
+}
+
+/**
+ * The slow path: Argon2, then the AF-merge, digest check and ext4 mount.
+ *
+ * Wrapped in [UnlockService.holding] so the process is in the foreground class
+ * for the whole derivation, and run on [Dispatchers.IO] so the UI thread stays
+ * free to draw the spinner.
+ */
+private suspend fun unlock(
+    context: Context,
+    device: LuksDevice,
+    partition: PartitionInfo,
+    password: ByteArray,
+): VolumeState = try {
+    UnlockService.holding(context) {
+        withContext(Dispatchers.IO) {
+            val v = device.unlock(partition.offsetBytes, password)
+            VolumeState.Unlocked(v, v.listDir("/"))
+        }
+    }
+} catch (e: LuksException) {
+    VolumeState.Failed(
+        partition,
+        if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}",
+    )
+} catch (e: Exception) {
+    VolumeState.Failed(partition, e.message ?: e.toString())
+} finally {
+    // Belt and braces: LuksDevice.unlock already zeroes this, but that only
+    // runs if the call was reached at all.
+    password.fill(0)
+}
+
+/** Streams the file through SHA-256 and reports the throughput it managed. */
+private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
+    val d = withContext(Dispatchers.IO) { volume.sha256(path) }
+    val mbPerSec = d.bytesPerSec.toDouble() / (1L shl 20)
+    "${d.sha256}\n${formatSize(d.bytes)} in ${d.elapsedMs} ms · %.1f MiB/s".format(mbPerSec)
+} catch (e: Exception) {
+    "hash failed: ${e.message}"
 }

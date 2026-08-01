@@ -340,14 +340,36 @@ impl<D: ReadAt> Ext4<D> {
 
     /// Physical block backing logical block `lblock`, or `None` for a hole.
     fn map_block(&self, inode: &Inode, lblock: u64) -> Result<Option<u64>> {
+        self.map_run(inode, lblock).map(|(phys, _)| phys)
+    }
+
+    /// Where `lblock` lives, **and how many consecutive logical blocks from
+    /// there are contiguous with it**.
+    ///
+    /// The run length is the whole point. Mapping one block at a time makes a
+    /// sequential read cost one device round trip per block — plus, for an
+    /// extent tree deep enough to have interior nodes, another read to re-walk
+    /// the tree for every one of them. Over USB that is fatal: reading a 1 GiB
+    /// file in 4 KiB blocks is a quarter of a million SCSI command/data/status
+    /// exchanges, and it measured in *minutes* on real hardware.
+    ///
+    /// An extent already records its own length, so the run comes for free —
+    /// it was being computed and thrown away.
+    ///
+    /// `(None, n)` is a hole `n` blocks long, which reads as zeros.
+    fn map_run(&self, inode: &Inode, lblock: u64) -> Result<(Option<u64>, u64)> {
         if inode.uses_extents() {
-            self.map_via_extents(inode, lblock)
+            self.map_run_extents(inode, lblock)
         } else {
-            self.map_via_indirect(inode, lblock)
+            // ext2/ext3 indirect mapping still walks per block. Coalescing here
+            // means reading an indirect block once and scanning it for
+            // contiguity, which is real work for a case that no longer occurs
+            // on drives anyone is likely to plug in. Correct, just not fast.
+            self.map_via_indirect(inode, lblock).map(|phys| (phys, 1))
         }
     }
 
-    fn map_via_extents(&self, inode: &Inode, lblock: u64) -> Result<Option<u64>> {
+    fn map_run_extents(&self, inode: &Inode, lblock: u64) -> Result<(Option<u64>, u64)> {
         let mut node = inode.block_area.to_vec();
 
         loop {
@@ -364,6 +386,10 @@ impl<D: ReadAt> Ext4<D> {
             }
 
             if depth == 0 {
+                // Extents within a leaf are sorted by logical block, so the
+                // first one starting past `lblock` bounds any hole at `lblock`.
+                let mut next_start: Option<u64> = None;
+
                 for i in 0..entries {
                     let e = &node[12 + i * 12..24 + i * 12];
                     let ee_block = u32le(e, 0) as u64;
@@ -379,14 +405,26 @@ impl<D: ReadAt> Ext4<D> {
                         continue;
                     }
                     if lblock >= ee_block && lblock < ee_block + len {
+                        let offset = lblock - ee_block;
+                        let run = len - offset;
                         if !initialised {
-                            return Ok(None);
+                            return Ok((None, run));
                         }
                         let start = u32le(e, 8) as u64 | ((u16le(e, 6) as u64) << 32);
-                        return Ok(Some(start + (lblock - ee_block)));
+                        return Ok((Some(start + offset), run));
+                    }
+                    if ee_block > lblock {
+                        next_start = Some(ee_block);
+                        break;
                     }
                 }
-                return Ok(None); // hole
+
+                // A hole. Its length is known only as far as this leaf: if no
+                // later extent is in *this* node, the next leaf may still hold
+                // one, so claim a single block rather than guessing. Being
+                // wrong here would read real data as zeros.
+                let run = next_start.map_or(1, |n| n - lblock);
+                return Ok((None, run));
             }
 
             // Interior node: descend into the last index whose block <= lblock.
@@ -484,18 +522,39 @@ impl<D: ReadAt> Ext4<D> {
 
         let bs = self.sb.block_size as u64;
         let mut done = 0usize;
-        let mut block_buf = vec![0u8; bs as usize];
 
         while done < want {
             let pos = offset + done as u64;
             let lblock = pos / bs;
-            let within = (pos % bs) as usize;
-            let take = (bs as usize - within).min(want - done);
+            let within = pos % bs;
 
-            match self.map_block(inode, lblock)? {
-                Some(phys) => {
-                    self.read_block(phys, &mut block_buf)?;
-                    buf[done..done + take].copy_from_slice(&block_buf[within..within + take]);
+            let (phys, run_blocks) = self.map_run(inode, lblock)?;
+
+            // How much of this contiguous run the caller still wants. The
+            // saturating arithmetic matters: a hole can legitimately be
+            // reported as an enormous run.
+            let in_run = run_blocks.saturating_mul(bs).saturating_sub(within);
+            let take = in_run.min((want - done) as u64) as usize;
+            debug_assert!(take > 0, "map_run must make progress");
+
+            match phys {
+                Some(start) => {
+                    // Bounds-check the whole run, not just the part read: an
+                    // extent claiming blocks past the end of the filesystem is
+                    // corrupt whether or not this call touches them.
+                    let past_end = start
+                        .checked_add(run_blocks)
+                        .is_none_or(|end| end > self.sb.blocks_count);
+                    if past_end {
+                        return Err(LuksError::CorruptFs(
+                            "block pointer past end of filesystem",
+                        ));
+                    }
+                    // Straight into the caller's buffer. `ReadAt` handles
+                    // arbitrary offsets and lengths, so there is no need to
+                    // round to blocks and copy through a bounce buffer.
+                    self.device
+                        .read_at(start * bs + within, &mut buf[done..done + take])?;
                 }
                 None => buf[done..done + take].fill(0), // sparse hole
             }

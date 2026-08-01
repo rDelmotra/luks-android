@@ -335,3 +335,59 @@ fn error_cases() {
         Err(LuksError::NotADirectory(_)) | Err(LuksError::NotFound(_))
     ));
 }
+
+/// Counts device reads, so a change in *how many* I/Os a read costs is visible.
+struct Counting {
+    inner: Vec<u8>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl luks_core::device::ReadAt for Counting {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LuksError> {
+        self.reads.set(self.reads.get() + 1);
+        self.inner.read_at(offset, buf)
+    }
+
+    fn len(&self) -> Option<u64> {
+        Some(self.inner.len() as u64)
+    }
+}
+
+/// 🐛 Regression guard for a bug found on real hardware, not by this suite.
+///
+/// `read_inode_data` used to map and read **one filesystem block at a time**,
+/// re-walking the extent tree for each. Every test still passed — the bytes
+/// were right — but reading a 1 GiB file over USB took minutes, because it
+/// became ~262,000 SCSI command/data/status round trips instead of a few
+/// thousand.
+///
+/// The bytes-correct tests above cannot catch this. Only counting I/Os can.
+#[test]
+fn a_sequential_read_does_not_cost_one_io_per_block() {
+    for (name, block_size) in [("big-4k.img", 4096usize), ("small-1k.img", 1024)] {
+        let dev = Counting {
+            inner: image(name),
+            reads: std::cell::Cell::new(0),
+        };
+        let fs = Ext4::mount(&dev).unwrap();
+
+        let before = dev.reads.get();
+        let got = fs.read_file("/big.bin").unwrap();
+        let reads = dev.reads.get() - before;
+
+        assert_eq!(got.len(), 2 * 1024 * 1024, "{name}");
+
+        // The file is contiguous or nearly so, so a run-aware reader needs a
+        // handful of I/Os. Block-at-a-time would need 2 MiB / block_size:
+        // 512 reads at 4 KiB, 2048 at 1 KiB. Assert an order of magnitude
+        // better than that, which passes comfortably for any sane extent
+        // layout while failing loudly if per-block mapping returns.
+        let per_block = (2 * 1024 * 1024) / block_size;
+        println!("{name}: 2 MiB read cost {reads} device reads (was {per_block})");
+        assert!(
+            reads < per_block / 10,
+            "{name}: {reads} device reads for a 2 MiB file \
+             (block-at-a-time would be {per_block}) — run coalescing regressed",
+        );
+    }
+}

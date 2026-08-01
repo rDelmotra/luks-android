@@ -2,4 +2,6 @@
     <string name="app_name">LUKS</string>
     <string name="unlock_channel_name">Unlocking</string>
     <string name="unlock_channel_description">Keeps the app alive while a drive is being unlocked</string>
+    <string name="unlock_notification_title">Unlocking drive</string>
+    <string name="unlock_notification_text">Deriving the key. This can take several seconds.</string>
 </resources>

@@ -57,8 +57,11 @@
                 android:resource="@xml/device_filter" />
         </activity>
 
-        <!-- TODO(pass 2): UnlockService, foregroundServiceType="dataSync".
-             The permissions above are already declared because the unlock path
-             must not ship without it — see the note on FOREGROUND_SERVICE. -->
+        <!-- The type here must match the one passed to startForeground(), or
+             API 34+ throws instead of starting the service. -->
+        <service
+            android:name=".UnlockService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
     </application>
 </manifest>
