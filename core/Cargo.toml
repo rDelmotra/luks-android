@@ -7,9 +7,8 @@ description = "Cross-platform userspace LUKS + filesystem engine"
 
 [lib]
 name = "luks_core"
-# rlib for now. `cdylib` gets added in Phase 1 when we emit the Android .so
-# (that is also the point at which the NDK linker becomes required).
-crate-type = ["rlib"]
+# rlib for `cargo test`; cdylib for the Android `.so` loaded over JNI.
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -38,4 +37,8 @@ dangerous-write-support = []
 [profile.release]
 lto = true
 codegen-units = 1
-panic = "abort"
+# NOT panic = "abort". The JNI layer must wrap every entry point in
+# catch_unwind, which requires unwinding. We parse attacker-controlled GPT,
+# LUKS and ext4 metadata; with abort, a malformed drive kills the whole app,
+# whereas unwinding lets it surface as a Java exception and an error message.
+strip = true
