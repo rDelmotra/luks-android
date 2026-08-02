@@ -10,20 +10,24 @@
 //! of USB. That ceiling matters: software AES that only manages 200 MB/s caps
 //! the product no matter how fast the bus is.
 //!
-//! The passphrase is read from **stdin**, never argv or the environment, so it
-//! does not show up in `ps` or in a shell history.
+//! The passphrase is **never** taken from argv or the environment. On a
+//! terminal it is prompted for with echo off, exactly as cryptsetup does;
+//! piped in, it is read from stdin. Both matter for different reasons: argv is
+//! visible in `ps` to every user on the machine, and a passphrase typed into a
+//! shell pipeline lands in `~/.zsh_history` where it outlives the session.
 //!
 //! ```text
-//! printf 'test' | cargo run --release --example read_image -- disk.img
-//! printf 'test' | cargo run --release --example read_image -- disk.img /bigfile.bin
+//! sudo cargo run --release --example read_image -- /dev/disk4s3   # prompts
+//! printf 'test' | cargo run --release --example read_image -- disk.img  # scripted
 //! ```
 
 use luks_core::device::{FileDevice, ReadAt};
-use luks_core::fs::Ext4;
+use luks_core::fs::MountedFs;
 use luks_core::luks::{self, LuksVolume};
 use luks_core::partition;
+use luks_core::secret::Secret;
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::time::Instant;
 
 fn main() {
@@ -31,29 +35,57 @@ fn main() {
     let path = match args.next() {
         Some(p) => p,
         None => {
-            eprintln!("usage: printf 'password' | read_image <image|device> [file-to-hash]");
+            eprintln!("usage: read_image <image|device> [file-to-hash]");
+            eprintln!("       the passphrase is prompted for, or piped in on stdin");
             std::process::exit(2);
         }
     };
     let hash_target = args.next();
 
-    let mut password = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut password)
-        .expect("read password from stdin");
-    // Tolerate a trailing newline from `echo`, since getting that wrong looks
-    // exactly like a wrong password.
-    if password.last() == Some(&b'\n') {
-        password.pop();
-    }
-    if password.last() == Some(&b'\r') {
-        password.pop();
-    }
+    let password = read_password();
 
-    if let Err(e) = run(&path, &password, hash_target.as_deref()) {
+    let result = run(&path, password.expose(), hash_target.as_deref());
+    // `password` is a Secret: dropping it zeroes the bytes. Dropped here
+    // explicitly rather than at the end of main, so it is gone before the
+    // process spends any time printing.
+    drop(password);
+
+    if let Err(e) = result {
         eprintln!("\nFAILED: {e}");
         std::process::exit(1);
     }
+}
+
+/// Prompt with echo off when there is a terminal; otherwise read stdin.
+///
+/// `String::into_bytes` reuses the allocation rather than copying, so the
+/// prompted passphrase exists as exactly one buffer, which `Secret` then zeroes
+/// on drop. What this cannot control is whether `rpassword` reallocated its
+/// buffer while reading — a freed copy could linger. That is acceptable for a
+/// host-side diagnostic on the developer's own machine and would not be on the
+/// phone, where the password never becomes a String at all.
+fn read_password() -> Secret {
+    let mut bytes = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("passphrase: ")
+            .expect("read passphrase from the terminal")
+            .into_bytes()
+    } else {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .expect("read passphrase from stdin");
+        buf
+    };
+
+    // Tolerate a trailing newline from `echo`, since getting that wrong looks
+    // exactly like a wrong password.
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    Secret::new(bytes)
 }
 
 fn run(path: &str, password: &[u8], hash_target: Option<&str>) -> luks_core::error::Result<()> {
@@ -104,11 +136,37 @@ fn run(path: &str, password: &[u8], hash_target: Option<&str>) -> luks_core::err
     let volume = LuksVolume::open(&dev, offset, &header, password)?;
     println!("unlock  {:.2} s", t.elapsed().as_secs_f64());
 
-    let fs = Ext4::mount(&volume)?;
-    println!("ext4    label {:?}", fs.volume_name());
+    // Which filesystem it is, decided by signature — the same call the phone
+    // makes, so a failure here is a failure there.
+    let fs = MountedFs::mount(&volume)?;
+    println!(
+        "fs      {}, label {:?}",
+        fs.kind().name(),
+        fs.label().unwrap_or("(none)")
+    );
+
+    // On btrfs the interesting content usually is not in the top-level tree:
+    // a Fedora install keeps / and /home in separate subvolumes.
+    let subvols = fs.subvolumes()?;
+    if !subvols.is_empty() {
+        println!("subvolumes ({}):", subvols.len());
+        for s in &subvols {
+            println!(
+                "  {:>6}  {}{}",
+                s.id,
+                s.path,
+                if s.is_read_only() { "  (read-only)" } else { "" }
+            );
+        }
+    }
 
     for e in fs.list_dir("/")? {
-        println!("  {:?} {}", e.file_type, e.name);
+        println!(
+            "  {:?} {}{}",
+            e.file_type,
+            e.name,
+            if e.is_subvolume { "  [subvolume]" } else { "" }
+        );
     }
 
     if let Some(target) = hash_target {

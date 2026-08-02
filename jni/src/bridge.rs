@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
-use luks_core::fs::{btrfs, detect, Btrfs, Ext4, FileType, FileInfo, FsKind};
+use luks_core::fs::FileType;
 use luks_core::luks::{self, keyslot, LuksVolume};
 use luks_core::partition::{self, PartitionTable, TableKind};
 use luks_core::secret::Secret;
@@ -184,151 +184,19 @@ pub struct VolumeHandle {
     pub partition_offset: u64,
 }
 
-/// The filesystem inside an unlocked volume, whichever one it turned out to be.
+/// The filesystem inside an unlocked volume.
 ///
-/// An enum rather than a `Box<dyn Filesystem>` because the two readers do not
-/// have the same shape and pretending they do costs more than it saves. ext4
-/// identifies a file by inode number; btrfs needs an inode *and* the tree it
-/// lives in, since subvolumes number their inodes independently. A trait
-/// flattening both to "u64" is exactly the mistake pass 4b removed from the
-/// core, and it would reintroduce it one layer up.
-pub enum MountedFs {
-    Ext4(Ext4<LuksVolume<SharedDevice>>),
-    Btrfs(Btrfs<LuksVolume<SharedDevice>>),
+/// The dispatch itself lives in `luks_core::fs::mounted`, so the host-side
+/// examples and any future desktop build make the same decision the same way.
+pub type MountedFs = luks_core::fs::MountedFs<LuksVolume<SharedDevice>>;
+pub use luks_core::fs::OpenFile;
+
+/// JSON shaping is a bridge concern, so it stays here rather than in core.
+trait SubvolumesJson {
+    fn subvolumes_json(&self) -> Vec<Value>;
 }
 
-/// A resolved file, held open across a streaming read.
-///
-/// The reason this exists rather than passing a path to each read: hashing a
-/// 1 GiB file in 1 MiB chunks would otherwise re-resolve the path a thousand
-/// times, and each resolution is a directory walk over USB.
-pub enum OpenFile {
-    Ext4(luks_core::fs::ext4::Inode),
-    /// The tree comes along because an inode number alone does not identify a
-    /// file on btrfs.
-    Btrfs {
-        tree: u64,
-        inode: btrfs::Inode,
-    },
-}
-
-impl OpenFile {
-    pub fn size(&self) -> u64 {
-        match self {
-            OpenFile::Ext4(i) => i.info().size,
-            OpenFile::Btrfs { inode, .. } => inode.size,
-        }
-    }
-
-    pub fn file_type(&self) -> FileType {
-        match self {
-            OpenFile::Ext4(i) => i.file_type(),
-            OpenFile::Btrfs { inode, .. } => inode.file_type(),
-        }
-    }
-}
-
-impl MountedFs {
-    /// Decide what is on the volume, then hand it to exactly one reader.
-    ///
-    /// The decision comes first because mounting consumes the volume and
-    /// re-opening it would mean running Argon2 a second time. See
-    /// [`luks_core::fs::detect`].
-    pub fn mount(volume: LuksVolume<SharedDevice>) -> Result<Self> {
-        match detect(&volume)? {
-            FsKind::Ext4 => Ok(MountedFs::Ext4(Ext4::mount(volume)?)),
-            FsKind::Btrfs => Ok(MountedFs::Btrfs(Btrfs::mount(volume)?)),
-        }
-    }
-
-    pub fn kind(&self) -> FsKind {
-        match self {
-            MountedFs::Ext4(_) => FsKind::Ext4,
-            MountedFs::Btrfs(_) => FsKind::Btrfs,
-        }
-    }
-
-    fn label(&self) -> Option<String> {
-        match self {
-            MountedFs::Ext4(fs) => {
-                let name = fs.volume_name();
-                (!name.is_empty()).then(|| name.to_string())
-            }
-            MountedFs::Btrfs(fs) => fs.volume_name().map(str::to_string),
-        }
-    }
-
-    fn uuid(&self) -> [u8; 16] {
-        match self {
-            MountedFs::Ext4(fs) => fs.uuid(),
-            MountedFs::Btrfs(fs) => fs.fsid(),
-        }
-    }
-
-    /// The allocation unit a user would recognise. ext4 calls it a block;
-    /// btrfs calls the same thing a sector and reserves "block" for its
-    /// 16 KiB metadata nodes.
-    fn block_size(&self) -> u32 {
-        match self {
-            MountedFs::Ext4(fs) => fs.block_size(),
-            MountedFs::Btrfs(fs) => fs.sector_size(),
-        }
-    }
-
-    fn size_bytes(&self) -> u64 {
-        match self {
-            MountedFs::Ext4(fs) => fs.superblock().blocks_count * fs.block_size() as u64,
-            MountedFs::Btrfs(fs) => fs.superblock().total_bytes,
-        }
-    }
-
-    pub fn list_dir(&self, path: &str) -> Result<Vec<luks_core::fs::DirEntry>> {
-        match self {
-            MountedFs::Ext4(fs) => fs.list_dir(path),
-            MountedFs::Btrfs(fs) => fs.list_dir(path),
-        }
-    }
-
-    pub fn file_info(&self, path: &str) -> Result<FileInfo> {
-        match self {
-            MountedFs::Ext4(fs) => fs.file_info(path),
-            MountedFs::Btrfs(fs) => fs.file_info(path),
-        }
-    }
-
-    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        match self {
-            MountedFs::Ext4(fs) => fs.read_file(path),
-            MountedFs::Btrfs(fs) => fs.read_file(path),
-        }
-    }
-
-    pub fn open(&self, path: &str) -> Result<OpenFile> {
-        match self {
-            MountedFs::Ext4(fs) => Ok(OpenFile::Ext4(fs.resolve(path)?)),
-            MountedFs::Btrfs(fs) => {
-                let found = fs.resolve_no_follow(fs.fs_tree(), path)?;
-                Ok(OpenFile::Btrfs {
-                    tree: found.tree.bytenr,
-                    inode: found.inode,
-                })
-            }
-        }
-    }
-
-    pub fn read_open(&self, file: &OpenFile, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        match (self, file) {
-            (MountedFs::Ext4(fs), OpenFile::Ext4(inode)) => fs.read_inode_data(inode, offset, buf),
-            (MountedFs::Btrfs(fs), OpenFile::Btrfs { tree, inode }) => {
-                fs.read_inode_data(*tree, inode, offset, buf)
-            }
-            // Only reachable by handing a file opened on one volume to another,
-            // which no caller does — but returning an error beats a panic on a
-            // path that runs with a device attached.
-            _ => Err(LuksError::UnknownFs),
-        }
-    }
-
+impl SubvolumesJson for MountedFs {
     /// Subvolumes, for a filesystem that has them. Empty on ext4 rather than
     /// absent, so the JSON has one shape.
     fn subvolumes_json(&self) -> Vec<Value> {

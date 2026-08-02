@@ -7,10 +7,12 @@
 pub mod btrfs;
 pub mod detect;
 pub mod ext4;
+pub mod mounted;
 
 pub use btrfs::Btrfs;
 pub use detect::{detect, FsKind};
 pub use ext4::Ext4;
+pub use mounted::{MountedFs, OpenFile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {

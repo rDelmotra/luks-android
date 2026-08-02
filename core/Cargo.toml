@@ -33,6 +33,11 @@ lzo = "0.1.2"
 
 [dev-dependencies]
 sha2 = "0.10"
+# Host-side examples only — never compiled into the Android library. Echo-off
+# terminal input is fiddly and platform-specific (termios on unix, console
+# handles on Windows); this is the crate everyone uses for it, and it is
+# Apache-2.0.
+rpassword = "7"
 
 [lints.rust]
 # `aes_armv8` is a custom cfg set in ../.cargo/config.toml — see the long note
