@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -46,6 +47,41 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
+ * Diagnostic logging — **debug builds only**.
+ *
+ * It exists because the phone has one USB-C port. Attaching a drive means
+ * unplugging the cable that carries `adb`, so nothing can be watched live; the
+ * logcat ring buffer survives the disconnect and is the only record of what
+ * happened while the drive was attached. (Wireless debugging would fix that,
+ * but `adb tcpip` opens an *unauthenticated* port, which is not something to
+ * do on a shared or public network.)
+ *
+ * ### What is deliberately not logged
+ *
+ * Never the passphrase, obviously — but also **never a file or directory name
+ * from the encrypted drive**. The whole premise of the tool is that those
+ * contents are private, and the system log is the wrong place for them: it
+ * outlives the session, it is not encrypted, and on a debug build a bug report
+ * would carry it off the device. So this logs *shapes* — counts, sizes, types,
+ * timings, error codes — which is everything needed to diagnose a transport
+ * failure and nothing that says what is on the drive.
+ *
+ * `BuildConfig.DEBUG` gates the lot, so a release build logs nothing at all
+ * rather than relying on this file staying disciplined.
+ */
+private object Trace {
+    const val TAG = "luks"
+
+    fun i(msg: String) {
+        if (BuildConfig.DEBUG) Log.i(TAG, msg)
+    }
+
+    fun e(msg: String, t: Throwable? = null) {
+        if (BuildConfig.DEBUG) Log.e(TAG, msg, t)
+    }
+}
+
+/**
  * Pass 3: unlock and browse.
  *
  * Adds password entry, the [UnlockService]-wrapped unlock, and a root
@@ -61,6 +97,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // A startup line, so a logcat dump taken after the drive was detached
+        // begins with proof of which build was running rather than with
+        // whatever the first failure happened to be.
+        Trace.i("start: luks_core ${LuksNative.nativeVersion()}")
 
         // Keeps the app out of the recents thumbnail and blocks screenshots.
         // Set here rather than on the unlock screen alone: the file listing of
@@ -563,16 +603,26 @@ private suspend fun openDevice(
     context: Context,
     target: UsbMassStorage.Target,
 ): DeviceState {
+    Trace.i("open: vid=0x%04x pid=0x%04x".format(target.device.vendorId, target.device.productId))
     val granted = UsbMassStorage.requestPermission(context, target.device)
     if (!granted) {
+        Trace.e("open: USB permission denied")
         return DeviceState.Failed("permission denied")
     }
     return try {
+        val started = System.currentTimeMillis()
         val device = withContext(Dispatchers.IO) { UsbMassStorage.open(context, target) }
+        Trace.i(
+            "open: ok in ${System.currentTimeMillis() - started} ms, " +
+                "${device.info.partitions.size} partitions, " +
+                "${device.luksPartitions.size} LUKS"
+        )
         DeviceState.Open(device)
     } catch (e: LuksException) {
+        Trace.e("open: failed [${e.code}] ${e.message}")
         DeviceState.Failed("[${e.code}] ${e.message}")
     } catch (e: Exception) {
+        Trace.e("open: failed", e)
         DeviceState.Failed(e.message ?: e.toString())
     }
 }
@@ -590,18 +640,34 @@ private suspend fun unlock(
     partition: PartitionInfo,
     password: ByteArray,
 ): VolumeState = try {
+    Trace.i("unlock: partition at ${partition.offsetBytes} bytes")
+    val started = System.currentTimeMillis()
     UnlockService.holding(context) {
         withContext(Dispatchers.IO) {
             val v = device.unlock(partition.offsetBytes, password)
-            VolumeState.Unlocked(v, v.listDir("/"))
+            val kdf = System.currentTimeMillis() - started
+            val info = v.info
+            // The line that matters for btrfs-over-USB: which filesystem the
+            // signature picked, and whether subvolume enumeration survived the
+            // transport. Paths are shapes here — a count, not the names.
+            Trace.i(
+                "unlock: ok in $kdf ms · fs=${info.fsType} " +
+                    "block=${info.blockSize} size=${info.sizeBytes} " +
+                    "subvolumes=${info.subvolumes.size}"
+            )
+            val entries = v.listDir("/")
+            Trace.i("unlock: root listed, ${entries.size} entries")
+            VolumeState.Unlocked(v, entries)
         }
     }
 } catch (e: LuksException) {
+    Trace.e("unlock: failed [${e.code}] ${e.message}")
     VolumeState.Failed(
         partition,
         if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}",
     )
 } catch (e: Exception) {
+    Trace.e("unlock: failed", e)
     VolumeState.Failed(partition, e.message ?: e.toString())
 } finally {
     // Belt and braces: LuksDevice.unlock already zeroes this, but that only
@@ -644,10 +710,12 @@ private suspend fun exportFile(
         }
 
         val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+        Trace.i("export: %d bytes in %.1f s · %.1f MiB/s".format(done, secs, done / secs / (1L shl 20)))
         "saved ${formatSize(done)} in %.1f s · %.1f MiB/s"
             .format(secs, done / secs / (1L shl 20))
     }
 } catch (e: Exception) {
+    Trace.e("export: failed", e)
     "save failed: ${e.message}"
 }
 
@@ -657,7 +725,11 @@ private const val EXPORT_CHUNK = 1 shl 20
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
     val d = withContext(Dispatchers.IO) { volume.sha256(path) }
     val mbPerSec = d.bytesPerSec.toDouble() / (1L shl 20)
+    // Size and rate, not the path: this is the throughput measurement, and the
+    // name of the file being read off an encrypted drive is not part of it.
+    Trace.i("hash: %d bytes in %d ms · %.1f MiB/s".format(d.bytes, d.elapsedMs, mbPerSec))
     "${d.sha256}\n${formatSize(d.bytes)} in ${d.elapsedMs} ms · %.1f MiB/s".format(mbPerSec)
 } catch (e: Exception) {
+    Trace.e("hash: failed", e)
     "hash failed: ${e.message}"
 }

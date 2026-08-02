@@ -54,6 +54,10 @@ android {
 
     buildFeatures {
         compose = true
+        // For BuildConfig.DEBUG, which gates all diagnostic logging. A release
+        // build must not write what is on an encrypted drive into the system
+        // log — see the Trace object in MainActivity.
+        buildConfig = true
     }
 
     packaging {
