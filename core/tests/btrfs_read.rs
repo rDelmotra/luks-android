@@ -1129,20 +1129,6 @@ fn reads_files_on_a_mixed_block_group_filesystem() {
 }
 
 #[test]
-fn a_compressed_extent_is_refused_by_name_for_now() {
-    // Not implemented yet, and the important part is that it says so rather
-    // than handing back the compressed bytes as if they were the file.
-    let fs = mount("compress.img");
-    for name in ["/zlib.txt", "/lzo.txt", "/zstd.txt"] {
-        let err = fs.read_file(name).expect_err(name);
-        assert!(
-            err.to_string().contains("compressed"),
-            "{name}: unhelpful error {err}"
-        );
-    }
-}
-
-#[test]
 fn an_inline_file_is_readable_on_the_compressed_image() {
     // tiny.txt is below max_inline, and the mount that wrote it had no
     // compression forced, so it is a plain inline extent.
@@ -1184,5 +1170,108 @@ fn reading_a_file_costs_one_device_read_per_extent() {
         reads <= 12,
         "reading a two-extent file took {reads} device reads — the extent runs \
          are being chopped up"
+    );
+}
+
+// --- compression -----------------------------------------------------------
+
+/// The same 256 KiB of text `tools/gen-btrfs-fixtures.sh` writes into each
+/// compressed file. Deliberately not one repeated byte: a single repeated byte
+/// can be encoded in ways that hide a segment-framing bug, because every
+/// segment's output looks the same as every other's.
+fn expected_payload() -> Vec<u8> {
+    (0..5000)
+        .map(|i| format!("line {i:06} the quick brown fox jumps over the lazy dog\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+#[test]
+fn reads_zlib_lzo_and_zstd_extents() {
+    let fs = mount("compress.img");
+    let expected = expected_payload();
+    assert!(expected.len() > 64 * 1024, "must span several extents");
+
+    for name in ["/zlib.txt", "/lzo.txt", "/zstd.txt"] {
+        let got = fs.read_file(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(got.len(), expected.len(), "{name}: wrong length");
+        assert_eq!(got, expected, "{name}: wrong contents");
+    }
+}
+
+#[test]
+fn the_fixture_is_actually_compressed() {
+    // Without this the test above would pass just as happily against three
+    // uncompressed files, and would be proving nothing at all.
+    let fs = mount("compress.img");
+    let root = fs.fs_tree();
+    let expected_len = expected_payload().len() as u64;
+
+    for (name, algorithm) in [("zlib.txt", 1u8), ("lzo.txt", 2), ("zstd.txt", 3)] {
+        let inode = fs
+            .resolve_no_follow(root.bytenr, root.root_dirid, name)
+            .unwrap();
+        let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+        assert!(!extents.is_empty(), "{name}");
+        assert!(
+            extents.iter().all(|e| e.compression == algorithm),
+            "{name}: expected algorithm {algorithm}, got {:?}",
+            extents.iter().map(|e| e.compression).collect::<Vec<_>>()
+        );
+        let on_disk: u64 = extents.iter().map(|e| e.disk_num_bytes).sum();
+        assert!(
+            on_disk < expected_len / 2,
+            "{name}: {on_disk} bytes on disk for {expected_len} of text is not compression"
+        );
+    }
+}
+
+#[test]
+fn reads_from_the_middle_of_a_compressed_file() {
+    // Compression is per extent, so a partial read has to decompress the whole
+    // extent and then take a slice of it at `offset + within`. Dropping either
+    // term returns real text from the wrong part of the file — which looks
+    // entirely plausible.
+    let fs = mount("compress.img");
+    let expected = expected_payload();
+
+    for name in ["/zlib.txt", "/lzo.txt", "/zstd.txt"] {
+        for (offset, len) in [
+            (0usize, 64usize),
+            (4095, 4098),
+            (100_000, 1000),
+            (expected.len() - 50, 50),
+        ] {
+            let mut buf = vec![0u8; len];
+            let n = fs.read_chunk(name, offset as u64, &mut buf).unwrap();
+            assert_eq!(n, len, "{name} at {offset}");
+            assert_eq!(buf, expected[offset..offset + len], "{name} at {offset}");
+        }
+    }
+}
+
+#[test]
+fn lzo_segment_framing_spans_more_than_one_sector() {
+    // The LZO-specific trap: segments are independently compressed and a
+    // segment header never straddles a sector boundary, so the reader has to
+    // skip padding the writer inserted. Miss it and the first 4 KiB decodes
+    // perfectly and everything after it is wrong — so this asserts the file is
+    // big enough for that to be exercised at all.
+    let fs = mount("compress.img");
+    let root = fs.fs_tree();
+    let inode = fs
+        .resolve_no_follow(root.bytenr, root.root_dirid, "lzo.txt")
+        .unwrap();
+    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+
+    let biggest = extents
+        .iter()
+        .map(|e| e.disk_num_bytes)
+        .max()
+        .expect("lzo.txt has extents");
+    assert!(
+        biggest > fs.sector_size() as u64,
+        "the compressed extent is {biggest} bytes, which fits in one sector — \
+         this fixture cannot exercise the segment framing"
     );
 }

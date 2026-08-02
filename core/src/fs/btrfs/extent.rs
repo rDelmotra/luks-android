@@ -231,10 +231,21 @@ impl<D: ReadAt> Btrfs<D> {
             if extent.is_zeros() {
                 out.fill(0);
             } else if extent.is_compressed() {
-                return Err(LuksError::UnsupportedFsFeature(format!(
-                    "btrfs compressed extent (algorithm {})",
-                    extent.compression
-                )));
+                // Compression is per *extent*, so serving any part of one means
+                // decompressing all of it — bounded at 128 KiB by btrfs itself.
+                // A sequential reader whose chunks are smaller than an extent
+                // will therefore decompress the same extent more than once;
+                // acceptable, and noted rather than cached, because the reads
+                // that matter are far larger than 128 KiB.
+                let plain = self.decompress_extent(&extent)?;
+                let start = (extent.offset + within) as usize;
+                let end = start
+                    .checked_add(take)
+                    .filter(|e| *e <= plain.len())
+                    .ok_or(LuksError::CorruptFs(
+                        "btrfs compressed extent is shorter than the range it covers",
+                    ))?;
+                out.copy_from_slice(&plain[start..end]);
             } else if let Some(inline) = &extent.inline {
                 let start = (extent.offset + within) as usize;
                 let end = start
@@ -263,6 +274,31 @@ impl<D: ReadAt> Btrfs<D> {
             }
         }
         Ok(done)
+    }
+
+    /// Decompress a whole compressed extent, inline or not.
+    fn decompress_extent(&self, extent: &FileExtent) -> Result<Vec<u8>> {
+        let expected = extent.ram_bytes as usize;
+        match &extent.inline {
+            // An inline extent can be compressed too: the leaf holds the
+            // compressed bytes and `ram_bytes` the size they expand to.
+            Some(payload) => super::compress::decompress(
+                extent.compression,
+                payload,
+                expected,
+                self.sector_size(),
+            ),
+            None => {
+                let mut raw = vec![0u8; extent.disk_num_bytes as usize];
+                self.read_logical(extent.disk_bytenr, &mut raw)?;
+                super::compress::decompress(
+                    extent.compression,
+                    &raw,
+                    expected,
+                    self.sector_size(),
+                )
+            }
+        }
     }
 
     /// Every extent item of a file, in order. Mostly useful for tests and for

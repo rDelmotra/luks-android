@@ -24,6 +24,7 @@
 //! several incompat flags that sound alarming are safe to accept.
 
 pub mod chunk;
+pub mod compress;
 pub mod crc32c;
 pub mod cursor;
 pub mod dir;
