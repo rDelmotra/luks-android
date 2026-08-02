@@ -834,45 +834,45 @@ fn a_listing_comes_back_in_a_stable_order() {
 fn looks_a_name_up_without_scanning_the_directory() {
     // The point of hashing the name: finding one file in a 400-entry directory
     // must not cost 400 entries' worth of reads.
-    let counting = CountingDevice {
-        inner: device("plain.img"),
-        reads: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let fs = Btrfs::mount(counting).unwrap();
-    let root = fs.fs_tree();
-    let load = || {
-        fs.device()
-            .reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
-
-    let many = fs
-        .lookup(root.bytenr, root.root_dirid, "many")
-        .unwrap()
-        .unwrap();
-    let docs = fs
-        .lookup(root.bytenr, root.root_dirid, "docs")
-        .unwrap()
-        .unwrap();
-
     // The claim worth testing is that a lookup costs the same in a directory of
     // 400 entries as in one of 3 — cost follows tree depth, not directory size.
     // Comparing lookup against listing would instead measure how big this
     // particular fixture is, and at 400 small entries it is not big enough for
     // that comparison to say anything.
-    let before = load();
-    let found = fs
-        .lookup(root.bytenr, many.location.objectid, "f0399.txt")
-        .unwrap()
-        .expect("the last file in a 400-entry directory");
-    let big_dir_reads = load() - before;
-    assert_eq!(found.name, b"f0399.txt");
+    //
+    // Each measurement gets its **own mount**, because the node cache would
+    // otherwise make the second lookup free and the comparison vacuous — both
+    // sides zero, the assertion passing while measuring nothing. The two runs
+    // do identical work up to the lookup being timed, so what is left is the
+    // difference between the directories.
+    fn lookup_cost(dir_name: &str, file: &str) -> usize {
+        let counting = CountingDevice {
+            inner: device("plain.img"),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let fs = Btrfs::mount(counting).unwrap();
+        let load = |fs: &Btrfs<CountingDevice>| {
+            fs.device()
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let root = fs.fs_tree();
+        let dir = fs
+            .lookup(root.bytenr, root.root_dirid, dir_name)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{dir_name} exists"));
 
-    let before = load();
-    fs.lookup(root.bytenr, docs.location.objectid, "readme.md")
-        .unwrap()
-        .expect("a file in a 3-entry directory");
-    let small_dir_reads = load() - before;
+        let before = load(&fs);
+        let found = fs
+            .lookup(root.bytenr, dir.location.objectid, file)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{file} exists in {dir_name}"));
+        assert_eq!(found.name, file.as_bytes());
+        load(&fs) - before
+    }
+
+    let big_dir_reads = lookup_cost("many", "f0399.txt");
+    let small_dir_reads = lookup_cost("docs", "readme.md");
 
     assert_eq!(
         big_dir_reads, small_dir_reads,
@@ -880,8 +880,14 @@ fn looks_a_name_up_without_scanning_the_directory() {
          in a 3-entry directory {small_dir_reads} — the hash index is not \
          doing its job"
     );
-    // Tree depth here is 2 (root node + leaf), and that is the whole cost.
-    assert_eq!(big_dir_reads, 2);
+    // A bound rather than an equality. The tree is 2 levels deep, so a cold
+    // lookup reads at most 2 nodes; whether it reads fewer depends on which
+    // leaves the preceding lookup happened to pull into the cache, and pinning
+    // that would be pinning an artefact of how mkfs laid this fixture out.
+    assert!(
+        big_dir_reads <= 2,
+        "a lookup cost {big_dir_reads} reads on a 2-level tree"
+    );
 }
 
 #[test]
@@ -1179,6 +1185,105 @@ fn reading_a_file_costs_one_device_read_per_extent() {
         "reading a two-extent file took {reads} device reads — either the \
          extent runs are being chopped up, or the checksum lookup is being \
          repeated per sector instead of per extent"
+    );
+}
+
+#[test]
+fn streaming_a_file_does_not_re_descend_the_trees_per_chunk() {
+    // The bug this pins was invisible on fixtures and cost 27% of a real read.
+    //
+    // Streaming reads a file in chunks, and every chunk used to pay a fresh
+    // descent of two trees: the fs tree, to find the extent covering the
+    // offset, and the checksum tree, to verify what came back. Both start at a
+    // root that never changes, so the same nodes were fetched again per chunk.
+    // On the developer's 1 TB drive that was 3729 metadata reads against 618
+    // data reads — 88% of all I/O, and about sixty fetches of each distinct
+    // node.
+    //
+    // The property worth asserting is not a read count, which depends on the
+    // fixture, but a *shape*: halving the chunk size doubles the data reads and
+    // must leave the metadata reads alone. A cache that works makes the second
+    // and later descents free; one that does not makes both numbers scale
+    // together.
+    let cost = |chunk: usize| -> usize {
+        let counting = CountingDevice {
+            inner: device("plain.img"),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let fs = Btrfs::mount(counting).unwrap();
+        let root = fs.fs_tree();
+        let located = fs.resolve_no_follow(root, "/big.bin").unwrap();
+
+        let before = fs
+            .device()
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut buf = vec![0u8; chunk];
+        let mut done = 0u64;
+        while done < located.inode.size {
+            let got = fs
+                .read_inode_data(located.tree.bytenr, &located.inode, done, &mut buf)
+                .unwrap();
+            assert!(got > 0, "short read at {done}");
+            done += got as u64;
+        }
+        fs.device()
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+            - before
+    };
+
+    // 2 MiB file. 32 chunks against 64: the data reads must double, so the
+    // total may grow by about 32. If the trees were being re-walked it would
+    // grow by several times that, because each descent is worth ~6 reads.
+    let coarse = cost(64 * 1024);
+    let fine = cost(32 * 1024);
+    let extra_chunks = 32;
+
+    assert!(
+        fine <= coarse + extra_chunks + 4,
+        "doubling the chunk count took reads from {coarse} to {fine}; only \
+         about {extra_chunks} more data reads are justified, so the trees are \
+         being re-descended per chunk"
+    );
+}
+
+#[test]
+fn the_node_cache_serves_the_repeated_descents() {
+    // The counterpart to the test above, stated from the cache's side: reading
+    // a file in many small chunks must be dominated by hits, because every
+    // chunk after the first re-walks nodes the previous one already brought in.
+    //
+    // Honest about what this does *not* prove: it reads the cache's own
+    // counters, so it would still pass if lookups were counted and the result
+    // thrown away — checked by stubbing exactly that, which this test survived
+    // and `streaming_a_file_does_not_re_descend_the_trees_per_chunk` did not.
+    // That one is the load-bearing assertion; this one keeps the reported hit
+    // rate honest, since a diagnostic prints it.
+    let fs = mount("plain.img");
+    let root = fs.fs_tree();
+    let located = fs.resolve_no_follow(root, "/big.bin").unwrap();
+
+    let (hits_before, misses_before) = fs.node_cache_stats();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut done = 0u64;
+    while done < located.inode.size {
+        let got = fs
+            .read_inode_data(located.tree.bytenr, &located.inode, done, &mut buf)
+            .unwrap();
+        done += got as u64;
+    }
+    let hits = fs.node_cache_stats().0 - hits_before;
+    let misses = fs.node_cache_stats().1 - misses_before;
+
+    assert!(
+        misses <= 8,
+        "streaming a 2 MiB file missed the node cache {misses} times; a file \
+         this size touches only a handful of distinct nodes"
+    );
+    assert!(
+        hits > misses * 4,
+        "{hits} hits against {misses} misses — the descents are not being reused"
     );
 }
 

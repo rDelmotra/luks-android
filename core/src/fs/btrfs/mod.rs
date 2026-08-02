@@ -23,6 +23,7 @@
 //! to make *allocation* work. A reader never consults them, which is why
 //! several incompat flags that sound alarming are safe to accept.
 
+mod cache;
 pub mod chunk;
 pub mod compress;
 pub mod csum;
@@ -100,6 +101,10 @@ pub struct Btrfs<D: ReadAt> {
     /// Same reasoning, and it matters more: every data read consults this.
     /// `None` on a filesystem that keeps no data checksums.
     csum_tree: Option<TreeRoot>,
+    /// Tree nodes already read and verified. See [`cache`] for the measurement
+    /// that put it here — six metadata reads per data read, all of them
+    /// re-descending the same two trees.
+    nodes: cache::NodeCache,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -126,10 +131,12 @@ impl<D: ReadAt> Btrfs<D> {
         }
 
         let chunks = ChunkMap::bootstrap(&sb)?;
+        let nodes = cache::NodeCache::new(sb.node_size);
         let mut fs = Btrfs {
             device,
             sb,
             chunks,
+            nodes,
             // Placeholder: resolving it needs the chunk map that the next two
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
@@ -188,12 +195,30 @@ impl<D: ReadAt> Btrfs<D> {
     }
 
     /// Read and verify the tree node at logical address `logical`.
+    ///
+    /// Served from the node cache when possible. A tree descent touches one
+    /// node per level and every descent starts at the same root, so without the
+    /// cache the top of each tree is re-read once per operation — which
+    /// measured as 88% of all device reads on a large file. See [`cache`].
     pub fn read_node(&self, logical: u64) -> Result<Node> {
+        if let Some(node) = self.nodes.get(logical) {
+            return Ok(node);
+        }
         // Node reads are always node_size, whatever the caller wants out of
         // them, because the checksum covers the whole block.
         let mut raw = vec![0u8; self.sb.node_size as usize];
         self.read_logical(logical, &mut raw)?;
-        Node::parse(raw, logical, self.sb.csum_type, &self.sb.metadata_uuid)
+        let node = Node::parse(raw, logical, self.sb.csum_type, &self.sb.metadata_uuid)?;
+        self.nodes.insert(logical, &node);
+        Ok(node)
+    }
+
+    /// Node-cache hits and misses since mount.
+    ///
+    /// Exposed so a diagnostic can show the hit rate rather than leaving it to
+    /// be inferred from a device read count, which mixes metadata with data.
+    pub fn node_cache_stats(&self) -> (u64, u64) {
+        self.nodes.stats()
     }
 
     /// Visit every item in the tree rooted at `root`, in key order.

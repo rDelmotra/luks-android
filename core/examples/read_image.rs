@@ -412,6 +412,17 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
             "  amplification   {:>6.2}x  (device bytes per file byte)",
             io.bytes as f64 / done as f64
         );
+        if let Some((hits, misses)) = fs.cache_stats() {
+            let total = hits + misses;
+            println!(
+                "  node cache      {:>6.1}% hit   {hits} hits, {misses} misses",
+                if total == 0 {
+                    0.0
+                } else {
+                    100.0 * hits as f64 / total as f64
+                }
+            );
+        }
         dev.print_histogram();
     }
 

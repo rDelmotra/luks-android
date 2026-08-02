@@ -115,6 +115,7 @@ pub struct KeyPtr {
 /// The block is kept rather than parsed into owned items because item data is
 /// read as byte slices, and for a leaf full of file extents that would mean
 /// allocating and copying a node's worth of vectors to look at one of them.
+#[derive(Clone)]
 pub struct Node {
     raw: Vec<u8>,
     pub level: u8,

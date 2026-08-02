@@ -166,4 +166,17 @@ impl<D: ReadAt> MountedFs<D> {
             MountedFs::Btrfs(fs) => fs.subvolumes(),
         }
     }
+
+    /// Metadata-cache hits and misses, for the filesystems that keep one.
+    ///
+    /// `None` for ext4, which has no equivalent — an ext4 inode names physical
+    /// blocks directly, so reading a file never re-walks a tree. The
+    /// indirection that makes btrfs need a cache is the same indirection that
+    /// makes it able to verify data.
+    pub fn cache_stats(&self) -> Option<(u64, u64)> {
+        match self {
+            MountedFs::Ext4(_) => None,
+            MountedFs::Btrfs(fs) => Some(fs.node_cache_stats()),
+        }
+    }
 }
