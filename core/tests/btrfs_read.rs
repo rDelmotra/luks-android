@@ -23,7 +23,7 @@
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, Key, Node};
-use luks_core::fs::Btrfs;
+use luks_core::fs::{Btrfs, FileType};
 
 const IMAGES: [&str; 3] = ["plain.img", "compress.img", "mixed-4k.img"];
 
@@ -722,4 +722,261 @@ fn searching_costs_the_depth_of_the_tree_not_its_size() {
         "walking read {walked} nodes, searching {searched} — the fixture is \
          too small for this comparison to mean anything"
     );
+}
+
+// --- inodes and directories ------------------------------------------------
+
+fn names(entries: &[luks_core::fs::DirEntry]) -> Vec<String> {
+    let mut v: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn lists_the_root_directory() {
+    let fs = mount("plain.img");
+    let entries = fs.list_dir("/").unwrap();
+    assert_eq!(
+        names(&entries),
+        vec![
+            "big.bin",
+            "café-naïve-日本語.txt",
+            "docs",
+            "hello.txt",
+            "link-to-hello",
+            "many",
+        ]
+    );
+    // btrfs stores no "." or ".." items at all, so unlike ext4 there is nothing
+    // to filter out — worth asserting so a future "helpful" filter is not added.
+    assert!(!entries.iter().any(|e| e.name == "." || e.name == ".."));
+}
+
+#[test]
+fn reports_the_type_of_each_entry() {
+    let fs = mount("plain.img");
+    let entries = fs.list_dir("/").unwrap();
+    let of = |n: &str| entries.iter().find(|e| e.name == n).unwrap().file_type;
+    assert_eq!(of("hello.txt"), FileType::Regular);
+    assert_eq!(of("docs"), FileType::Directory);
+    assert_eq!(of("link-to-hello"), FileType::Symlink);
+    assert_eq!(of("many"), FileType::Directory);
+}
+
+#[test]
+fn lists_nested_directories() {
+    let fs = mount("plain.img");
+    assert_eq!(
+        names(&fs.list_dir("/docs").unwrap()),
+        vec!["link-to-deep", "nested", "readme.md"]
+    );
+    assert_eq!(
+        names(&fs.list_dir("/docs/nested").unwrap()),
+        vec!["deep.txt"]
+    );
+    // Leading and trailing slashes, and "." components, must not change the
+    // answer.
+    assert_eq!(
+        names(&fs.list_dir("docs/./nested/").unwrap()),
+        vec!["deep.txt"]
+    );
+}
+
+#[test]
+fn lists_a_directory_that_spans_several_leaves() {
+    // 400 entries do not fit in one 16 KiB leaf, so this is the case where a
+    // listing silently truncates if the cursor cannot cross a leaf boundary.
+    let fs = mount("plain.img");
+    let entries = fs.list_dir("/many").unwrap();
+    assert_eq!(entries.len(), 400);
+    assert!(entries.iter().all(|e| e.file_type == FileType::Regular));
+
+    let listed = names(&entries);
+    let expected: Vec<String> = (0..400).map(|i| format!("f{i:04}.txt")).collect();
+    assert_eq!(listed, expected);
+}
+
+#[test]
+fn a_listing_comes_back_in_a_stable_order() {
+    // DIR_INDEX is keyed by a sequence number, so the order is stable across
+    // reads. It is *creation* order, not alphabetical — mkfs --rootdir copies
+    // the staging directory in readdir order, so f0251.txt legitimately comes
+    // first. Asserting alphabetical order here would be asserting something
+    // btrfs never promised.
+    let fs = mount("plain.img");
+    let first: Vec<String> = fs
+        .list_dir("/many")
+        .unwrap()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    let second: Vec<String> = fs
+        .list_dir("/many")
+        .unwrap()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    assert_eq!(first, second, "the order must not vary between reads");
+    assert_eq!(first.len(), 400);
+
+    let mut sorted = first.clone();
+    sorted.sort();
+    assert_ne!(
+        first, sorted,
+        "this fixture happens to be stored out of alphabetical order, which is \
+         what makes it evidence that the order comes from DIR_INDEX"
+    );
+}
+
+#[test]
+fn looks_a_name_up_without_scanning_the_directory() {
+    // The point of hashing the name: finding one file in a 400-entry directory
+    // must not cost 400 entries' worth of reads.
+    let counting = CountingDevice {
+        inner: device("plain.img"),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let fs = Btrfs::mount(counting).unwrap();
+    let root = fs.fs_tree().unwrap();
+    let load = || {
+        fs.device()
+            .reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+
+    let many = fs
+        .lookup(root.bytenr, root.root_dirid, "many")
+        .unwrap()
+        .unwrap();
+    let docs = fs
+        .lookup(root.bytenr, root.root_dirid, "docs")
+        .unwrap()
+        .unwrap();
+
+    // The claim worth testing is that a lookup costs the same in a directory of
+    // 400 entries as in one of 3 — cost follows tree depth, not directory size.
+    // Comparing lookup against listing would instead measure how big this
+    // particular fixture is, and at 400 small entries it is not big enough for
+    // that comparison to say anything.
+    let before = load();
+    let found = fs
+        .lookup(root.bytenr, many.location.objectid, "f0399.txt")
+        .unwrap()
+        .expect("the last file in a 400-entry directory");
+    let big_dir_reads = load() - before;
+    assert_eq!(found.name, b"f0399.txt");
+
+    let before = load();
+    fs.lookup(root.bytenr, docs.location.objectid, "readme.md")
+        .unwrap()
+        .expect("a file in a 3-entry directory");
+    let small_dir_reads = load() - before;
+
+    assert_eq!(
+        big_dir_reads, small_dir_reads,
+        "a lookup in a 400-entry directory cost {big_dir_reads} reads and one \
+         in a 3-entry directory {small_dir_reads} — the hash index is not \
+         doing its job"
+    );
+    // Tree depth here is 2 (root node + leaf), and that is the whole cost.
+    assert_eq!(big_dir_reads, 2);
+}
+
+#[test]
+fn a_missing_name_is_not_found_rather_than_an_error() {
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap();
+    assert!(fs
+        .lookup(root.bytenr, root.root_dirid, "nope.txt")
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        fs.list_dir("/nope").unwrap_err(),
+        LuksError::NotFound(_)
+    ));
+}
+
+#[test]
+fn a_unicode_name_round_trips() {
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap();
+    let found = fs
+        .lookup(root.bytenr, root.root_dirid, "café-naïve-日本語.txt")
+        .unwrap()
+        .expect("hashing must be over the raw bytes, not over chars");
+    assert_eq!(found.file_type, FileType::Regular);
+}
+
+#[test]
+fn listing_a_file_is_refused() {
+    let fs = mount("plain.img");
+    assert!(matches!(
+        fs.list_dir("/hello.txt").unwrap_err(),
+        LuksError::NotADirectory(_)
+    ));
+    assert!(matches!(
+        fs.list_dir("/hello.txt/inner").unwrap_err(),
+        LuksError::NotADirectory(_)
+    ));
+}
+
+#[test]
+fn reads_inode_metadata() {
+    let fs = mount("plain.img");
+    let info = fs.file_info("/hello.txt").unwrap();
+    assert_eq!(info.size, 12); // "hello btrfs\n"
+    assert_eq!(info.file_type, FileType::Regular);
+    assert_eq!(info.mode & 0xF000, 0x8000);
+    assert_eq!(info.links, 1);
+    assert!(info.mtime > 1_600_000_000, "a plausible timestamp");
+
+    let big = fs.file_info("/big.bin").unwrap();
+    assert_eq!(big.size, 2 * 1024 * 1024);
+
+    let dir = fs.file_info("/docs").unwrap();
+    assert_eq!(dir.file_type, FileType::Directory);
+}
+
+#[test]
+fn a_symlink_is_reported_as_one_rather_than_followed() {
+    // Following needs the extent reader, which does not exist yet. The
+    // important part is that it does not silently resolve to something else.
+    let fs = mount("plain.img");
+    let info = fs.file_info("/link-to-hello").unwrap();
+    assert_eq!(info.file_type, FileType::Symlink);
+    assert_eq!(info.size, 9); // "hello.txt"
+}
+
+#[test]
+fn every_image_lists_its_own_contents() {
+    assert_eq!(
+        names(&mount("mixed-4k.img").list_dir("/").unwrap()),
+        vec!["docs", "hello.txt"]
+    );
+    assert_eq!(
+        names(&mount("compress.img").list_dir("/").unwrap()),
+        vec!["lzo.txt", "sparse.bin", "tiny.txt", "zlib.txt", "zstd.txt"]
+    );
+}
+
+#[test]
+fn the_name_hash_matches_what_mkfs_filed_entries_under() {
+    // Different convention from the block checksum: seed !1, and no final
+    // inversion. Getting it wrong makes every lookup miss while every checksum
+    // still verifies, so it is worth pinning to a value read off the disk.
+    use luks_core::fs::btrfs::crc32c::name_hash;
+    assert_eq!(name_hash(b"hello.txt"), 1096805209);
+    assert_eq!(name_hash(b"default"), 2378154706);
+
+    // And the hash must actually agree with the key mkfs used, for every entry
+    // in the root directory rather than just the two above.
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap();
+    for entry in fs.list_dir("/").unwrap() {
+        let found = fs
+            .lookup(root.bytenr, root.root_dirid, &entry.name)
+            .unwrap();
+        assert!(found.is_some(), "{} was listed but not findable", entry.name);
+    }
 }

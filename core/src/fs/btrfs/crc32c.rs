@@ -31,6 +31,15 @@ const TABLE: [u32; 256] = {
     table
 };
 
+/// The raw accumulator: seeded with `seed`, with no final inversion.
+pub fn crc32c_seed(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = seed;
+    for &b in data {
+        crc = (crc >> 8) ^ TABLE[((crc ^ b as u32) & 0xFF) as usize];
+    }
+    crc
+}
+
 /// Standard CRC-32C of `data`: seeded with `!0`, and inverted at the end.
 ///
 /// The final inversion is the part worth stating, because the kernel's own
@@ -39,11 +48,20 @@ const TABLE: [u32; 256] = {
 /// value that is wrong by exactly a bitwise NOT. Verified directly against
 /// `fixtures/btrfs/plain.img`, whose stored superblock checksum is 0xf7b4210d.
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in data {
-        crc = (crc >> 8) ^ TABLE[((crc ^ b as u32) & 0xFF) as usize];
-    }
-    !crc
+    !crc32c_seed(!0, data)
+}
+
+/// The hash btrfs files a directory entry under, which is the `offset` of its
+/// `DIR_ITEM` key.
+///
+/// **Same polynomial as the block checksum, different convention**: seeded with
+/// `!1` instead of `!0`, and *not* inverted. There is no principle behind the
+/// difference; it is simply what btrfs does, and assuming one convention covers
+/// both is the kind of mistake that makes every directory lookup miss while the
+/// checksums all verify. Confirmed against all 228 `DIR_ITEM`s in
+/// `fixtures/btrfs/plain.img`.
+pub fn name_hash(name: &[u8]) -> u64 {
+    crc32c_seed(!1, name) as u64
 }
 
 #[cfg(test)]

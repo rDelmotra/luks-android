@@ -26,11 +26,14 @@
 pub mod chunk;
 pub mod crc32c;
 pub mod cursor;
+pub mod dir;
+pub mod inode;
 pub mod superblock;
 pub mod tree;
 
 pub use chunk::{Chunk, ChunkMap};
 pub use cursor::Cursor;
+pub use inode::{DirEntryItem, Inode};
 pub use superblock::{CsumType, Superblock};
 pub use tree::{Key, Node};
 
