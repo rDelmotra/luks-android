@@ -69,7 +69,8 @@ pub fn error_code(e: &LuksError) -> i32 {
         | BadKeyLength(_)
         | BadSectorSize(_)
         | UnsupportedFsFeature(_)
-        | NotExt4(_) => code::UNSUPPORTED,
+        | NotExt4(_)
+        | NotBtrfs(_) => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
@@ -84,6 +85,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | BadExtentHeader(_)
         | BadExtentTree(_)
         | CorruptFs(_)
+        | FsChecksumMismatch(_)
         | SymlinkLoop(_)
         | BadGpt(_)
         | OutOfBounds => code::CORRUPT,

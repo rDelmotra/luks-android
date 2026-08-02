@@ -4,8 +4,10 @@
 //! not know or care whether it sits on a plain image, a `LuksVolume`, or a USB
 //! device. V1 is read-only by construction: there are no mutating methods.
 
+pub mod btrfs;
 pub mod ext4;
 
+pub use btrfs::Btrfs;
 pub use ext4::Ext4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

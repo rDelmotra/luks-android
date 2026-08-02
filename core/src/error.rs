@@ -65,6 +65,15 @@ pub enum LuksError {
     #[error("not an ext4 filesystem: magic 0x{0:04x}, expected 0xef53")]
     NotExt4(u16),
 
+    #[error("not a btrfs filesystem: magic {0:02x?}, expected _BHRfS_M")]
+    NotBtrfs([u8; 8]),
+
+    /// A metadata block did not match its stored checksum. btrfs checksums all
+    /// of its metadata, so this is a genuine corruption signal rather than the
+    /// advisory it would be on ext4.
+    #[error("{0} failed its checksum — the drive is corrupt, or we parsed it wrong")]
+    FsChecksumMismatch(&'static str),
+
     #[error("filesystem uses unsupported feature: {0}")]
     UnsupportedFsFeature(String),
 
