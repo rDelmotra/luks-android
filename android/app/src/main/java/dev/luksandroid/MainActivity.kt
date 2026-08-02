@@ -463,11 +463,21 @@ private fun UnlockedBody(
     }
 
     Text(
-        "Unlocked: ${info.label.ifBlank { "(no label)" }} · ${formatSize(info.sizeBytes)} " +
-            "· ${info.blockSize}B blocks",
+        "Unlocked: ${info.label.ifBlank { "(no label)" }} · ${info.fsType} " +
+            "· ${formatSize(info.sizeBytes)} · ${info.blockSize}B blocks",
         style = MaterialTheme.typography.bodyMedium,
     )
     Text(info.uuid, style = MaterialTheme.typography.bodySmall)
+    if (info.subvolumes.isNotEmpty()) {
+        // Worth showing rather than hiding: on a Linux install these are where
+        // the actual content lives, and their paths are directly navigable.
+        Text(
+            "subvolumes: " + info.subvolumes.joinToString(", ") {
+                it.path + if (it.readOnly) " (ro)" else ""
+            },
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
 
     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 

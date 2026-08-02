@@ -68,6 +68,21 @@ pub enum LuksError {
     #[error("not a btrfs filesystem: magic {0:02x?}, expected _BHRfS_M")]
     NotBtrfs([u8; 8]),
 
+    /// Nothing recognisable on an otherwise readable volume. Distinct from a
+    /// wrong password, which produces plausible-looking noise — by the time
+    /// this is reached the master key has already been verified against the
+    /// keyslot digest, so the volume really is decrypted and really is
+    /// something we cannot read.
+    #[error("unrecognised filesystem: this reader understands ext4 and btrfs")]
+    UnknownFs,
+
+    /// Two filesystem signatures on one volume, usually a reformat that did not
+    /// wipe the old one. Refused rather than resolved: one of the two answers
+    /// is a filesystem that no longer exists, and there is no way to tell from
+    /// the signatures alone which.
+    #[error("this volume carries both ext4 and btrfs signatures — refusing to guess which is real")]
+    AmbiguousFs,
+
     /// A metadata block did not match its stored checksum. btrfs checksums all
     /// of its metadata, so this is a genuine corruption signal rather than the
     /// advisory it would be on ext4.

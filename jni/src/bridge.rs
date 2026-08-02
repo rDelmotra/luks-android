@@ -8,11 +8,15 @@
 //!
 //! Two shapes matter here and are worth stating up front:
 //!
-//! * **Handles own their whole stack.** A `VolumeHandle` contains
-//!   `Ext4<LuksVolume<SharedDevice>>`, which is `'static` and self-contained.
-//!   Both `Ext4` and `LuksVolume` were changed to own rather than borrow their
-//!   device precisely so this type could exist without a self-referential
-//!   struct.
+//! * **Handles own their whole stack.** A `VolumeHandle` contains a
+//!   [`MountedFs`] over `LuksVolume<SharedDevice>`, which is `'static` and
+//!   self-contained. Both `Ext4` and `LuksVolume` were changed to own rather
+//!   than borrow their device precisely so this type could exist without a
+//!   self-referential struct.
+//! * **The filesystem is chosen once, at unlock.** Mounting consumes the
+//!   volume, so "try ext4, then btrfs" is not available — the volume is gone
+//!   with the first attempt, and re-deriving it means running Argon2 again.
+//!   [`luks_core::fs::detect`] settles it by signature first.
 //! * **One lock at the bottom.** `SharedDevice` is the *only* handle to the
 //!   transport, and it serialises every read. Two Java threads reading at once
 //!   would otherwise interleave two SCSI command/data/status sequences on one
@@ -22,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
-use luks_core::fs::{Ext4, FileType};
+use luks_core::fs::{btrfs, detect, Btrfs, Ext4, FileType, FileInfo, FsKind};
 use luks_core::luks::{self, keyslot, LuksVolume};
 use luks_core::partition::{self, PartitionTable, TableKind};
 use luks_core::secret::Secret;
@@ -70,7 +74,9 @@ pub fn error_code(e: &LuksError) -> i32 {
         | BadSectorSize(_)
         | UnsupportedFsFeature(_)
         | NotExt4(_)
-        | NotBtrfs(_) => code::UNSUPPORTED,
+        | NotBtrfs(_)
+        | UnknownFs
+        | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
@@ -174,8 +180,179 @@ pub struct DeviceHandle {
 }
 
 pub struct VolumeHandle {
-    pub fs: Ext4<LuksVolume<SharedDevice>>,
+    pub fs: MountedFs,
     pub partition_offset: u64,
+}
+
+/// The filesystem inside an unlocked volume, whichever one it turned out to be.
+///
+/// An enum rather than a `Box<dyn Filesystem>` because the two readers do not
+/// have the same shape and pretending they do costs more than it saves. ext4
+/// identifies a file by inode number; btrfs needs an inode *and* the tree it
+/// lives in, since subvolumes number their inodes independently. A trait
+/// flattening both to "u64" is exactly the mistake pass 4b removed from the
+/// core, and it would reintroduce it one layer up.
+pub enum MountedFs {
+    Ext4(Ext4<LuksVolume<SharedDevice>>),
+    Btrfs(Btrfs<LuksVolume<SharedDevice>>),
+}
+
+/// A resolved file, held open across a streaming read.
+///
+/// The reason this exists rather than passing a path to each read: hashing a
+/// 1 GiB file in 1 MiB chunks would otherwise re-resolve the path a thousand
+/// times, and each resolution is a directory walk over USB.
+pub enum OpenFile {
+    Ext4(luks_core::fs::ext4::Inode),
+    /// The tree comes along because an inode number alone does not identify a
+    /// file on btrfs.
+    Btrfs {
+        tree: u64,
+        inode: btrfs::Inode,
+    },
+}
+
+impl OpenFile {
+    pub fn size(&self) -> u64 {
+        match self {
+            OpenFile::Ext4(i) => i.info().size,
+            OpenFile::Btrfs { inode, .. } => inode.size,
+        }
+    }
+
+    pub fn file_type(&self) -> FileType {
+        match self {
+            OpenFile::Ext4(i) => i.file_type(),
+            OpenFile::Btrfs { inode, .. } => inode.file_type(),
+        }
+    }
+}
+
+impl MountedFs {
+    /// Decide what is on the volume, then hand it to exactly one reader.
+    ///
+    /// The decision comes first because mounting consumes the volume and
+    /// re-opening it would mean running Argon2 a second time. See
+    /// [`luks_core::fs::detect`].
+    pub fn mount(volume: LuksVolume<SharedDevice>) -> Result<Self> {
+        match detect(&volume)? {
+            FsKind::Ext4 => Ok(MountedFs::Ext4(Ext4::mount(volume)?)),
+            FsKind::Btrfs => Ok(MountedFs::Btrfs(Btrfs::mount(volume)?)),
+        }
+    }
+
+    pub fn kind(&self) -> FsKind {
+        match self {
+            MountedFs::Ext4(_) => FsKind::Ext4,
+            MountedFs::Btrfs(_) => FsKind::Btrfs,
+        }
+    }
+
+    fn label(&self) -> Option<String> {
+        match self {
+            MountedFs::Ext4(fs) => {
+                let name = fs.volume_name();
+                (!name.is_empty()).then(|| name.to_string())
+            }
+            MountedFs::Btrfs(fs) => fs.volume_name().map(str::to_string),
+        }
+    }
+
+    fn uuid(&self) -> [u8; 16] {
+        match self {
+            MountedFs::Ext4(fs) => fs.uuid(),
+            MountedFs::Btrfs(fs) => fs.fsid(),
+        }
+    }
+
+    /// The allocation unit a user would recognise. ext4 calls it a block;
+    /// btrfs calls the same thing a sector and reserves "block" for its
+    /// 16 KiB metadata nodes.
+    fn block_size(&self) -> u32 {
+        match self {
+            MountedFs::Ext4(fs) => fs.block_size(),
+            MountedFs::Btrfs(fs) => fs.sector_size(),
+        }
+    }
+
+    fn size_bytes(&self) -> u64 {
+        match self {
+            MountedFs::Ext4(fs) => fs.superblock().blocks_count * fs.block_size() as u64,
+            MountedFs::Btrfs(fs) => fs.superblock().total_bytes,
+        }
+    }
+
+    pub fn list_dir(&self, path: &str) -> Result<Vec<luks_core::fs::DirEntry>> {
+        match self {
+            MountedFs::Ext4(fs) => fs.list_dir(path),
+            MountedFs::Btrfs(fs) => fs.list_dir(path),
+        }
+    }
+
+    pub fn file_info(&self, path: &str) -> Result<FileInfo> {
+        match self {
+            MountedFs::Ext4(fs) => fs.file_info(path),
+            MountedFs::Btrfs(fs) => fs.file_info(path),
+        }
+    }
+
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+        match self {
+            MountedFs::Ext4(fs) => fs.read_file(path),
+            MountedFs::Btrfs(fs) => fs.read_file(path),
+        }
+    }
+
+    pub fn open(&self, path: &str) -> Result<OpenFile> {
+        match self {
+            MountedFs::Ext4(fs) => Ok(OpenFile::Ext4(fs.resolve(path)?)),
+            MountedFs::Btrfs(fs) => {
+                let found = fs.resolve_no_follow(fs.fs_tree(), path)?;
+                Ok(OpenFile::Btrfs {
+                    tree: found.tree.bytenr,
+                    inode: found.inode,
+                })
+            }
+        }
+    }
+
+    pub fn read_open(&self, file: &OpenFile, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        match (self, file) {
+            (MountedFs::Ext4(fs), OpenFile::Ext4(inode)) => fs.read_inode_data(inode, offset, buf),
+            (MountedFs::Btrfs(fs), OpenFile::Btrfs { tree, inode }) => {
+                fs.read_inode_data(*tree, inode, offset, buf)
+            }
+            // Only reachable by handing a file opened on one volume to another,
+            // which no caller does — but returning an error beats a panic on a
+            // path that runs with a device attached.
+            _ => Err(LuksError::UnknownFs),
+        }
+    }
+
+    /// Subvolumes, for a filesystem that has them. Empty on ext4 rather than
+    /// absent, so the JSON has one shape.
+    fn subvolumes_json(&self) -> Vec<Value> {
+        let MountedFs::Btrfs(fs) = self else {
+            return Vec::new();
+        };
+        // A failure here must not take the whole volume-info call down with
+        // it: the filesystem is mounted and browsable either way, and an
+        // unreadable root tree will resurface the moment anything is listed.
+        let Ok(subvols) = fs.subvolumes() else {
+            return Vec::new();
+        };
+        subvols
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id,
+                    "name": s.name,
+                    "path": s.path,
+                    "readOnly": s.is_read_only(),
+                })
+            })
+            .collect()
+    }
 }
 
 impl DeviceHandle {
@@ -286,7 +463,7 @@ impl DeviceHandle {
     pub fn unlock(&self, partition_offset: u64, password: &[u8]) -> Result<VolumeHandle> {
         let header = luks::read_from(&self.dev, partition_offset)?;
         let volume = LuksVolume::open(self.dev.clone(), partition_offset, &header, password)?;
-        let fs = Ext4::mount(volume)?;
+        let fs = MountedFs::mount(volume)?;
         Ok(VolumeHandle {
             fs,
             partition_offset,
@@ -335,14 +512,23 @@ pub unsafe fn open_usb_device(
 }
 
 impl VolumeHandle {
+    /// Existing fields keep their names and meanings; `fsType` and
+    /// `subvolumes` are additions, so a Kotlin caller that does not know about
+    /// them is unaffected.
+    ///
+    /// `label` is now null rather than `""` for an unlabelled volume — btrfs
+    /// has no label at all until `mkfs` is given one, and reporting that as an
+    /// empty string would make "unnamed" indistinguishable from "named with an
+    /// empty string".
     pub fn info_json(&self) -> String {
-        let sb = self.fs.superblock();
         json!({
             "partitionOffset": self.partition_offset,
-            "label": self.fs.volume_name(),
+            "fsType": self.fs.kind().name(),
+            "label": self.fs.label(),
             "uuid": format_uuid(&self.fs.uuid()),
             "blockSize": self.fs.block_size(),
-            "sizeBytes": sb.blocks_count * self.fs.block_size() as u64,
+            "sizeBytes": self.fs.size_bytes(),
+            "subvolumes": self.fs.subvolumes_json(),
         })
         .to_string()
     }
@@ -369,6 +555,10 @@ impl VolumeHandle {
                     "name": e.name,
                     "inode": e.inode,
                     "type": type_name(e.file_type),
+                    // Always present, always false on ext4. On btrfs it also
+                    // says that `inode` above is a tree id rather than an
+                    // inode number.
+                    "isSubvolume": e.is_subvolume,
                 })
             })
             .collect();
@@ -413,11 +603,11 @@ impl VolumeHandle {
     /// Fill `buf` from `offset`, returning how many bytes were written.
     /// A short return means end of file.
     pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let inode = self.fs.resolve(path)?;
-        if !inode.file_type().is_file() {
+        let file = self.fs.open(path)?;
+        if !file.file_type().is_file() {
             return Err(LuksError::IsADirectory(path.to_string()));
         }
-        self.fs.read_inode_data(&inode, offset, buf)
+        self.fs.read_open(&file, offset, buf)
     }
 
     /// Hash a file without ever holding it in memory.
@@ -429,8 +619,8 @@ impl VolumeHandle {
     pub fn sha256_json(&self, path: &str, chunk_bytes: usize) -> Result<String> {
         use sha2::{Digest, Sha256};
 
-        let inode = self.fs.resolve(path)?;
-        let size = inode.info().size;
+        let file = self.fs.open(path)?;
+        let size = file.size();
         // 0 means "pick something sensible". An explicit value is honoured down
         // to 8 bytes so the streaming loop can be tested against the small
         // fixture files; the upper clamp is what keeps a caller from asking for
@@ -448,7 +638,7 @@ impl VolumeHandle {
 
         while done < size {
             let want = std::cmp::min(chunk as u64, size - done) as usize;
-            let got = self.fs.read_inode_data(&inode, done, &mut buf[..want])?;
+            let got = self.fs.read_open(&file, done, &mut buf[..want])?;
             if got == 0 {
                 break;
             }
@@ -653,6 +843,32 @@ mod tests {
         std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
+    /// The same stack with btrfs inside: GPT, one LUKS2 partition, password
+    /// "test", a subvolume named `sub`. Read through `FileDevice` rather than
+    /// slurped — btrfs's floor for a non-mixed filesystem makes this 128 MiB,
+    /// and holding that in a test process to read a few files is wasteful.
+    fn btrfs_device() -> luks_core::device::FileDevice {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/disks/gpt-luks-btrfs.img"
+        );
+        luks_core::device::FileDevice::open(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    fn unlock_btrfs() -> VolumeHandle {
+        let dev = btrfs_device();
+        let blocks = dev.len().unwrap() / 512;
+        let handle = DeviceHandle::new(dev, 512, blocks, "TEST".into(), "BTRFS".into())
+            .expect("scan");
+        let offset = handle
+            .table
+            .luks_partitions()
+            .next()
+            .expect("a LUKS partition")
+            .offset_bytes();
+        handle.unlock(offset, PASSWORD).expect("unlock")
+    }
+
     fn open() -> DeviceHandle {
         let img = disk_image();
         let blocks = img.len() as u64 / 512;
@@ -821,6 +1037,127 @@ mod tests {
             // and a stale reference is refused rather than handed out.
             assert!(device_ref(dev_handle).is_err());
             drop_device(dev_handle);
+        }
+    }
+
+    // --- btrfs through the same bridge --------------------------------------
+
+    /// The pass-4c claim in one test: the bridge picks the filesystem itself,
+    /// and the JSON coming out is the same shape either way.
+    #[test]
+    fn unlocking_a_btrfs_volume_reports_it_as_btrfs() {
+        let vol = unlock_btrfs();
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        assert_eq!(v["fsType"], "btrfs");
+        assert_eq!(v["label"], "DISKBTRFS");
+        // btrfs calls its allocation unit a sector; the field means the same
+        // thing to a caller as ext4's block size.
+        assert_eq!(v["blockSize"], 4096);
+
+        let ext4 = unlock_fixture();
+        let e: Value = serde_json::from_str(&ext4.info_json()).unwrap();
+        assert_eq!(e["fsType"], "ext4");
+        assert_eq!(e["label"], "DISKDATA");
+        // Same keys, both filesystems — the point of the enum.
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&v), keys(&e));
+    }
+
+    #[test]
+    fn lists_and_reads_a_btrfs_volume() {
+        let vol = unlock_btrfs();
+        let v: Value = serde_json::from_str(&vol.list_dir_json("/").unwrap()).unwrap();
+        let names: Vec<&str> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"proof.txt"), "{names:?}");
+        assert!(names.contains(&"sub"), "{names:?}");
+        // btrfs has no lost+found, so directories still sort first but the set
+        // differs from ext4 — worth pinning so a future change to the sort is
+        // visible.
+        assert_eq!(names[0], "dir", "{names:?}");
+
+        assert_eq!(
+            vol.read_file("/proof.txt", 1024).unwrap(),
+            b"whole disk stack works\n"
+        );
+        assert_eq!(
+            vol.read_file("/dir/inner.txt", 1024).unwrap(),
+            b"inside a directory\n"
+        );
+    }
+
+    /// Reading across a subvolume boundary, through the bridge, on a real
+    /// encrypted volume. Everything below this line was tested on bare images
+    /// until now.
+    #[test]
+    fn reads_across_a_subvolume_boundary_through_the_bridge() {
+        let vol = unlock_btrfs();
+        assert_eq!(
+            vol.read_file("/sub/nested.txt", 1024).unwrap(),
+            b"inside a subvolume\n"
+        );
+
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        let subvols = v["subvolumes"].as_array().unwrap();
+        assert_eq!(subvols.len(), 1, "{v}");
+        assert_eq!(subvols[0]["name"], "sub");
+        assert_eq!(subvols[0]["path"], "/sub");
+        assert_eq!(subvols[0]["readOnly"], false);
+
+        // ext4 gets the same key with an empty list, not a missing key.
+        let e: Value = serde_json::from_str(&unlock_fixture().info_json()).unwrap();
+        assert_eq!(e["subvolumes"].as_array().unwrap().len(), 0);
+    }
+
+    /// The subvolume entry is flagged in a listing, because its `inode` field
+    /// is a tree id and a caller cannot tell from the number.
+    #[test]
+    fn a_subvolume_is_flagged_in_a_listing() {
+        let vol = unlock_btrfs();
+        let v: Value = serde_json::from_str(&vol.list_dir_json("/").unwrap()).unwrap();
+        let entries = v["entries"].as_array().unwrap();
+
+        let sub = entries.iter().find(|e| e["name"] == "sub").unwrap();
+        assert_eq!(sub["isSubvolume"], true);
+        assert_eq!(sub["type"], "dir");
+
+        let dir = entries.iter().find(|e| e["name"] == "dir").unwrap();
+        assert_eq!(dir["isSubvolume"], false);
+
+        // ext4 carries the field too, always false.
+        let e: Value = serde_json::from_str(&unlock_fixture().list_dir_json("/").unwrap()).unwrap();
+        assert!(e["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["isSubvolume"] == false));
+    }
+
+    /// Streaming reads must resolve the path once, not per chunk, and must
+    /// agree with the whole-file read on both filesystems.
+    #[test]
+    fn streamed_sha256_matches_on_btrfs_too() {
+        use sha2::{Digest, Sha256};
+        let vol = unlock_btrfs();
+        let whole = vol.read_file("/sub/nested.txt", u64::MAX).unwrap();
+        let expected: String = Sha256::digest(&whole)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        for chunk in [8usize, 1024, 0] {
+            let v: Value =
+                serde_json::from_str(&vol.sha256_json("/sub/nested.txt", chunk).unwrap()).unwrap();
+            assert_eq!(v["sha256"], expected, "chunk={chunk}");
+            assert_eq!(v["bytes"], whole.len() as u64, "chunk={chunk}");
         }
     }
 

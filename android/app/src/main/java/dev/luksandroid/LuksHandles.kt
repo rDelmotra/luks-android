@@ -47,9 +47,30 @@ data class VolumeInfo(
     val uuid: String,
     val blockSize: Int,
     val sizeBytes: Long,
+    /** "ext4" or "btrfs" — decided natively by signature, not by us. */
+    val fsType: String,
+    /** Empty on ext4, which has no such concept. */
+    val subvolumes: List<SubvolumeInfo>,
 )
 
-data class Entry(val name: String, val type: String) {
+/**
+ * A btrfs subvolume: a separate filesystem tree inside the same filesystem.
+ * [path] is where it appears when browsing from the top level, so it can be
+ * navigated to directly.
+ */
+data class SubvolumeInfo(
+    val id: Long,
+    val name: String,
+    val path: String,
+    val readOnly: Boolean,
+)
+
+/**
+ * [isSubvolume] marks a btrfs subvolume boundary. It is still a directory and
+ * opens like one; the flag exists because it is a different tree underneath,
+ * and may be a read-only snapshot.
+ */
+data class Entry(val name: String, val type: String, val isSubvolume: Boolean = false) {
     val isDir: Boolean get() = type == "dir"
 }
 
@@ -127,11 +148,24 @@ class LuksDevice internal constructor(
 class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
 
     val info: VolumeInfo = JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
+        val subvols = it.optJSONArray("subvolumes")
         VolumeInfo(
-            label = it.optString("label"),
+            // A volume with no label reports JSON null, and optString would
+            // turn that into the literal text "null" on screen.
+            label = if (it.isNull("label")) "" else it.optString("label"),
             uuid = it.optString("uuid"),
             blockSize = it.optInt("blockSize"),
             sizeBytes = it.optLong("sizeBytes"),
+            fsType = it.optString("fsType"),
+            subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
+                val s = subvols!!.getJSONObject(i)
+                SubvolumeInfo(
+                    id = s.optLong("id"),
+                    name = s.optString("name"),
+                    path = s.optString("path"),
+                    readOnly = s.optBoolean("readOnly"),
+                )
+            },
         )
     }
 
@@ -140,7 +174,11 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         val entries = JSONObject(LuksNative.nativeListDir(handle, path)).getJSONArray("entries")
         return (0 until entries.length()).map { i ->
             val e = entries.getJSONObject(i)
-            Entry(e.getString("name"), e.getString("type"))
+            Entry(
+                e.getString("name"),
+                e.getString("type"),
+                e.optBoolean("isSubvolume"),
+            )
         }
     }
 

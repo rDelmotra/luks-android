@@ -5,9 +5,11 @@
 //! device. V1 is read-only by construction: there are no mutating methods.
 
 pub mod btrfs;
+pub mod detect;
 pub mod ext4;
 
 pub use btrfs::Btrfs;
+pub use detect::{detect, FsKind};
 pub use ext4::Ext4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
