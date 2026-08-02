@@ -3,10 +3,24 @@
 use super::crc32c::name_hash;
 use super::inode::{parse_dir_entries, DirEntryItem, Inode};
 use super::tree;
-use super::{Btrfs, Key};
+use super::{Btrfs, Key, TreeRoot};
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::{DirEntry, FileInfo};
+
+/// An inode together with the tree it belongs to.
+///
+/// The pair is the unit of meaning, not the inode. Every fs tree numbers its
+/// inodes from 256, so inode 257 exists in each of them and names a different
+/// file in each; handing an inode number to a reader without saying which tree
+/// it came from is how a path that crosses a subvolume ends up reading someone
+/// else's data with a valid checksum. Returning them together makes that
+/// mistake impossible to make by accident.
+#[derive(Debug, Clone)]
+pub struct Located {
+    pub tree: TreeRoot,
+    pub inode: Inode,
+}
 
 impl<D: ReadAt> Btrfs<D> {
     /// Load one inode from the fs tree.
@@ -36,12 +50,11 @@ impl<D: ReadAt> Btrfs<D> {
                         out.push(DirEntry {
                             name: e.name_lossy(),
                             // For a subvolume this is a tree id rather than an
-                            // inode number. Both are u64 and the caller cannot
-                            // tell them apart, which is why crossing into a
-                            // subvolume is refused rather than guessed at in
-                            // `lookup`.
+                            // inode number — indistinguishable by value, so the
+                            // flag beside it is the only thing that says which.
                             inode: e.location.objectid,
                             file_type: e.file_type,
+                            is_subvolume: e.is_subvolume(),
                         });
                     }
                     Ok(true)
@@ -77,40 +90,54 @@ impl<D: ReadAt> Btrfs<D> {
 
     /// Resolve a path to an inode, **without** following a trailing symlink.
     ///
-    /// Symlinks are not followed at all yet, at any position. Their targets are
-    /// stored as file contents, which needs the extent reader — so following
-    /// one now would mean guessing at data this layer cannot read. A path
-    /// through a symlinked directory therefore fails with a clear error instead
-    /// of resolving to the wrong file.
-    pub fn resolve_no_follow(&self, tree: u64, root_dir: u64, path: &str) -> Result<Inode> {
-        let mut current = root_dir;
+    /// Symlinks are not followed at all, at any position. A path through a
+    /// symlinked directory fails with a clear error instead of resolving to
+    /// the wrong file — see [`Btrfs::read_link`](crate::fs::Btrfs::read_link)
+    /// for reading one deliberately.
+    ///
+    /// **Subvolume boundaries are crossed**, and the tree comes back with the
+    /// inode because of it. A btrfs subvolume is a separate fs tree, so
+    /// `/home/user/docs` on a Fedora install is three components in one tree
+    /// and the rest in another; refusing to cross would make most of such a
+    /// drive unreachable, and crossing without saying so would leave the caller
+    /// holding an inode number it would resolve against the wrong tree.
+    ///
+    /// This is what the kernel shows for a plain `mount` with `subvol=/`:
+    /// subvolumes appear as ordinary directories you can walk into.
+    pub fn resolve_no_follow(&self, start: TreeRoot, path: &str) -> Result<Located> {
+        let mut tree = start;
+        let mut current = start.root_dirid;
 
         for component in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
             if component == ".." {
-                // Walking up needs the INODE_REF that names this inode's
-                // parent. Nothing in the app navigates that way — the UI holds
-                // whole paths — so it is refused rather than half-implemented.
+                // Walking up needs the INODE_REF chain, which `inode_path`
+                // has — but across a subvolume boundary the parent lives in a
+                // different tree, so ".." is not simply the reverse of a step
+                // down. Nothing in the app navigates that way (the UI holds
+                // whole paths), so it is refused rather than half-implemented.
                 return Err(LuksError::UnsupportedFsFeature(
                     "btrfs path containing '..'".into(),
                 ));
             }
 
-            let parent = self.read_inode(tree, current)?;
+            let parent = self.read_inode(tree.bytenr, current)?;
             if !parent.file_type().is_dir() {
                 return Err(LuksError::NotADirectory(path.to_string()));
             }
 
             let entry = self
-                .lookup(tree, current, component)?
+                .lookup(tree.bytenr, current, component)?
                 .ok_or_else(|| LuksError::NotFound(path.to_string()))?;
 
             if entry.is_subvolume() {
-                // The entry names another fs tree. Following it means switching
-                // trees mid-walk, which the caller has to opt into because it
-                // changes which tree every subsequent inode number belongs to.
-                return Err(LuksError::UnsupportedFsFeature(format!(
-                    "btrfs subvolume boundary at '{component}'"
-                )));
+                // The location is a *tree id*, not an inode number. Switch
+                // trees and start again at the new tree's root directory —
+                // which is 256 here as it is everywhere, and is exactly why
+                // mistaking one for the other produces a plausible wrong
+                // answer rather than an error.
+                tree = self.tree_root(entry.location.objectid)?;
+                current = tree.root_dirid;
+                continue;
             }
             if entry.location.item_type != tree::INODE_ITEM_KEY {
                 return Err(LuksError::CorruptFs(
@@ -120,27 +147,26 @@ impl<D: ReadAt> Btrfs<D> {
             current = entry.location.objectid;
         }
 
-        self.read_inode(tree, current)
+        Ok(Located {
+            inode: self.read_inode(tree.bytenr, current)?,
+            tree,
+        })
     }
 
-    // --- convenience over the default subvolume -----------------------------
+    // --- convenience over the top level -------------------------------------
 
-    /// List a path in the default subvolume.
+    /// List a path, starting from the top level.
     pub fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let root = self.fs_tree();
-        let inode = self.resolve_no_follow(root.bytenr, root.root_dirid, path)?;
-        if !inode.file_type().is_dir() {
+        let found = self.resolve_no_follow(self.fs_tree(), path)?;
+        if !found.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(path.to_string()));
         }
-        self.list_dir_by_inode(root.bytenr, inode.objectid)
+        self.list_dir_by_inode(found.tree.bytenr, found.inode.objectid)
     }
 
-    /// Metadata for a path in the default subvolume.
+    /// Metadata for a path, starting from the top level.
     pub fn file_info(&self, path: &str) -> Result<FileInfo> {
-        let root = self.fs_tree();
-        Ok(self
-            .resolve_no_follow(root.bytenr, root.root_dirid, path)?
-            .info())
+        Ok(self.resolve_no_follow(self.fs_tree(), path)?.inode.info())
     }
 
     /// The filesystem label, or `None` if `mkfs` was not given one.

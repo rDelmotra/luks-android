@@ -639,6 +639,7 @@ impl<D: ReadAt> Ext4<D> {
                                 name: String::from_utf8_lossy(raw).into_owned(),
                                 inode: ino,
                                 file_type,
+                                is_subvolume: false,
                             });
                         }
                     }

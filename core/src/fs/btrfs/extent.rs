@@ -324,26 +324,29 @@ impl<D: ReadAt> Btrfs<D> {
         }
     }
 
-    // --- convenience over the default subvolume -----------------------------
+    // --- convenience over the top level -------------------------------------
+    //
+    // Each of these resolves the path and then reads through the tree that came
+    // back with it, never through `fs_tree()`. On a path that crosses into a
+    // subvolume those are different trees, and using the latter would read the
+    // right inode number out of the wrong filesystem.
 
-    /// Read a whole file from the default subvolume.
+    /// Read a whole file.
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
-        let root = self.fs_tree();
-        let inode = self.resolve_no_follow(root.bytenr, root.root_dirid, path)?;
-        if inode.file_type().is_dir() {
+        let found = self.resolve_no_follow(self.fs_tree(), path)?;
+        if found.inode.file_type().is_dir() {
             return Err(LuksError::IsADirectory(path.to_string()));
         }
-        let mut out = vec![0u8; inode.size as usize];
-        let n = self.read_inode_data(root.bytenr, &inode, 0, &mut out)?;
+        let mut out = vec![0u8; found.inode.size as usize];
+        let n = self.read_inode_data(found.tree.bytenr, &found.inode, 0, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
-    /// Read part of a file from the default subvolume.
+    /// Read part of a file.
     pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let root = self.fs_tree();
-        let inode = self.resolve_no_follow(root.bytenr, root.root_dirid, path)?;
-        self.read_inode_data(root.bytenr, &inode, offset, buf)
+        let found = self.resolve_no_follow(self.fs_tree(), path)?;
+        self.read_inode_data(found.tree.bytenr, &found.inode, offset, buf)
     }
 
     /// A symlink's target.
@@ -351,13 +354,12 @@ impl<D: ReadAt> Btrfs<D> {
     /// Stored exactly like file contents, which is why this could not exist
     /// before the extent reader did.
     pub fn read_link(&self, path: &str) -> Result<String> {
-        let root = self.fs_tree();
-        let inode = self.resolve_no_follow(root.bytenr, root.root_dirid, path)?;
-        if inode.file_type() != crate::fs::FileType::Symlink {
+        let found = self.resolve_no_follow(self.fs_tree(), path)?;
+        if found.inode.file_type() != crate::fs::FileType::Symlink {
             return Err(LuksError::NotFound(format!("{path} is not a symlink")));
         }
-        let mut out = vec![0u8; inode.size as usize];
-        let n = self.read_inode_data(root.bytenr, &inode, 0, &mut out)?;
+        let mut out = vec![0u8; found.inode.size as usize];
+        let n = self.read_inode_data(found.tree.bytenr, &found.inode, 0, &mut out)?;
         out.truncate(n);
         Ok(String::from_utf8_lossy(&out).into_owned())
     }

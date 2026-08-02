@@ -35,8 +35,18 @@ impl FileType {
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
+    /// Inode number — **except** when `is_subvolume` is set, in which case this
+    /// is a btrfs tree id, and reading it as an inode number lands on an
+    /// unrelated file that will happily pass every checksum.
     pub inode: u64,
     pub file_type: FileType,
+    /// A btrfs subvolume boundary: still a directory, but a different fs tree
+    /// underneath. Always false on ext4, which has no such thing.
+    ///
+    /// Worth surfacing rather than hiding, because it is the difference between
+    /// a folder and something the user may know as a separate mount or a
+    /// snapshot they cannot write to.
+    pub is_subvolume: bool,
 }
 
 #[derive(Debug, Clone)]

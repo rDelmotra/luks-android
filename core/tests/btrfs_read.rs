@@ -1005,9 +1005,10 @@ fn reads_an_inline_file() {
         b"three levels down\n"
     );
 
-    let root = fs.fs_tree();
-    let inode = fs.resolve_no_follow(root.bytenr, root.root_dirid, "/hello.txt").unwrap();
-    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+    let found = fs.resolve_no_follow(fs.fs_tree(), "/hello.txt").unwrap();
+    let extents = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
+        .unwrap();
     assert_eq!(extents.len(), 1);
     assert_eq!(extents[0].kind, ExtentKind::Inline);
 }
@@ -1022,9 +1023,10 @@ fn reads_a_file_that_spans_several_extents() {
     assert_eq!(data.len(), 2 * 1024 * 1024);
     assert_eq!(data, expected_big());
 
-    let root = fs.fs_tree();
-    let inode = fs.resolve_no_follow(root.bytenr, root.root_dirid, "/big.bin").unwrap();
-    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+    let found = fs.resolve_no_follow(fs.fs_tree(), "/big.bin").unwrap();
+    let extents = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
+        .unwrap();
     assert_eq!(extents.len(), 2);
     assert!(extents.iter().all(|e| e.kind == ExtentKind::Regular));
 }
@@ -1209,10 +1211,10 @@ fn the_fixture_is_actually_compressed() {
     let expected_len = expected_payload().len() as u64;
 
     for (name, algorithm) in [("zlib.txt", 1u8), ("lzo.txt", 2), ("zstd.txt", 3)] {
-        let inode = fs
-            .resolve_no_follow(root.bytenr, root.root_dirid, name)
+        let found = fs.resolve_no_follow(root, name).unwrap();
+        let extents = fs
+            .file_extents(found.tree.bytenr, found.inode.objectid)
             .unwrap();
-        let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
         assert!(!extents.is_empty(), "{name}");
         assert!(
             extents.iter().all(|e| e.compression == algorithm),
@@ -1260,10 +1262,10 @@ fn lzo_segment_framing_spans_more_than_one_sector() {
     // big enough for that to be exercised at all.
     let fs = mount("compress.img");
     let root = fs.fs_tree();
-    let inode = fs
-        .resolve_no_follow(root.bytenr, root.root_dirid, "lzo.txt")
+    let found = fs.resolve_no_follow(root, "lzo.txt").unwrap();
+    let extents = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
         .unwrap();
-    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
 
     let biggest = extents
         .iter()
@@ -1401,4 +1403,155 @@ fn enumerating_subvolumes_reads_only_the_root_tree() {
     // deliberately loose — what it rules out is a per-subvolume tree walk,
     // which would be hundreds.
     assert!(cost < 40, "enumeration cost {cost} reads");
+}
+
+// --- crossing subvolume boundaries -----------------------------------------
+
+/// The top level looks like an ordinary directory, with the subvolumes in it
+/// presented as the directories a user thinks they are — and flagged, because
+/// their `inode` field is a tree id and nothing about the number says so.
+#[test]
+fn the_top_level_lists_subvolumes_as_directories() {
+    let fs = mount("subvol.img");
+    let mut entries = fs.list_dir("/").unwrap();
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let seen: Vec<(&str, bool, bool)> = entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.file_type.is_dir(), e.is_subvolume))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("home", true, true),
+            ("plaindir", true, false),
+            ("root", true, true),
+            ("snapshots", true, false),
+            ("toplevel.txt", false, false),
+        ]
+    );
+}
+
+/// The Fedora shape: content that lives in a different fs tree from the root.
+#[test]
+fn reads_a_file_inside_a_subvolume() {
+    let fs = mount("subvol.img");
+    assert_eq!(
+        fs.read_file("/root/etc/hostname").unwrap(),
+        b"fixture.localdomain\n"
+    );
+    assert_eq!(
+        fs.read_file("/home/user/docs/deep.txt").unwrap(),
+        b"four levels down, in another tree\n"
+    );
+    // A path that crosses *two* boundaries: the top level into `home`, then
+    // `home` into the subvolume nested inside it.
+    assert_eq!(
+        fs.read_file("/home/user/snap/inside.txt").unwrap(),
+        b"nested subvolume\n"
+    );
+    // And the plain directory beside them still resolves without any of this.
+    assert_eq!(
+        fs.read_file("/plaindir/note.txt").unwrap(),
+        b"just a directory\n"
+    );
+}
+
+/// A read-only snapshot is a full second copy of the tree it was taken from,
+/// so the same relative path reads the same bytes through it.
+#[test]
+fn reads_through_a_snapshot() {
+    let fs = mount("subvol.img");
+    let live = fs.read_file("/home/user/docs/deep.txt").unwrap();
+    let snap = fs
+        .read_file("/snapshots/home-snap/user/docs/deep.txt")
+        .unwrap();
+    assert_eq!(live, snap);
+
+    // The snapshot was taken before `snap` was created inside `home`... or
+    // after; either way, listing it must succeed rather than error.
+    let entries = fs.list_dir("/snapshots/home-snap").unwrap();
+    assert!(
+        entries.iter().any(|e| e.name == "user"),
+        "{:?}",
+        entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+}
+
+/// Listing and metadata cross boundaries too, not just whole-file reads.
+#[test]
+fn listing_and_stat_work_across_a_boundary() {
+    let fs = mount("subvol.img");
+
+    let entries = fs.list_dir("/home/user").unwrap();
+    let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["docs", "snap"]);
+    // `snap` is a subvolume even when seen from inside another subvolume.
+    assert!(entries.iter().any(|e| e.name == "snap" && e.is_subvolume));
+
+    let info = fs.file_info("/home/user/docs/deep.txt").unwrap();
+    assert_eq!(info.size, b"four levels down, in another tree\n".len() as u64);
+    assert!(info.file_type.is_file());
+}
+
+/// The mistake the `Located` type exists to prevent, demonstrated rather than
+/// described: every fs tree numbers its inodes from 256, so an inode number
+/// from one tree is a *valid* inode number in another, naming something else
+/// entirely. Reading it through the top-level tree — the obvious thing to do
+/// when resolution hands back a bare inode — silently returns the wrong file.
+#[test]
+fn the_same_inode_number_means_different_files_in_different_trees() {
+    let fs = mount("subvol.img");
+    let found = fs
+        .resolve_no_follow(fs.fs_tree(), "/home/user/docs/deep.txt")
+        .unwrap();
+
+    // It really did end up in another tree, or this test proves nothing.
+    assert_ne!(found.tree.objectid, fs.fs_tree().objectid);
+    assert_eq!(found.tree.objectid, 257);
+
+    let mut correct = vec![0u8; found.inode.size as usize];
+    fs.read_inode_data(found.tree.bytenr, &found.inode, 0, &mut correct)
+        .unwrap();
+    assert_eq!(correct, b"four levels down, in another tree\n");
+
+    // Now the bug. Inode 259 in tree 257 is this file; inode 259 in the top
+    // level is `/plaindir/note.txt`. Reading through the wrong tree does not
+    // fail — it returns a real file, whose checksums all verify, which is not
+    // the one that was asked for. That is the entire hazard in one assertion.
+    assert_eq!(found.inode.objectid, 259);
+    let mut wrong = vec![0u8; found.inode.size as usize];
+    let n = fs
+        .read_inode_data(fs.fs_tree().bytenr, &found.inode, 0, &mut wrong)
+        .expect("inode 259 exists in the top-level tree too");
+    assert_eq!(&wrong[..17], b"just a directory\n");
+    assert_ne!(&wrong[..n], &correct[..]);
+}
+
+/// Crossing must cost a boundary crossing, not a rescan. One extra root-tree
+/// search per subvolume entered is the whole price.
+#[test]
+fn crossing_a_boundary_costs_one_extra_search() {
+    let counting = CountingDevice {
+        inner: device("subvol.img"),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let fs = Btrfs::mount(counting).unwrap();
+    let count = || fs.device().reads.load(std::sync::atomic::Ordering::Relaxed);
+
+    let before = count();
+    fs.file_info("/plaindir/note.txt").unwrap();
+    let no_crossing = count() - before;
+
+    let before = count();
+    fs.file_info("/home/user/docs/deep.txt").unwrap();
+    let one_crossing = count() - before;
+
+    // Deeper by two components and across a tree boundary. The bound rules out
+    // anything that re-reads the root tree per component or walks a tree.
+    assert!(
+        one_crossing < no_crossing + 12,
+        "{no_crossing} reads without a crossing, {one_crossing} with one"
+    );
 }

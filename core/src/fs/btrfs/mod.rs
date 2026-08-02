@@ -36,6 +36,7 @@ pub mod tree;
 
 pub use chunk::{Chunk, ChunkMap};
 pub use cursor::Cursor;
+pub use dir::Located;
 pub use extent::{ExtentKind, FileExtent};
 pub use inode::{DirEntryItem, Inode};
 pub use subvol::Subvolume;
@@ -260,14 +261,15 @@ impl<D: ReadAt> Btrfs<D> {
         })
     }
 
-    /// The default subvolume's tree — the one whose contents a user thinks of
-    /// as "the filesystem".
+    /// The top-level tree — where browsing starts.
     ///
-    /// This is FS_TREE, which is right for every filesystem that has not had
-    /// `btrfs subvolume set-default` run on it. A Fedora install has *not*, but
-    /// it does put `/` and `/home` in separate subvolumes mounted by name, so
-    /// browsing the whole install will eventually mean enumerating subvolumes
-    /// rather than just this one. Noted, not done.
+    /// This is FS_TREE (id 5), which is what the kernel shows for a mount with
+    /// `subvol=/`, and every subvolume is reachable from it by path because
+    /// resolution crosses subvolume boundaries. Starting at
+    /// [`default_subvolume`](Self::default_subvolume) instead would match a
+    /// plain `mount` but hide everything outside it — on openSUSE the default
+    /// is a snapshot several levels down, and choosing it would make the live
+    /// filesystem unbrowsable.
     pub fn fs_tree(&self) -> TreeRoot {
         self.fs_tree
     }
