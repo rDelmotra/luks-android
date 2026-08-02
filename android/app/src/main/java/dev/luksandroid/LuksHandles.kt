@@ -127,6 +127,19 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         return LuksNative.nativeReadFile(handle, path, maxBytes)
     }
 
+    /**
+     * Up to [len] bytes at [offset]. A result shorter than [len] means end of
+     * file; an empty result means there was nothing left.
+     *
+     * This is the only way to move a large file: [readFile] has to materialise
+     * the whole thing as a Java `byte[]`, which the app heap will not survive
+     * for a multi-gigabyte file.
+     */
+    fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeReadChunk(handle, path, offset, len)
+    }
+
     /** [sha256] result: digest plus the throughput it was measured at. */
     data class Digest(val sha256: String, val bytes: Long, val elapsedMs: Long, val bytesPerSec: Long)
 

@@ -7,6 +7,7 @@ import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -357,8 +358,58 @@ private fun UnlockedBody(
     onVolumeChange: (VolumeState) -> Unit,
     scope: kotlinx.coroutines.CoroutineScope,
 ) {
+    val context = LocalContext.current
     val info = state.volume.info
-    var digest by remember { mutableStateOf<String?>(null) }
+
+    var path by remember { mutableStateOf("/") }
+    var entries by remember { mutableStateOf(state.entries) }
+    var busy by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf<String?>(null) }
+    // Which file the pending "create document" dialog is for. The launcher
+    // callback carries only the destination Uri, not what we were exporting.
+    var pendingExport by remember { mutableStateOf<String?>(null) }
+
+    /**
+     * Writes a file out through the Storage Access Framework.
+     *
+     * SAF rather than a WRITE_EXTERNAL_STORAGE permission: the user picks the
+     * destination themselves, the app gets access to exactly that one file, and
+     * nothing has to be granted broad storage access to copy a document off an
+     * encrypted drive.
+     */
+    val exporter = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri ->
+        val source = pendingExport
+        pendingExport = null
+        if (uri == null || source == null) return@rememberLauncherForActivityResult
+        busy = true
+        scope.launch {
+            status = exportFile(context, state.volume, source, uri) { done, total ->
+                // Compose snapshot state is safe to write from any thread, so
+                // progress can be reported straight from the IO dispatcher.
+                val pct = if (total > 0) done * 100 / total else 0
+                status = "copying ${source.substringAfterLast('/')} — $pct% " +
+                    "(${formatSize(done)} of ${formatSize(total)})"
+            }
+            busy = false
+        }
+    }
+
+    fun navigate(to: String) {
+        busy = true
+        status = null
+        scope.launch {
+            try {
+                val listed = withContext(Dispatchers.IO) { state.volume.listDir(to) }
+                entries = listed
+                path = to
+            } catch (e: Exception) {
+                status = "cannot open $to: ${e.message}"
+            }
+            busy = false
+        }
+    }
 
     Text(
         "Unlocked: ${info.label.ifBlank { "(no label)" }} · ${formatSize(info.sizeBytes)} " +
@@ -369,39 +420,77 @@ private fun UnlockedBody(
 
     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-    state.entries.forEach { entry ->
+    Text(path, style = MaterialTheme.typography.bodyMedium)
+    if (path != "/") {
+        TextButton(onClick = { navigate(parentOf(path)) }, enabled = !busy) {
+            Text("⬆ up")
+        }
+    }
+
+    if (busy) {
+        CircularProgressIndicator(modifier = Modifier.padding(4.dp))
+    }
+
+    entries.forEach { entry ->
+        val full = joinPath(path, entry.name)
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Text(
-                if (entry.isDir) "📁 ${entry.name}" else "   ${entry.name}",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            if (!entry.isDir) {
-                TextButton(onClick = {
-                    digest = "hashing ${entry.name}…"
-                    scope.launch {
-                        digest = hashFile(state.volume, "/${entry.name}")
+            if (entry.isDir) {
+                TextButton(onClick = { navigate(full) }, enabled = !busy) {
+                    Text("📁 ${entry.name}")
+                }
+            } else {
+                Text("   ${entry.name}", style = MaterialTheme.typography.bodySmall)
+                Row {
+                    TextButton(
+                        onClick = {
+                            pendingExport = full
+                            exporter.launch(entry.name)
+                        },
+                        enabled = !busy,
+                    ) {
+                        Text("Save")
                     }
-                }) {
-                    Text("SHA-256")
+                    TextButton(
+                        onClick = {
+                            status = "hashing ${entry.name}…"
+                            busy = true
+                            scope.launch {
+                                status = hashFile(state.volume, full)
+                                busy = false
+                            }
+                        },
+                        enabled = !busy,
+                    ) {
+                        Text("SHA-256")
+                    }
                 }
             }
         }
     }
 
-    digest?.let {
+    status?.let {
         Text(it, style = MaterialTheme.typography.bodySmall)
     }
 
-    Button(onClick = {
-        state.volume.close()
-        onVolumeChange(VolumeState.None)
-    }) {
+    Button(
+        onClick = {
+            state.volume.close()
+            onVolumeChange(VolumeState.None)
+        },
+        enabled = !busy,
+    ) {
         Text("Lock")
     }
 }
+
+private fun joinPath(dir: String, name: String): String =
+    if (dir == "/") "/$name" else "$dir/$name"
+
+private fun parentOf(path: String): String =
+    path.trimEnd('/').substringBeforeLast('/').ifEmpty { "/" }
 
 /**
  * Requests permission if needed, then opens the device and reads its
@@ -458,6 +547,50 @@ private suspend fun unlock(
     // runs if the call was reached at all.
     password.fill(0)
 }
+
+/**
+ * Copies a file off the encrypted drive to a user-chosen destination,
+ * streaming it a megabyte at a time.
+ *
+ * Never holds the whole file: the drive being read is expected to contain
+ * things far larger than the app heap, and the entire point of `readChunk` is
+ * that a 1 GiB file is copied with a 1 MiB buffer.
+ */
+private suspend fun exportFile(
+    context: Context,
+    volume: LuksVolume,
+    path: String,
+    uri: android.net.Uri,
+    onProgress: (done: Long, total: Long) -> Unit,
+): String = try {
+    withContext(Dispatchers.IO) {
+        val total = volume.fileSize(path)
+        var done = 0L
+        val started = System.currentTimeMillis()
+
+        val stream = context.contentResolver.openOutputStream(uri)
+            ?: throw IllegalStateException("could not open the destination for writing")
+
+        stream.use { out ->
+            while (done < total) {
+                val chunk = volume.readChunk(path, done, EXPORT_CHUNK)
+                if (chunk.isEmpty()) break // short read: end of file
+                out.write(chunk)
+                done += chunk.size
+                onProgress(done, total)
+            }
+            out.flush()
+        }
+
+        val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+        "saved ${formatSize(done)} in %.1f s · %.1f MiB/s"
+            .format(secs, done / secs / (1L shl 20))
+    }
+} catch (e: Exception) {
+    "save failed: ${e.message}"
+}
+
+private const val EXPORT_CHUNK = 1 shl 20
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
