@@ -27,12 +27,24 @@ const KEY_PTR_SIZE: usize = 33;
 pub const KEY_SIZE: usize = 17;
 
 // --- item types we name ----------------------------------------------------
+pub const INODE_ITEM_KEY: u8 = 1;
+pub const INODE_REF_KEY: u8 = 12;
+pub const XATTR_ITEM_KEY: u8 = 24;
+pub const DIR_ITEM_KEY: u8 = 84;
+pub const DIR_INDEX_KEY: u8 = 96;
+pub const EXTENT_DATA_KEY: u8 = 108;
+pub const ROOT_ITEM_KEY: u8 = 132;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
 // --- objectids we name -----------------------------------------------------
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
+pub const ROOT_TREE_OBJECTID: u64 = 1;
+pub const FS_TREE_OBJECTID: u64 = 5;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
+/// Objectid of the root directory inside any fs tree, and the point above
+/// which every objectid is a file rather than a reserved tree id.
+pub const FIRST_FREE_OBJECTID: u64 = 256;
 
 /// A btrfs key. Ordering is lexicographic by `(objectid, item_type, offset)`,
 /// and it is the only thing that orders a tree — every search, every range
@@ -242,16 +254,14 @@ impl Node {
     /// whenever the key is not an exact match — the classic B-tree off-by-one,
     /// and it fails only for interior lookups, so a small filesystem whose
     /// trees are a single leaf never shows it.
+    /// A key below everything in this node descends into child 0, which is not
+    /// a corruption case: searching for `(inode, DIR_INDEX, 0)` in a tree whose
+    /// first key is higher is an ordinary way to start a directory scan.
     pub fn child_for(&self, key: &Key) -> Result<usize> {
         let bound = self.lower_bound(key)?;
         if bound < self.nr_items && self.key(bound)? == *key {
             return Ok(bound);
         }
-        if bound == 0 {
-            return Err(LuksError::CorruptFs(
-                "btrfs key precedes everything in this node",
-            ));
-        }
-        Ok(bound - 1)
+        Ok(bound.saturating_sub(1))
     }
 }

@@ -25,10 +25,12 @@
 
 pub mod chunk;
 pub mod crc32c;
+pub mod cursor;
 pub mod superblock;
 pub mod tree;
 
 pub use chunk::{Chunk, ChunkMap};
+pub use cursor::Cursor;
 pub use superblock::{CsumType, Superblock};
 pub use tree::{Key, Node};
 
@@ -39,6 +41,17 @@ use crate::error::{LuksError, Result};
 /// node's level must drop by exactly one per descent, so this doubles as the
 /// termination proof for the walk below.
 const MAX_LEVEL: u8 = 8;
+
+/// Where one tree lives, from its `ROOT_ITEM`.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeRoot {
+    /// Logical address of the root node.
+    pub bytenr: u64,
+    pub level: u8,
+    /// Objectid of this tree's root directory — 256 for any fs tree.
+    pub root_dirid: u64,
+    pub generation: u64,
+}
 
 /// A mounted, read-only btrfs filesystem.
 ///
@@ -162,6 +175,46 @@ impl<D: ReadAt> Btrfs<D> {
             self.walk_node(child, visit)?;
         }
         Ok(())
+    }
+
+    // --- tree roots ---------------------------------------------------------
+
+    /// Where the tree with this objectid is rooted, from its `ROOT_ITEM` in the
+    /// root tree.
+    ///
+    /// Field offsets inside `btrfs_root_item` were read off the real item and
+    /// cross-checked against dump-tree: the 160-byte inode item comes first,
+    /// then generation, `root_dirid`, and `bytenr` at 176. `level` sits at 238,
+    /// past a `drop_progress` key that is easy to miscount.
+    pub fn tree_root(&self, objectid: u64) -> Result<TreeRoot> {
+        let key = Key::new(objectid, tree::ROOT_ITEM_KEY, 0);
+        let data = self
+            .find_item(self.sb.root, &key)?
+            // A tree named in the superblock but absent from the root tree is
+            // corruption, not an empty filesystem.
+            .ok_or(LuksError::CorruptFs("btrfs root item is missing"))?;
+
+        if data.len() < 239 {
+            return Err(LuksError::CorruptFs("btrfs root item truncated"));
+        }
+        Ok(TreeRoot {
+            bytenr: u64::from_le_bytes(data[176..184].try_into().unwrap()),
+            level: data[238],
+            root_dirid: u64::from_le_bytes(data[168..176].try_into().unwrap()),
+            generation: u64::from_le_bytes(data[160..168].try_into().unwrap()),
+        })
+    }
+
+    /// The default subvolume's tree — the one whose contents a user thinks of
+    /// as "the filesystem".
+    ///
+    /// This is FS_TREE, which is right for every filesystem that has not had
+    /// `btrfs subvolume set-default` run on it. A Fedora install has *not*, but
+    /// it does put `/` and `/home` in separate subvolumes mounted by name, so
+    /// browsing the whole install will eventually mean enumerating subvolumes
+    /// rather than just this one. Noted, not done.
+    pub fn fs_tree(&self) -> Result<TreeRoot> {
+        self.tree_root(tree::FS_TREE_OBJECTID)
     }
 
     pub fn superblock(&self) -> &Superblock {

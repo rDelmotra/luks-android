@@ -555,3 +555,171 @@ fn a_child_at_the_wrong_level_stops_the_walk() {
     assert!(leaf.is_leaf());
     assert!(leaf.key_ptr(0).is_err());
 }
+
+// --- tree roots and searching ----------------------------------------------
+
+#[test]
+fn finds_the_fs_tree_through_its_root_item() {
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap();
+    // Cross-checked against dump-tree, which reports the FS_TREE node at this
+    // address and level.
+    assert_eq!(root.bytenr, 30605312);
+    assert_eq!(root.level, 1);
+    // Every fs tree's root directory is objectid 256.
+    assert_eq!(root.root_dirid, 256);
+
+    for name in IMAGES {
+        assert_eq!(mount(name).fs_tree().unwrap().root_dirid, 256, "{name}");
+    }
+}
+
+#[test]
+fn a_missing_tree_is_an_error_not_an_empty_one() {
+    let fs = mount("plain.img");
+    assert!(fs.tree_root(999_999).is_err());
+}
+
+#[test]
+fn searching_lands_on_an_exact_key() {
+    let fs = mount("plain.img");
+    let key = Key::new(256, 228, 22020096); // the system chunk
+    let cursor = fs.search(fs.superblock().chunk_root, &key).unwrap();
+    assert!(cursor.valid());
+    assert_eq!(cursor.key().unwrap(), key);
+    assert_eq!(cursor.data().unwrap().len(), 112);
+}
+
+#[test]
+fn searching_a_missing_key_lands_on_the_next_one() {
+    let fs = mount("plain.img");
+    // Between the data chunk at 13631488 and the system chunk at 22020096.
+    let cursor = fs
+        .search(fs.superblock().chunk_root, &Key::new(256, 228, 20000000))
+        .unwrap();
+    assert!(cursor.valid());
+    assert_eq!(cursor.key().unwrap(), Key::new(256, 228, 22020096));
+}
+
+#[test]
+fn searching_past_the_last_key_is_not_an_error() {
+    // Range scans hit this every time they finish. Making it an error would
+    // mean every caller has to distinguish "ran out" from "went wrong".
+    let fs = mount("plain.img");
+    let cursor = fs
+        .search(fs.superblock().chunk_root, &Key::new(u64::MAX, 255, u64::MAX))
+        .unwrap();
+    assert!(!cursor.valid());
+}
+
+#[test]
+fn stepping_a_cursor_visits_exactly_what_walking_does() {
+    // The equivalence that matters: the cheap traversal and the exhaustive one
+    // must agree, across leaf boundaries and interior nodes alike. The fs tree
+    // is level 1 with 13 leaves, so a cursor that mishandles the climb-and-
+    // descend would diverge here and nowhere else.
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap().bytenr;
+
+    let mut walked = Vec::new();
+    fs.walk_tree(root, &mut |key, data| {
+        walked.push((key, data.len()));
+        Ok(())
+    })
+    .unwrap();
+
+    let mut stepped = Vec::new();
+    let mut cursor = fs.search(root, &Key::new(0, 0, 0)).unwrap();
+    while cursor.valid() {
+        stepped.push((cursor.key().unwrap(), cursor.data().unwrap().len()));
+        cursor.advance().unwrap();
+    }
+
+    assert_eq!(stepped.len(), walked.len());
+    assert_eq!(stepped, walked);
+    assert!(walked.len() > 400, "the fixture must be multi-leaf");
+}
+
+#[test]
+fn a_run_scan_stops_at_the_end_of_the_run() {
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap().bytenr;
+
+    // The root directory's DIR_INDEX entries: hello.txt, big.bin, docs, many,
+    // the unicode name, and the two symlinks.
+    let mut names = Vec::new();
+    fs.for_each_item(root, 256, 96, &mut |key, _| {
+        names.push(key);
+        Ok(true)
+    })
+    .unwrap();
+    assert!(!names.is_empty());
+    assert!(names.iter().all(|k| k.objectid == 256 && k.item_type == 96));
+    assert!(names.windows(2).all(|w| w[0] < w[1]));
+}
+
+#[test]
+fn a_run_scan_can_stop_early() {
+    let fs = mount("plain.img");
+    let root = fs.fs_tree().unwrap().bytenr;
+    let mut seen = 0;
+    fs.for_each_item(root, 256, 96, &mut |_, _| {
+        seen += 1;
+        Ok(seen < 2)
+    })
+    .unwrap();
+    assert_eq!(seen, 2);
+}
+
+/// Counts device reads, so a claim about traversal cost can be checked rather
+/// than asserted. The same idea as the ext4 test that counts I/Os: over USB the
+/// number of round trips is the thing that matters, not the number of bytes.
+struct CountingDevice {
+    inner: FileDevice,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadAt for CountingDevice {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), LuksError> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
+
+#[test]
+fn searching_costs_the_depth_of_the_tree_not_its_size() {
+    // The whole reason the cursor exists. On this fixture the difference is
+    // 2 reads against 14; on the developer's 1 TB drive it is the difference
+    // between opening a directory and reading the filesystem.
+    let counting = CountingDevice {
+        inner: device("plain.img"),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let fs = Btrfs::mount(counting).unwrap();
+    let root = fs.fs_tree().unwrap().bytenr;
+
+    let load = |fs: &Btrfs<CountingDevice>| {
+        fs.device().reads.load(std::sync::atomic::Ordering::Relaxed)
+    };
+
+    let before = load(&fs);
+    let cursor = fs.search(root, &Key::new(256, 1, 0)).unwrap();
+    assert!(cursor.valid());
+    let searched = load(&fs) - before;
+
+    let before = load(&fs);
+    fs.walk_tree(root, &mut |_, _| Ok(())).unwrap();
+    let walked = load(&fs) - before;
+
+    // level 1 tree: root node plus one leaf.
+    assert_eq!(searched, 2, "a search should read one node per level");
+    assert!(
+        walked > searched * 4,
+        "walking read {walked} nodes, searching {searched} — the fixture is \
+         too small for this comparison to mean anything"
+    );
+}
