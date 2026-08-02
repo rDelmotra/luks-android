@@ -398,3 +398,23 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256<'l>(
         out_string(env, &json)
     })
 }
+
+/// Time a raw block read: no decryption, no filesystem, just the transport.
+///
+/// The diagnostic that separates "our layers are slow" from "the link is
+/// slow". Returns JSON including the transfer size the kernel actually allowed.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkRead<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    bytes: jlong,
+    chunk_bytes: jint,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        // SAFETY: validated against the device magic tag.
+        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let json = dev.benchmark_json(bytes.max(0) as u64, chunk_bytes.max(0) as usize)?;
+        out_string(env, &json)
+    })
+}

@@ -25,6 +25,7 @@ use luks_core::usb::BulkTransport;
 use std::os::raw::{c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------- ioctl codes
 
@@ -140,7 +141,11 @@ pub struct UsbFsTransport {
     ep_out: u8,
     interface: u8,
     /// Shrinks itself on `EINVAL`. See [`UsbFsTransport::DEFAULT_MAX_TRANSFER`].
-    max_transfer: AtomicUsize,
+    ///
+    /// Shared so a caller can observe where it settled after the transport has
+    /// been moved into the SCSI layer — the settled value is a measurement of
+    /// the kernel, and worth reporting rather than assuming.
+    max_transfer: Arc<AtomicUsize>,
     timeout_ms: u32,
     claimed: bool,
 }
@@ -192,15 +197,21 @@ impl UsbFsTransport {
             ep_in,
             ep_out,
             interface,
-            max_transfer: AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER),
+            max_transfer: Arc::new(AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER)),
             timeout_ms: 5_000,
             claimed: false,
         }
     }
 
     pub fn with_max_transfer(mut self, bytes: usize) -> Self {
-        self.max_transfer = AtomicUsize::new(bytes.max(Self::MIN_MAX_TRANSFER));
+        self.max_transfer = Arc::new(AtomicUsize::new(bytes.max(Self::MIN_MAX_TRANSFER)));
         self
+    }
+
+    /// A handle on the self-tuned transfer limit, readable after this
+    /// transport has been consumed by `ScsiBlockDevice`.
+    pub fn max_transfer_cell(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.max_transfer)
     }
 
     pub fn with_timeout_ms(mut self, ms: u32) -> Self {

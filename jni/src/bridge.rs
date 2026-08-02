@@ -166,6 +166,9 @@ pub struct DeviceHandle {
     pub vendor: String,
     pub product: String,
     pub table: PartitionTable,
+    /// Where the usbfs transfer limit actually settled, once the kernel has had
+    /// its say. `None` for a device that is not usbfs-backed (the tests).
+    pub max_transfer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 pub struct VolumeHandle {
@@ -192,7 +195,53 @@ impl DeviceHandle {
             vendor,
             product,
             table,
+            max_transfer: None,
         })
+    }
+
+    /// Read raw sectors and time them — no decryption, no filesystem.
+    ///
+    /// This exists to settle an argument the full-stack number cannot. Reading a
+    /// 1 GiB file through LUKS and ext4 gave the same ~21 MiB/s whether the
+    /// transfer limit was 16 KiB or 128 KiB, which has two very different
+    /// explanations: either the kernel quietly refused the larger size, or the
+    /// link simply does not go faster and none of our layers are to blame.
+    ///
+    /// Reading raw blocks answers it directly. If this is also ~21 MiB/s, the
+    /// transport is at its ceiling and the decrypt/filesystem layers cost
+    /// nothing worth chasing. If it is markedly faster, the overhead is ours
+    /// and there is a real bug above this line.
+    pub fn benchmark_json(&self, bytes: u64, chunk_bytes: usize) -> Result<String> {
+        let chunk = chunk_bytes.clamp(4096, 8 * 1024 * 1024);
+        let capacity = self.block_count * self.block_size as u64;
+        let total = bytes.min(capacity).max(chunk as u64);
+
+        let mut buf = vec![0u8; chunk];
+        let mut done = 0u64;
+        let started = std::time::Instant::now();
+
+        while done < total {
+            let want = std::cmp::min(chunk as u64, total - done) as usize;
+            self.dev.read_at(done, &mut buf[..want])?;
+            done += want as u64;
+        }
+
+        let elapsed = started.elapsed();
+        let secs = elapsed.as_secs_f64();
+
+        Ok(json!({
+            "bytes": done,
+            "elapsedMs": elapsed.as_millis() as u64,
+            "bytesPerSec": if secs > 0.0 { (done as f64 / secs) as u64 } else { 0 },
+            "chunkBytes": chunk,
+            // The number that says whether the self-tuning found headroom or
+            // hit the historical 16 KiB wall.
+            "maxTransfer": self
+                .max_transfer
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
+        })
+        .to_string())
     }
 
     pub fn info_json(&self) -> String {
@@ -264,17 +313,23 @@ pub unsafe fn open_usb_device(
     }
     transport.claim_interface()?;
 
+    // Grabbed before the transport is moved into the SCSI layer: after that the
+    // concrete type is erased and the settled limit would be unobservable.
+    let limit = transport.max_transfer_cell();
+
     let scsi = ScsiBlockDevice::open(transport)?;
     let capacity = scsi.capacity();
     let inquiry = scsi.inquiry()?;
 
-    DeviceHandle::new(
+    let mut handle = DeviceHandle::new(
         scsi,
         capacity.block_size,
         capacity.blocks,
         inquiry.vendor,
         inquiry.product,
-    )
+    )?;
+    handle.max_transfer = Some(limit);
+    Ok(handle)
 }
 
 impl VolumeHandle {

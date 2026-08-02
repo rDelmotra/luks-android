@@ -270,6 +270,32 @@ private fun OpenDeviceBody(
         Text("No LUKS partition on this drive.", style = MaterialTheme.typography.bodySmall)
     }
 
+    // Raw transport throughput, with LUKS and ext4 out of the picture. Compare
+    // it against the full-stack SHA-256 rate: if they match, the link is the
+    // ceiling and the crypto/filesystem layers are free.
+    var benchmark by remember { mutableStateOf<String?>(null) }
+    var benchmarking by remember { mutableStateOf(false) }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(
+            onClick = {
+                benchmarking = true
+                benchmark = "reading 128 MiB of raw blocks…"
+                scope.launch {
+                    benchmark = try {
+                        withContext(Dispatchers.IO) { device.benchmark().summary }
+                    } catch (e: Exception) {
+                        "benchmark failed: ${e.message}"
+                    }
+                    benchmarking = false
+                }
+            },
+            enabled = !benchmarking,
+        ) {
+            Text("Benchmark raw read")
+        }
+    }
+    benchmark?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+
     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
     when (volume) {

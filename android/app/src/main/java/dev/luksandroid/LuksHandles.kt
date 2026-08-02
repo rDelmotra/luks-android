@@ -83,6 +83,33 @@ class LuksDevice internal constructor(
         }
     }
 
+    /** Raw transport throughput, bypassing LUKS and the filesystem entirely. */
+    data class Benchmark(
+        val bytes: Long,
+        val elapsedMs: Long,
+        val bytesPerSec: Long,
+        val maxTransfer: Int?,
+    ) {
+        val summary: String
+            get() = "raw %.1f MiB/s (%s in %d ms)\ntransfer limit: %s".format(
+                bytesPerSec.toDouble() / (1L shl 20),
+                formatSize(bytes),
+                elapsedMs,
+                maxTransfer?.let { formatSize(it.toLong()) } ?: "unknown",
+            )
+    }
+
+    fun benchmark(bytes: Long = 128L shl 20, chunkBytes: Int = 1 shl 20): Benchmark {
+        check(handle != 0L) { "device is closed" }
+        val j = JSONObject(LuksNative.nativeBenchmarkRead(handle, bytes, chunkBytes))
+        return Benchmark(
+            bytes = j.getLong("bytes"),
+            elapsedMs = j.getLong("elapsedMs"),
+            bytesPerSec = j.getLong("bytesPerSec"),
+            maxTransfer = if (j.isNull("maxTransfer")) null else j.getInt("maxTransfer"),
+        )
+    }
+
     override fun close() {
         // Native first: it reads through the connection's file descriptor, and
         // releasing the interface or closing the connection first would leave

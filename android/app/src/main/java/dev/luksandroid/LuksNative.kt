@@ -82,4 +82,11 @@ internal object LuksNative {
      * @param chunkBytes 0 for the default (1 MiB).
      */
     external fun nativeSha256(handle: Long, path: String, chunkBytes: Int): String
+
+    /**
+     * Times a raw block read — no decryption, no filesystem. JSON result also
+     * reports the transfer size the kernel actually allowed, which is the only
+     * way to tell a self-tuned ceiling from a silent fallback.
+     */
+    external fun nativeBenchmarkRead(handle: Long, bytes: Long, chunkBytes: Int): String
 }
