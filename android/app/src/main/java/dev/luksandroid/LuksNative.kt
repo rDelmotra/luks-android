@@ -89,4 +89,10 @@ internal object LuksNative {
      * way to tell a self-tuned ceiling from a silent fallback.
      */
     external fun nativeBenchmarkRead(handle: Long, bytes: Long, chunkBytes: Int): String
+
+    /**
+     * Measures AES-XTS and SHA-256 throughput in memory. No USB, no drive —
+     * these are the CPU-side ceilings the read pipeline can never exceed.
+     */
+    external fun nativeSelfTest(mib: Int): String
 }

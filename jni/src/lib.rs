@@ -418,3 +418,19 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkRead<'l>(
         out_string(env, &json)
     })
 }
+
+/// Measure AES-XTS and SHA-256 throughput in memory, with no USB involved.
+///
+/// Attributes the gap between the raw-read benchmark and the full-stack figure
+/// to the layer actually responsible, instead of inferring it.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSelfTest<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    mib: jint,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let json = bridge::self_test_json(mib.max(1) as usize);
+        out_string(env, &json)
+    })
+}

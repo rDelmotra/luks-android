@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
 use luks_core::fs::{Ext4, FileType};
-use luks_core::luks::{self, LuksVolume};
+use luks_core::luks::{self, keyslot, LuksVolume};
 use luks_core::partition::{self, PartitionTable, TableKind};
 use luks_core::secret::Secret;
 use luks_core::usb::ScsiBlockDevice;
@@ -469,6 +469,59 @@ impl VolumeHandle {
         })
         .to_string())
     }
+}
+
+/// Time the CPU-side work in isolation, with no USB involved.
+///
+/// This exists because comparing the raw-read benchmark against the full-stack
+/// SHA-256 number is not a fair comparison, and treating it as one led to a
+/// wrong conclusion. Raw reads bytes and throws them away; the full-stack
+/// figure also decrypts every sector, walks ext4, and hashes the result. Any of
+/// those could account for the difference, and only measurement says which.
+///
+/// Both figures are per-core and in-memory, so they are upper bounds on what
+/// the pipeline could sustain even with an infinitely fast drive.
+pub fn self_test_json(mib: usize) -> String {
+    use sha2::{Digest, Sha256};
+
+    let bytes = mib.clamp(1, 256) * 1024 * 1024;
+    let mut buf = vec![0u8; bytes];
+    // A fixed non-zero pattern: an all-zero buffer would let neither cipher nor
+    // hash take a shortcut, but it also would not resemble real ciphertext.
+    for (i, b) in buf.iter_mut().enumerate() {
+        *b = (i * 31 + 7) as u8;
+    }
+    let key = [0x42u8; 64]; // AES-256-XTS: two 32-byte keys
+
+    let started = std::time::Instant::now();
+    let xts = keyslot::xts_decrypt(&key, &mut buf, 512, 0, 1);
+    let xts_secs = started.elapsed().as_secs_f64();
+
+    let started = std::time::Instant::now();
+    let digest = Sha256::digest(&buf);
+    let sha_secs = started.elapsed().as_secs_f64();
+
+    let rate = |secs: f64| -> u64 {
+        if secs > 0.0 {
+            (bytes as f64 / secs / (1024.0 * 1024.0)) as u64
+        } else {
+            0
+        }
+    };
+
+    json!({
+        "mib": mib,
+        "xtsOk": xts.is_ok(),
+        "xtsMiBs": rate(xts_secs),
+        "sha256MiBs": rate(sha_secs),
+        // Proves the hardware backend was compiled in. It is chosen at runtime
+        // by cpufeatures, so this being true is necessary but not sufficient —
+        // the measured rate is what actually settles it. Software AES-XTS runs
+        // around 65 MiB/s; hardware runs in the thousands.
+        "aesArmv8Compiled": cfg!(aes_armv8),
+        "digestHead": format!("{:02x}{:02x}", digest[0], digest[1]),
+    })
+    .to_string()
 }
 
 fn type_name(t: FileType) -> &'static str {

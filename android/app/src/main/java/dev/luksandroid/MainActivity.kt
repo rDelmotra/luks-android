@@ -125,6 +125,7 @@ private fun DiagnosticsScreen() {
     // object identity would forget every open device on the next scan.
     var states by remember { mutableStateOf(mapOf<String, DeviceState>()) }
     var volume by remember { mutableStateOf<VolumeState>(VolumeState.None) }
+    var selfTest by remember { mutableStateOf<String?>(null) }
 
     fun keyOf(t: UsbMassStorage.Target) =
         "${t.device.vendorId}:${t.device.productId}:${t.usbInterface.id}"
@@ -139,9 +140,33 @@ private fun DiagnosticsScreen() {
         Text("LUKS", style = MaterialTheme.typography.headlineMedium)
         Text("luks_core $version loaded", style = MaterialTheme.typography.bodyMedium)
 
-        Button(onClick = { targets = UsbMassStorage.findTargets(context) }) {
-            Text("Rescan USB")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = { targets = UsbMassStorage.findTargets(context) }) {
+                Text("Rescan USB")
+            }
+            // Needs no drive attached: pure CPU, and it bounds everything the
+            // read pipeline can achieve regardless of how fast the link is.
+            TextButton(onClick = {
+                selfTest = "measuring…"
+                scope.launch {
+                    selfTest = try {
+                        withContext(Dispatchers.IO) {
+                            val j = org.json.JSONObject(LuksNative.nativeSelfTest(64))
+                            "AES-XTS %d MiB/s · SHA-256 %d MiB/s (armv8 compiled: %b)".format(
+                                j.getLong("xtsMiBs"),
+                                j.getLong("sha256MiBs"),
+                                j.getBoolean("aesArmv8Compiled"),
+                            )
+                        }
+                    } catch (e: Exception) {
+                        "self-test failed: ${e.message}"
+                    }
+                }
+            }) {
+                Text("CPU self-test")
+            }
         }
+        selfTest?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
 
         if (targets.isEmpty()) {
             Text(
