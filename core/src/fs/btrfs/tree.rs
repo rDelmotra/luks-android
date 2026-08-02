@@ -34,6 +34,12 @@ pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
 pub const ROOT_ITEM_KEY: u8 = 132;
+/// A subvolume's view of its parent: key `(subvol id, ROOT_BACKREF, parent id)`,
+/// data naming the directory it appears in. The direction that matters for a
+/// reader, because it turns a tree id into a path.
+pub const ROOT_BACKREF_KEY: u8 = 144;
+/// The mirror of [`ROOT_BACKREF_KEY`], filed under the parent.
+pub const ROOT_REF_KEY: u8 = 156;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
@@ -41,6 +47,9 @@ pub const CHUNK_ITEM_KEY: u8 = 228;
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const ROOT_TREE_OBJECTID: u64 = 1;
 pub const FS_TREE_OBJECTID: u64 = 5;
+/// The root tree's own directory, which holds exactly one entry: `default`,
+/// naming the subvolume a plain `mount` shows.
+pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// Objectid of the root directory inside any fs tree, and the point above
 /// which every objectid is a file rather than a reserved tree id.

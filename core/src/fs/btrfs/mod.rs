@@ -30,6 +30,7 @@ pub mod cursor;
 pub mod dir;
 pub mod extent;
 pub mod inode;
+pub mod subvol;
 pub mod superblock;
 pub mod tree;
 
@@ -37,6 +38,7 @@ pub use chunk::{Chunk, ChunkMap};
 pub use cursor::Cursor;
 pub use extent::{ExtentKind, FileExtent};
 pub use inode::{DirEntryItem, Inode};
+pub use subvol::Subvolume;
 pub use superblock::{CsumType, Superblock};
 pub use tree::{Key, Node};
 
@@ -51,12 +53,32 @@ const MAX_LEVEL: u8 = 8;
 /// Where one tree lives, from its `ROOT_ITEM`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TreeRoot {
+    /// The tree's own id — 5 for the top level, 256 and up for a subvolume.
+    pub objectid: u64,
     /// Logical address of the root node.
     pub bytenr: u64,
     pub level: u8,
     /// Objectid of this tree's root directory — 256 for any fs tree.
     pub root_dirid: u64,
     pub generation: u64,
+    /// `btrfs_root_item.flags`. Only bit 0 means anything to a reader.
+    pub flags: u64,
+}
+
+/// `BTRFS_ROOT_SUBVOL_RDONLY`.
+const ROOT_SUBVOL_RDONLY: u64 = 1;
+
+impl TreeRoot {
+    /// Whether this subvolume is marked read-only — which is what a snapshot
+    /// taken with `-r` is, and what every entry under openSUSE's `.snapshots`
+    /// looks like.
+    ///
+    /// Informational only here: the whole reader is read-only regardless. It
+    /// exists so the UI can say *why* a directory cannot be written to once
+    /// there is anything that writes.
+    pub fn is_read_only(&self) -> bool {
+        self.flags & ROOT_SUBVOL_RDONLY != 0
+    }
 }
 
 /// A mounted, read-only btrfs filesystem.
@@ -198,24 +220,43 @@ impl<D: ReadAt> Btrfs<D> {
     ///
     /// Field offsets inside `btrfs_root_item` were read off the real item and
     /// cross-checked against dump-tree: the 160-byte inode item comes first,
-    /// then generation, `root_dirid`, and `bytenr` at 176. `level` sits at 238,
-    /// past a `drop_progress` key that is easy to miscount.
+    /// then generation, `root_dirid`, and `bytenr` at 176. `flags` is at 208 and
+    /// `level` sits at 238, past a `drop_progress` key that is easy to miscount.
+    ///
+    /// **The key's offset is not always zero.** For an ordinary subvolume it is,
+    /// but a *snapshot* is filed under the transid it was taken at —
+    /// `(259 ROOT_ITEM 7)` in the subvol fixture. An exact-match lookup at
+    /// offset 0 therefore reports a perfectly healthy snapshot as a corrupt
+    /// filesystem, which is what this code did until a fixture with a snapshot
+    /// in it existed. Searching backwards from `u64::MAX` and taking the last
+    /// item for this objectid is what the kernel does, and it picks the newest
+    /// root when there is more than one.
     pub fn tree_root(&self, objectid: u64) -> Result<TreeRoot> {
-        let key = Key::new(objectid, tree::ROOT_ITEM_KEY, 0);
-        let data = self
-            .find_item(self.sb.root, &key)?
-            // A tree named in the superblock but absent from the root tree is
-            // corruption, not an empty filesystem.
-            .ok_or(LuksError::CorruptFs("btrfs root item is missing"))?;
+        let key = Key::new(objectid, tree::ROOT_ITEM_KEY, u64::MAX);
+        let cursor = self.search_le(self.sb.root, &key)?;
+
+        // A tree named in the superblock but absent from the root tree is
+        // corruption, not an empty filesystem.
+        let missing = || LuksError::CorruptFs("btrfs root item is missing");
+        if !cursor.valid() {
+            return Err(missing());
+        }
+        let found = cursor.key()?;
+        if found.objectid != objectid || found.item_type != tree::ROOT_ITEM_KEY {
+            return Err(missing());
+        }
+        let data = cursor.data()?;
 
         if data.len() < 239 {
             return Err(LuksError::CorruptFs("btrfs root item truncated"));
         }
         Ok(TreeRoot {
+            objectid,
             bytenr: u64::from_le_bytes(data[176..184].try_into().unwrap()),
             level: data[238],
             root_dirid: u64::from_le_bytes(data[168..176].try_into().unwrap()),
             generation: u64::from_le_bytes(data[160..168].try_into().unwrap()),
+            flags: u64::from_le_bytes(data[208..216].try_into().unwrap()),
         })
     }
 

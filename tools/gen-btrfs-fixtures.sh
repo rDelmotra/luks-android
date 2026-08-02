@@ -7,6 +7,11 @@
 #   colima ssh -- bash -lc 'mkdir -p /tmp/btrfs && cd /tmp/btrfs'
 #   colima ssh -- tee /tmp/btrfs/gen.sh < tools/gen-btrfs-fixtures.sh
 #   colima ssh -- bash /tmp/btrfs/gen.sh /tmp/btrfs/out
+#
+# A second argument limits which images are built, so adding a fixture does not
+# churn the three that are already committed:
+#
+#   colima ssh -- sudo bash /tmp/btrfs/gen.sh /tmp/btrfs/out subvol
 #   colima ssh -- tar -C /tmp/btrfs/out -cf - . | tar -C fixtures/btrfs -xf -
 #
 # Same rule as every other fixture in this repo: the test data comes from the
@@ -20,9 +25,13 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
+TARGETS="${2:-plain compress mixed-4k subvol}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
+UUID_SUBVOL="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+want() { case " $TARGETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 command -v mkfs.btrfs >/dev/null || { echo "mkfs.btrfs not found: apt-get install btrfs-progs"; exit 1; }
 [ "$(uname -s)" = Linux ] || { echo "Linux only — run this in the VM"; exit 1; }
@@ -66,16 +75,19 @@ ln -s nested/deep.txt "$ROOT/docs/link-to-deep"
 # metadata chunk has two stripes for the same logical range and the reader has
 # to pick one. That is not an exotic case; it is what mkfs does by default on
 # anything it does not think is an SSD.
+if want plain; then
 echo "Building plain.img..."
 IMG="$OUT/plain.img"
 rm -f "$IMG"
 truncate -s 1G "$IMG"
 mkfs.btrfs -q -L BTRFSTEST -U "$UUID_PLAIN" --rootdir "$ROOT" --shrink "$IMG"
 echo "  -> plain.img"
+fi
 
 # --- compress.img: the three compression algorithms, plus holes -------------
 # compress-force, not compress: the heuristic will happily leave a file
 # uncompressed and then the fixture proves nothing.
+if want compress; then
 echo "Building compress.img..."
 IMG="$OUT/compress.img"
 rm -f "$IMG"
@@ -112,11 +124,13 @@ printf 'end' | dd of="$MNT/sparse.bin" bs=1 seek=1048573 conv=notrunc status=non
 sync
 umount "$MNT"
 echo "  -> compress.img"
+fi
 
 # --- mixed-4k.img: nodesize == sectorsize ----------------------------------
 # Mixed block groups put data and metadata in one chunk (type DATA|METADATA)
 # and force nodesize down to the sector size. It catches anything that assumed
 # 16 KiB nodes or that a chunk is only ever one of the two.
+if want mixed-4k; then
 echo "Building mixed-4k.img..."
 IMG="$OUT/mixed-4k.img"
 rm -f "$IMG"
@@ -129,13 +143,76 @@ printf 'nested content\n' > "$MNT/docs/readme.md"
 sync
 umount "$MNT"
 echo "  -> mixed-4k.img"
+fi
+
+# --- subvol.img: more than one fs tree --------------------------------------
+# The fixture the developer's own drive needs. A Fedora install keeps / and
+# /home in separate subvolumes, and a subvolume is a *separate fs tree* — a
+# directory entry pointing at one carries a tree id where every other entry
+# carries an inode number. Read it as an inode number and you land on an
+# unrelated file in the wrong tree, with checksums that all verify.
+#
+# The layout is deliberately awkward:
+#
+#   /toplevel.txt              plain file, proves the top level is still normal
+#   /plaindir/note.txt         plain directory, must NOT be treated as a crossing
+#   /root/etc/hostname         subvolume off the top level (the Fedora shape)
+#   /home/user/docs/deep.txt   subvolume, content several levels down
+#   /home/user/snap/inside.txt subvolume nested *inside another subvolume*
+#   /snapshots/home-snap/...   read-only snapshot, parent dir is not the root
+#
+# The last two are the ones that break a naive implementation: a nested
+# subvolume means a single path crosses two tree boundaries, and a snapshot
+# under `snapshots/` has a parent dirid that is not 256, so reconstructing its
+# path needs the INODE_REF chain rather than "/" + name.
+if want subvol; then
+echo "Building subvol.img..."
+IMG="$OUT/subvol.img"
+rm -f "$IMG"
+truncate -s 160M "$IMG"
+mkfs.btrfs -q -L BTRFSSUBV -U "$UUID_SUBVOL" "$IMG"
+mount -o loop "$IMG" "$MNT"
+
+printf 'top level file\n' > "$MNT/toplevel.txt"
+mkdir -p "$MNT/plaindir"
+printf 'just a directory\n' > "$MNT/plaindir/note.txt"
+
+btrfs subvolume create "$MNT/root"
+mkdir -p "$MNT/root/etc"
+printf 'fixture.localdomain\n' > "$MNT/root/etc/hostname"
+
+btrfs subvolume create "$MNT/home"
+mkdir -p "$MNT/home/user/docs"
+printf 'four levels down, in another tree\n' > "$MNT/home/user/docs/deep.txt"
+btrfs subvolume create "$MNT/home/user/snap"
+printf 'nested subvolume\n' > "$MNT/home/user/snap/inside.txt"
+
+mkdir -p "$MNT/snapshots"
+btrfs subvolume snapshot -r "$MNT/home" "$MNT/snapshots/home-snap"
+
+sync
+# The default subvolume decides what a plain `mount` shows. Setting it proves
+# the reader reports it, and — more useful — that browsing still starts from
+# the real top level so nothing becomes unreachable.
+btrfs subvolume set-default "$MNT/root"
+btrfs subvolume list "$MNT" > "$WORK/subvol-list.txt"
+btrfs subvolume get-default "$MNT" >> "$WORK/subvol-list.txt"
+sync
+umount "$MNT"
+echo "  -> subvol.img"
+fi
 
 # --- ground truth -----------------------------------------------------------
 {
     echo "btrfs fixtures — generated by tools/gen-btrfs-fixtures.sh"
     echo "btrfs-progs: $(mkfs.btrfs --version | head -1)"
     echo
-    for img in plain compress mixed-4k; do
+    if [ -f "$WORK/subvol-list.txt" ]; then
+        echo "=== subvol.img: subvolumes ==="
+        cat "$WORK/subvol-list.txt"
+        echo
+    fi
+    for img in $TARGETS; do
         echo "=== $img.img ==="
         btrfs inspect-internal dump-super "$OUT/$img.img" |
             grep -E '^(magic|fsid|label|generation|root|chunk_root|log_root|total_bytes|sectorsize|nodesize|sys_array_size|root_level|chunk_root_level|num_devices|incompat_flags|csum_type)\b'
@@ -144,7 +221,12 @@ echo "  -> mixed-4k.img"
         btrfs inspect-internal dump-tree -t chunk "$OUT/$img.img" | grep -E 'CHUNK_ITEM|length|stripe [0-9]'
         echo
     done
-} > "$OUT/BTRFS-EXPECTED.txt" 2>&1
+    # A partial run must not clobber the ground truth for images it did not
+    # build; the section it does produce gets appended to the tracked file.
+} > "$OUT/BTRFS-EXPECTED.partial.txt" 2>&1
+case "$TARGETS" in
+    "plain compress mixed-4k subvol") mv "$OUT/BTRFS-EXPECTED.partial.txt" "$OUT/BTRFS-EXPECTED.txt" ;;
+esac
 
 echo "Done:"
 ls -la "$OUT"

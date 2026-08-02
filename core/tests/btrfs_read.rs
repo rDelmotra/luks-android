@@ -1,12 +1,13 @@
 //! btrfs reader tests against images built by real `mkfs.btrfs`.
 //!
-//! Three images, each chosen for a code path rather than for variety:
+//! Four images, each chosen for a code path rather than for variety:
 //!
 //! | image        | geometry              | what it is for                     |
 //! |--------------|-----------------------|------------------------------------|
 //! | `plain.img`  | 4 KiB sector / 16 KiB node | DUP metadata, 400 files, symlinks |
 //! | `compress.img` | same, mounted       | zlib/lzo/zstd, inline, a hole      |
 //! | `mixed-4k.img` | node == sector      | mixed block groups, 4 KiB nodes    |
+//! | `subvol.img` | same as compress      | four subvolumes, one a snapshot    |
 //!
 //! `mixed-4k` earns its place by making `nodesize == sectorsize`, which is the
 //! one configuration where an accidental "nodes are always 16 KiB" assumption
@@ -14,7 +15,7 @@
 //!
 //! Unlike the ext4 tests these open the image through `FileDevice` rather than
 //! reading it into a `Vec`: btrfs's minimum filesystem size is ~109 MiB, so
-//! slurping all three would cost 377 MiB of RAM to read a few kilobytes of
+//! slurping all four would cost 537 MiB of RAM to read a few kilobytes of
 //! metadata.
 //!
 //! Regenerate with `tools/gen-btrfs-fixtures.sh` (needs Linux — see the header
@@ -25,7 +26,7 @@ use luks_core::error::LuksError;
 use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, ExtentKind, Key, Node};
 use luks_core::fs::{Btrfs, FileType};
 
-const IMAGES: [&str; 3] = ["plain.img", "compress.img", "mixed-4k.img"];
+const IMAGES: [&str; 4] = ["plain.img", "compress.img", "mixed-4k.img", "subvol.img"];
 
 fn device(name: &str) -> FileDevice {
     let path = format!("{}/../fixtures/btrfs/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -1274,4 +1275,130 @@ fn lzo_segment_framing_spans_more_than_one_sector() {
         "the compressed extent is {biggest} bytes, which fits in one sector — \
          this fixture cannot exercise the segment framing"
     );
+}
+
+// --- subvolumes ------------------------------------------------------------
+
+/// The ground truth here is `btrfs subvolume list`, recorded in
+/// BTRFS-EXPECTED.txt when the fixture was built:
+///
+/// ```text
+/// ID 256 gen 8 top level 5   path root
+/// ID 257 gen 7 top level 5   path home
+/// ID 258 gen 8 top level 257 path home/user/snap
+/// ID 259 gen 7 top level 5   path snapshots/home-snap
+/// ```
+#[test]
+fn enumerates_every_subvolume_with_the_path_btrfs_progs_reports() {
+    let fs = mount("subvol.img");
+    let subvols = fs.subvolumes().unwrap();
+
+    let seen: Vec<(u64, &str, u64)> = subvols
+        .iter()
+        .map(|s| (s.id, s.path.as_str(), s.parent_id))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (256, "/root", 5),
+            (257, "/home", 5),
+            // Nested inside another subvolume: its path crosses two trees, and
+            // its parent is 257 rather than the top level.
+            (258, "/home/user/snap", 257),
+            // Parent dirid is not the tree root, so this path can only come
+            // from walking the INODE_REF chain.
+            (259, "/snapshots/home-snap", 5),
+        ]
+    );
+}
+
+/// The bug this fixture was built to catch, and it caught one immediately: a
+/// snapshot's ROOT_ITEM is keyed by the transid it was taken at, not by zero.
+/// `tree_root` looked it up with an exact match at offset 0 and reported a
+/// healthy filesystem as corrupt — on a drive where every rollback point is a
+/// snapshot, which is to say on openSUSE and on anything using `snapper`.
+#[test]
+fn a_snapshots_root_item_is_found_despite_its_nonzero_key_offset() {
+    let fs = mount("subvol.img");
+    let snapshot = fs.tree_root(259).expect("snapshot root item");
+    assert!(snapshot.bytenr != 0);
+    assert_eq!(snapshot.root_dirid, 256);
+    assert_eq!(snapshot.objectid, 259);
+    // Taken with -r, so this is the one subvolume that reports read-only.
+    assert!(snapshot.is_read_only(), "snapshot should be read-only");
+
+    let others: Vec<u64> = fs
+        .subvolumes()
+        .unwrap()
+        .iter()
+        .filter(|s| s.is_read_only())
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(others, vec![259]);
+}
+
+/// Reported, not obeyed. The fixture had `set-default` run on it, so this is
+/// 256 rather than the top level — and browsing must still start at 5, or the
+/// three subvolumes outside `root` would be unreachable.
+#[test]
+fn reports_the_default_subvolume_without_browsing_from_it() {
+    let fs = mount("subvol.img");
+    assert_eq!(fs.default_subvolume().unwrap(), 256);
+    assert_eq!(fs.fs_tree().objectid, 5);
+    assert_eq!(fs.fs_tree().root_dirid, 256);
+}
+
+/// A filesystem nobody has run `set-default` on — the Fedora case — must not
+/// error just because the entry is absent.
+#[test]
+fn a_filesystem_with_no_default_entry_answers_with_the_top_level() {
+    for name in ["plain.img", "compress.img", "mixed-4k.img"] {
+        let fs = mount(name);
+        assert_eq!(fs.default_subvolume().unwrap(), 5, "{name}");
+        assert!(fs.subvolumes().unwrap().is_empty(), "{name}");
+    }
+}
+
+/// Subvolume ids and inode numbers share a namespace of `u64` and start at the
+/// same place, so a tree id read as an inode number lands somewhere plausible.
+/// This pins the distinguishing fact: the top level's own directory listing
+/// carries entries whose location is a ROOT_ITEM, not an INODE_ITEM.
+#[test]
+fn a_subvolume_entry_is_marked_as_a_tree_not_an_inode() {
+    let fs = mount("subvol.img");
+    let root = fs.fs_tree();
+
+    let subvol = fs.lookup(root.bytenr, root.root_dirid, "home").unwrap();
+    let subvol = subvol.expect("/home exists");
+    assert!(subvol.is_subvolume(), "/home is a subvolume boundary");
+    assert_eq!(subvol.location.objectid, 257, "the location is a tree id");
+
+    let plain = fs.lookup(root.bytenr, root.root_dirid, "plaindir").unwrap();
+    let plain = plain.expect("/plaindir exists");
+    assert!(!plain.is_subvolume(), "a plain directory is not a boundary");
+    assert!(
+        plain.location.objectid >= 256,
+        "an inode number in the same range as a tree id — which is exactly why \
+         the item type is what has to be checked"
+    );
+}
+
+/// Enumeration must not cost a walk of the filesystem. It reads the root tree,
+/// which is the smallest tree there is, plus one search per subvolume.
+#[test]
+fn enumerating_subvolumes_reads_only_the_root_tree() {
+    let counting = CountingDevice {
+        inner: device("subvol.img"),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let fs = Btrfs::mount(counting).unwrap();
+    let before = fs.device().reads.load(std::sync::atomic::Ordering::Relaxed);
+    let subvols = fs.subvolumes().unwrap();
+    let cost = fs.device().reads.load(std::sync::atomic::Ordering::Relaxed) - before;
+
+    assert_eq!(subvols.len(), 4);
+    // 4 subvolumes on a fixture whose root tree is a single leaf. The bound is
+    // deliberately loose — what it rules out is a per-subvolume tree walk,
+    // which would be hundreds.
+    assert!(cost < 40, "enumeration cost {cost} reads");
 }
