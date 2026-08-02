@@ -33,8 +33,114 @@ use luks_core::luks::{self, LuksVolume};
 use luks_core::partition;
 use luks_core::secret::Secret;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::io::{IsTerminal, Read};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Counts and times every read that reaches the device.
+///
+/// This exists because the performance story was being told by subtraction —
+/// "total minus what I think the CPU costs" — and subtraction produced two
+/// numbers that could not both be true: an estimated 1.2 s of CPU nobody could
+/// name, and a buffered device apparently reading faster than `dd` manages on
+/// the same node. Either the estimate was wrong or the assumption about read
+/// sizes was. Measuring directly settles which.
+///
+/// The size histogram is the part that matters most. `dd` reads in 1 MiB
+/// blocks; we read 16 KiB btrfs nodes and whatever the extent map hands back.
+/// A raw character device has no cache to hide small reads behind, so if the
+/// distribution is dominated by small reads then the fix is to read in bigger
+/// pieces, not to shave allocations.
+///
+/// `Cell` rather than atomics: this is a single-threaded diagnostic, and the
+/// counters must not cost enough to distort what they measure.
+struct Timed<D: ReadAt> {
+    inner: D,
+    time: Cell<Duration>,
+    reads: Cell<u64>,
+    bytes: Cell<u64>,
+    /// Buckets by request size: <=4K, 8K, 16K, 32K, 64K, 128K, 256K, larger.
+    hist: [Cell<u64>; 8],
+}
+
+#[derive(Clone, Copy)]
+struct Snapshot {
+    time: Duration,
+    reads: u64,
+    bytes: u64,
+}
+
+impl<D: ReadAt> Timed<D> {
+    fn new(inner: D) -> Self {
+        Self {
+            inner,
+            time: Cell::new(Duration::ZERO),
+            reads: Cell::new(0),
+            bytes: Cell::new(0),
+            hist: std::array::from_fn(|_| Cell::new(0)),
+        }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            time: self.time.get(),
+            reads: self.reads.get(),
+            bytes: self.bytes.get(),
+        }
+    }
+
+    /// What happened between two snapshots, so the unlock's reads do not get
+    /// counted against the file read.
+    fn since(&self, start: Snapshot) -> Snapshot {
+        let now = self.snapshot();
+        Snapshot {
+            time: now.time - start.time,
+            reads: now.reads - start.reads,
+            bytes: now.bytes - start.bytes,
+        }
+    }
+
+    fn print_histogram(&self) {
+        const LABELS: [&str; 8] = [
+            "<= 4 KiB", "8 KiB", "16 KiB", "32 KiB", "64 KiB", "128 KiB", "256 KiB", "> 256 KiB",
+        ];
+        // Cumulative over the whole run. The unlock contributes a couple of
+        // dozen reads against tens of thousands, so it does not move the shape.
+        println!("  read sizes (whole run):");
+        for (label, count) in LABELS.iter().zip(&self.hist) {
+            if count.get() > 0 {
+                println!("    {:>9}  {:>9}", label, count.get());
+            }
+        }
+    }
+}
+
+impl<D: ReadAt> ReadAt for Timed<D> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> luks_core::error::Result<()> {
+        let bucket = match buf.len() {
+            0..=4096 => 0,
+            4097..=8192 => 1,
+            8193..=16384 => 2,
+            16385..=32768 => 3,
+            32769..=65536 => 4,
+            65537..=131072 => 5,
+            131073..=262144 => 6,
+            _ => 7,
+        };
+        self.hist[bucket].set(self.hist[bucket].get() + 1);
+        self.reads.set(self.reads.get() + 1);
+        self.bytes.set(self.bytes.get() + buf.len() as u64);
+
+        let t = Instant::now();
+        let r = self.inner.read_at(offset, buf);
+        self.time.set(self.time.get() + t.elapsed());
+        r
+    }
+
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
 
 /// Join without doubling the separator at the root.
 fn join(dir: &str, name: &str) -> String {
@@ -107,12 +213,12 @@ fn read_password() -> Secret {
 }
 
 fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::Result<()> {
-    let dev = FileDevice::open(path)?;
+    let raw = FileDevice::open(path)?;
     println!(
         "device  {}  ({:?} bytes){}",
-        dev.path(),
-        dev.len(),
-        if dev.is_raw() {
+        raw.path(),
+        raw.len(),
+        if raw.is_raw() {
             "  [raw character device — reads widened to 4 KiB]"
         } else {
             ""
@@ -121,9 +227,10 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
     // A raw device reports no length, so nothing upstream can bounds-check
     // against it. Say so once rather than leaving it to be inferred from a
     // `None` above.
-    if dev.is_raw() {
+    if raw.is_raw() {
         println!("        (no length reported; bounds checks come from the LUKS header)");
     }
+    let dev = Timed::new(raw);
 
     // A whole disk has a partition table; a bare container does not. Try for a
     // table, and fall back to treating the whole thing as one LUKS volume.
@@ -241,7 +348,12 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; 1024 * 1024];
         let mut done = 0u64;
+        let mut hash_time = Duration::ZERO;
 
+        // Everything before this point — partition scan, header, unlock,
+        // mount, subvolume walk — is metadata, and counting it against the
+        // file read is what made the earlier arithmetic disagree with itself.
+        let mark = dev.snapshot();
         let t = Instant::now();
         while done < size {
             let want = std::cmp::min(buf.len() as u64, size - done) as usize;
@@ -249,10 +361,13 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
             if got == 0 {
                 break;
             }
+            let h = Instant::now();
             hasher.update(&buf[..got]);
+            hash_time += h.elapsed();
             done += got as u64;
         }
         let secs = t.elapsed().as_secs_f64();
+        let io = dev.since(mark);
 
         let mib = done as f64 / (1024.0 * 1024.0);
         println!(
@@ -262,6 +377,42 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
             secs,
             mib / secs
         );
+
+        // The three buckets that were previously estimated. "Everything else"
+        // is the LUKS decrypt, the extent walk, the csum verification and every
+        // memory copy between them — whatever is left once the two costs we
+        // can name are removed.
+        let io_secs = io.time.as_secs_f64();
+        let hash_secs = hash_time.as_secs_f64();
+        let rest = secs - io_secs - hash_secs;
+        let io_mib = io.bytes as f64 / (1024.0 * 1024.0);
+        println!("\nwhere the {secs:.2} s went");
+        println!(
+            "  device I/O      {:>6.2} s  {:>4.0}%   {:>8} reads, {:.1} MiB at {:.0} MiB/s",
+            io_secs,
+            100.0 * io_secs / secs,
+            io.reads,
+            io_mib,
+            io_mib / io_secs
+        );
+        println!(
+            "  SHA-256         {:>6.2} s  {:>4.0}%",
+            hash_secs,
+            100.0 * hash_secs / secs
+        );
+        println!(
+            "  everything else {:>6.2} s  {:>4.0}%   decrypt + extents + csums + copies",
+            rest,
+            100.0 * rest / secs
+        );
+        // Read amplification: bytes pulled off the device per byte of file.
+        // Anything well above 1.0 means the reader is fetching the same data
+        // twice, or fetching far more than it needs per request.
+        println!(
+            "  amplification   {:>6.2}x  (device bytes per file byte)",
+            io.bytes as f64 / done as f64
+        );
+        dev.print_histogram();
     }
 
     println!("\nOK");
