@@ -17,9 +17,15 @@
 //! shell pipeline lands in `~/.zsh_history` where it outlives the session.
 //!
 //! ```text
-//! sudo cargo run --release --example read_image -- /dev/disk4s3   # prompts
+//! sudo cargo run --release --example read_image -- /dev/rdisk4s3  # prompts
 //! printf 'test' | cargo run --release --example read_image -- disk.img  # scripted
 //! ```
+//!
+//! Prefer `/dev/rdiskN` over `/dev/diskN` on macOS. The raw character device
+//! measured 722 MiB/s against the buffered node's 132 on the developer's SSD,
+//! because the buffered path copies through the page cache for data that is
+//! read exactly once. `FileDevice` handles the block-alignment the raw node
+//! demands.
 
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::fs::MountedFs;
@@ -102,7 +108,22 @@ fn read_password() -> Secret {
 
 fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::Result<()> {
     let dev = FileDevice::open(path)?;
-    println!("device  {}  ({:?} bytes)", dev.path(), dev.len());
+    println!(
+        "device  {}  ({:?} bytes){}",
+        dev.path(),
+        dev.len(),
+        if dev.is_raw() {
+            "  [raw character device — reads widened to 4 KiB]"
+        } else {
+            ""
+        }
+    );
+    // A raw device reports no length, so nothing upstream can bounds-check
+    // against it. Say so once rather than leaving it to be inferred from a
+    // `None` above.
+    if dev.is_raw() {
+        println!("        (no length reported; bounds checks come from the LUKS header)");
+    }
 
     // A whole disk has a partition table; a bare container does not. Try for a
     // table, and fall back to treating the whole thing as one LUKS volume.
