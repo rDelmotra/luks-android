@@ -1,52 +1,34 @@
 //! CRC-32C (Castagnoli), the default btrfs checksum.
 //!
-//! Hand-rolled rather than pulled from a crate for two reasons. It is not the
-//! same polynomial as `crc32fast` — that one is the IEEE/zlib CRC-32
-//! (0xEDB88320) and btrfs uses Castagnoli (0x82F63B78), so the dependency
-//! already in the tree is the wrong algorithm and reaching for it would produce
-//! a checksum that never matches. And the alternative crates carry SIMD
-//! `unsafe` for a job that only ever runs over metadata: a 1 GiB file read
-//! touches a few hundred tree nodes, single-digit megabytes. Table-driven is
-//! several hundred MB/s, which is far past anything this path needs.
-
-/// Lookup table for the reflected Castagnoli polynomial, built at compile time.
-const TABLE: [u32; 256] = {
-    const POLY: u32 = 0x82F6_3B78;
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ POLY
-            } else {
-                crc >> 1
-            };
-            bit += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-};
+//! The algorithm comes from the `crc32c` crate, which dispatches to the ARMv8
+//! CRC instructions (and SSE4.2 on x86) at runtime with a software fallback.
+//! **Not `crc32fast`** — that is the IEEE/zlib polynomial (0xEDB88320) and
+//! btrfs uses Castagnoli (0x82F63B78), so the crate already in the tree is the
+//! wrong algorithm and would produce checksums that never match.
+//!
+//! This was a hand-written table for most of the reader's life, on the
+//! reasoning that checksums only ever covered metadata: a 1 GiB file read
+//! touches a few hundred tree nodes, single-digit megabytes, and a table-driven
+//! CRC at several hundred MB/s is far past what that needs.
+//!
+//! That reasoning expired when data checksums landed. Every byte of every file
+//! now goes through here, and the table version was measured at **472 MiB/s** —
+//! 1.1 seconds of the 6.06 seconds it took to read a 515 MB file off the
+//! developer's drive, 18% of the total, to compute checksums. The hardware
+//! instruction makes that disappear.
+//!
+//! The two conventions below are the part no crate can be trusted to guess at,
+//! and both are pinned by tests against real `mkfs.btrfs` output.
 
 /// The raw accumulator: seeded with `seed`, with no final inversion.
+///
+/// `crc32c_append` takes and returns *inverted* values — it is built so that
+/// `crc32c_append(0, data) == crc32c(data)` — so both ends are flipped here to
+/// expose the register itself, which is what the name hash needs.
 pub fn crc32c_seed(seed: u32, data: &[u8]) -> u32 {
-    let mut crc = seed;
-    for &b in data {
-        crc = (crc >> 8) ^ TABLE[((crc ^ b as u32) & 0xFF) as usize];
-    }
-    crc
+    !crc32c::crc32c_append(!seed, data)
 }
 
-/// Standard CRC-32C of `data`: seeded with `!0`, and inverted at the end.
-///
-/// The final inversion is the part worth stating, because the kernel's own
-/// `__crc32c_le` does not do it and the inversion lives in the crypto shash
-/// wrapper instead — so reading the kernel source at the wrong layer gives a
-/// value that is wrong by exactly a bitwise NOT. Verified directly against
-/// `fixtures/btrfs/plain.img`, whose stored superblock checksum is 0xf7b4210d.
 pub fn crc32c(data: &[u8]) -> u32 {
     !crc32c_seed(!0, data)
 }
