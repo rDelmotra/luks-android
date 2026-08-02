@@ -30,6 +30,15 @@ use sha2::{Digest, Sha256};
 use std::io::{IsTerminal, Read};
 use std::time::Instant;
 
+/// Join without doubling the separator at the root.
+fn join(dir: &str, name: &str) -> String {
+    if dir.ends_with('/') {
+        format!("{dir}{name}")
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = match args.next() {
@@ -40,11 +49,14 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let hash_target = args.next();
+    // A directory gets listed, a file gets read and hashed. Guessing from the
+    // filesystem beats making the caller say which, and on btrfs the
+    // interesting paths are inside subvolumes, several levels down.
+    let target = args.next();
 
     let password = read_password();
 
-    let result = run(&path, password.expose(), hash_target.as_deref());
+    let result = run(&path, password.expose(), target.as_deref());
     // `password` is a Secret: dropping it zeroes the bytes. Dropped here
     // explicitly rather than at the end of main, so it is gone before the
     // process spends any time printing.
@@ -88,7 +100,7 @@ fn read_password() -> Secret {
     Secret::new(bytes)
 }
 
-fn run(path: &str, password: &[u8], hash_target: Option<&str>) -> luks_core::error::Result<()> {
+fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::Result<()> {
     let dev = FileDevice::open(path)?;
     println!("device  {}  ({:?} bytes)", dev.path(), dev.len());
 
@@ -160,25 +172,72 @@ fn run(path: &str, password: &[u8], hash_target: Option<&str>) -> luks_core::err
         }
     }
 
-    for e in fs.list_dir("/")? {
-        println!(
-            "  {:?} {}{}",
-            e.file_type,
-            e.name,
-            if e.is_subvolume { "  [subvolume]" } else { "" }
-        );
+    let listing = match target {
+        // A directory: list it. A file: fall through and hash it.
+        Some(t) => match fs.file_info(t) {
+            Ok(info) if info.file_type.is_dir() => Some(t),
+            _ => None,
+        },
+        None => Some("/"),
+    };
+
+    if let Some(dir) = listing {
+        println!("\n{dir}");
+        let mut entries = fs.list_dir(dir)?;
+        entries.sort_by(|a, b| {
+            b.file_type
+                .is_dir()
+                .cmp(&a.file_type.is_dir())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        for e in &entries {
+            // Sizes come from a per-entry inode read, which is why the app
+            // fetches them lazily; here the whole point is to look around.
+            let size = fs
+                .file_info(&join(dir, &e.name))
+                .map(|i| i.size)
+                .unwrap_or(0);
+            println!(
+                "  {:<9} {:>12}  {}{}",
+                format!("{:?}", e.file_type),
+                size,
+                e.name,
+                if e.is_subvolume { "  [subvolume]" } else { "" }
+            );
+        }
+        if target.is_some() {
+            println!("\nOK");
+            return Ok(());
+        }
     }
 
-    if let Some(target) = hash_target {
+    if let Some(target) = target {
+        // Streamed in 1 MiB chunks rather than slurped: a multi-gigabyte file
+        // should not need multi-gigabytes of RAM to hash, and this is the same
+        // loop the phone runs, so the throughput number means something.
+        let file = fs.open(target)?;
+        let size = file.size();
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut done = 0u64;
+
         let t = Instant::now();
-        let data = fs.read_file(target)?;
+        while done < size {
+            let want = std::cmp::min(buf.len() as u64, size - done) as usize;
+            let got = fs.read_open(&file, done, &mut buf[..want])?;
+            if got == 0 {
+                break;
+            }
+            hasher.update(&buf[..got]);
+            done += got as u64;
+        }
         let secs = t.elapsed().as_secs_f64();
-        let mib = data.len() as f64 / (1024.0 * 1024.0);
-        let digest = Sha256::digest(&data);
+
+        let mib = done as f64 / (1024.0 * 1024.0);
         println!(
-            "\n{target}\n  {} bytes\n  sha256 {:x}\n  read+decrypt {:.2} s = {:.1} MiB/s",
-            data.len(),
-            digest,
+            "\n{target}\n  {done} bytes\n  sha256 {:x}\n  \
+             read+decrypt+verify+hash {:.2} s = {:.1} MiB/s",
+            hasher.finalize(),
             secs,
             mib / secs
         );
