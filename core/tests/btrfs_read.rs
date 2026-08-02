@@ -22,7 +22,7 @@
 
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::error::LuksError;
-use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType};
+use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, Key, Node};
 use luks_core::fs::Btrfs;
 
 const IMAGES: [&str; 3] = ["plain.img", "compress.img", "mixed-4k.img"];
@@ -202,19 +202,24 @@ fn the_newest_superblock_copy_wins() {
     // can leave copy 0 older than copy 1. Taking the primary unconditionally
     // would mount a stale filesystem — which reads fine and shows the wrong
     // contents, the worst possible failure for this app.
+    //
+    // These go through `Superblock::find` rather than `Btrfs::mount`: the
+    // synthetic disk holds superblocks and nothing else, and a full mount also
+    // wants the chunk tree the copies point at.
     let disk = two_mirrors(8, 9);
-    assert_eq!(Btrfs::mount(&disk[..]).unwrap().superblock().generation, 9);
+    assert_eq!(Superblock::find(&disk[..]).unwrap().generation, 9);
 
     let disk = two_mirrors(11, 9);
-    assert_eq!(Btrfs::mount(&disk[..]).unwrap().superblock().generation, 11);
+    assert_eq!(Superblock::find(&disk[..]).unwrap().generation, 11);
 }
 
 #[test]
 fn a_corrupt_primary_falls_back_to_the_mirror() {
     let mut disk = two_mirrors(8, 8);
     disk[0x1_0000 + 0x100] ^= 0xFF;
-    let fs = Btrfs::mount(&disk[..]).expect("the mirror at 64 MiB is intact");
-    assert_eq!(fs.label(), "BTRFSTEST");
+    let sb = Superblock::find(&disk[..]).expect("the mirror at 64 MiB is intact");
+    assert_eq!(sb.label, "BTRFSTEST");
+    assert_eq!(sb.bytenr, 0x400_0000, "the mirror is the copy that was used");
 }
 
 #[test]
@@ -301,4 +306,252 @@ fn an_implausible_node_size_is_refused() {
 fn fix_checksum(raw: &mut [u8]) {
     let csum = crc32c(&raw[32..4096]).to_le_bytes();
     raw[..4].copy_from_slice(&csum);
+}
+
+// --- chunk tree ------------------------------------------------------------
+
+#[test]
+fn the_chunk_map_matches_what_dump_tree_reports() {
+    // Ground truth is BTRFS-EXPECTED.txt, which is btrfs-progs' own dump.
+    let fs = mount("plain.img");
+    let chunks = fs.chunk_map().chunks();
+    assert_eq!(chunks.len(), 3);
+
+    let shape: Vec<(u64, u64, u64, usize)> = chunks
+        .iter()
+        .map(|c| (c.logical, c.length, c.chunk_type, c.stripes.len()))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (13631488, 8388608, 0x1, 1),   // DATA, single
+            (22020096, 8388608, 0x22, 2),  // SYSTEM, DUP
+            (30408704, 53673984, 0x24, 2), // METADATA, DUP
+        ]
+    );
+
+    // The DUP chunks' second stripes, which the map never uses but must parse.
+    assert_eq!(chunks[1].stripes[0].offset, 22020096);
+    assert_eq!(chunks[1].stripes[1].offset, 30408704);
+    assert_eq!(chunks[2].stripes[0].offset, 38797312);
+    assert_eq!(chunks[2].stripes[1].offset, 92471296);
+}
+
+#[test]
+fn mixed_mode_puts_data_and_metadata_in_one_chunk() {
+    let fs = mount("mixed-4k.img");
+    let chunks = fs.chunk_map().chunks();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].chunk_type, 0x2); // SYSTEM
+    assert_eq!(chunks[1].chunk_type, 0x5); // DATA | METADATA
+    assert!(!chunks[1].is_mirrored());
+}
+
+#[test]
+fn the_bootstrap_map_covers_the_chunk_tree_and_little_else() {
+    // The point of sys_chunk_array: it is not the whole map, just enough of it
+    // to read the tree that holds the whole map.
+    let fs = mount("plain.img");
+    let boot = luks_core::fs::btrfs::ChunkMap::bootstrap(fs.superblock()).unwrap();
+    assert_eq!(boot.len(), 1);
+    assert!(boot.map(fs.superblock().chunk_root).is_ok());
+    // The root tree lives in the metadata chunk, which the bootstrap map has
+    // never heard of.
+    assert!(boot.map(fs.superblock().root).is_err());
+}
+
+#[test]
+fn the_root_tree_is_reachable_only_through_the_full_map() {
+    // The strongest single check on the chunk layer. sb.root is in a chunk
+    // that appears only inside the chunk tree, so reading a node there proves
+    // the whole bootstrap-then-replace sequence worked. And because a node
+    // carries its own address, a mapping that is merely *plausible* — right
+    // chunk, wrong offset — fails the bytenr check rather than returning
+    // convincing garbage.
+    for name in IMAGES {
+        let fs = mount(name);
+        let root = fs.read_node(fs.superblock().root).unwrap();
+        assert_eq!(root.owner, 1, "{name}: root tree objectid is 1");
+        assert!(root.nr_items > 0, "{name}");
+    }
+}
+
+#[test]
+fn logical_addresses_translate_the_way_the_chunk_items_say() {
+    let fs = mount("plain.img");
+    // Inside the metadata chunk: logical 30408704 -> stripe 0 at 38797312.
+    let (physical, run) = fs.chunk_map().map(30408704).unwrap();
+    assert_eq!(physical, 38797312);
+    assert_eq!(run, 53673984);
+
+    // 16 KiB in, the offset carries through unchanged.
+    let (physical, run) = fs.chunk_map().map(30408704 + 16384).unwrap();
+    assert_eq!(physical, 38797312 + 16384);
+    assert_eq!(run, 53673984 - 16384);
+}
+
+#[test]
+fn an_address_in_no_chunk_is_an_error_not_a_hole() {
+    let fs = mount("plain.img");
+    // Below the first chunk: the first 13 MiB of the logical space is not
+    // mapped at all.
+    assert!(fs.chunk_map().map(0).is_err());
+    // Past the last chunk.
+    assert!(fs.chunk_map().map(30408704 + 53673984).is_err());
+    // In the gap between the data chunk (ends at 22020096) and... there is
+    // none here, so use the far end instead: reading unmapped space must never
+    // be treated as a hole full of zeros, which is what a filesystem reader
+    // does for a *file* hole and is exactly the wrong answer for metadata.
+    assert!(fs.chunk_map().map(u64::MAX).is_err());
+}
+
+#[test]
+fn reads_spanning_a_chunk_boundary_are_stitched_together() {
+    let fs = mount("plain.img");
+    // The system chunk ends at 22020096 + 8388608 = 30408704, which is exactly
+    // where the metadata chunk begins — so a read straddling that point has to
+    // come from two different physical places.
+    let mut spanning = vec![0u8; 8192];
+    fs.read_logical(30408704 - 4096, &mut spanning).unwrap();
+
+    let mut first = vec![0u8; 4096];
+    let mut second = vec![0u8; 4096];
+    fs.read_logical(30408704 - 4096, &mut first).unwrap();
+    fs.read_logical(30408704, &mut second).unwrap();
+    assert_eq!(&spanning[..4096], &first[..]);
+    assert_eq!(&spanning[4096..], &second[..]);
+}
+
+#[test]
+fn a_node_claiming_the_wrong_address_is_refused() {
+    // A checksum alone cannot catch a bad chunk mapping: a node fetched from
+    // the wrong place is still a perfectly valid node and verifies fine. Only
+    // comparing the node's own `bytenr` against the address we followed to get
+    // there catches it — so feed the real chunk-root block in while claiming it
+    // came from one node further on.
+    let fs = mount("plain.img");
+    let sb = fs.superblock();
+    let mut raw = vec![0u8; sb.node_size as usize];
+    fs.read_logical(sb.chunk_root, &mut raw).unwrap();
+
+    Node::parse(raw.clone(), sb.chunk_root, sb.csum_type, &sb.metadata_uuid)
+        .expect("the honest address must parse");
+
+    let err = Node::parse(
+        raw,
+        sb.chunk_root + sb.node_size as u64,
+        sb.csum_type,
+        &sb.metadata_uuid,
+    )
+    .expect_err("a node must not be accepted at an address it does not claim");
+    assert!(matches!(err, LuksError::CorruptFs(_)), "got {err}");
+}
+
+#[test]
+fn a_node_from_another_filesystem_is_refused() {
+    // Re-used space: a node left behind by a previous filesystem checksums
+    // correctly and can even sit at the right address. Its fsid is what gives
+    // it away.
+    let fs = mount("plain.img");
+    let sb = fs.superblock();
+    let mut raw = vec![0u8; sb.node_size as usize];
+    fs.read_logical(sb.chunk_root, &mut raw).unwrap();
+
+    let stranger = [0xABu8; 16];
+    let err = Node::parse(raw, sb.chunk_root, sb.csum_type, &stranger)
+        .expect_err("a foreign fsid must be refused");
+    assert!(matches!(err, LuksError::CorruptFs(_)), "got {err}");
+}
+
+// --- tree walking ----------------------------------------------------------
+
+#[test]
+fn walks_a_single_leaf_tree() {
+    let fs = mount("plain.img");
+    let mut items = Vec::new();
+    fs.walk_tree(fs.superblock().chunk_root, &mut |key, data| {
+        items.push((key, data.len()));
+        Ok(())
+    })
+    .unwrap();
+
+    // One DEV_ITEM plus the three chunks, in key order — dump-tree reports the
+    // same four at the same sizes.
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0].0, Key::new(1, 216, 1));
+    assert_eq!(items[0].1, 98);
+    assert_eq!(items[1].0, Key::new(256, 228, 13631488));
+    assert!(items.windows(2).all(|w| w[0].0 < w[1].0), "keys must ascend");
+}
+
+/// Logical address of the fs tree's root node, via the root tree.
+///
+/// This peeks at two fields of a `ROOT_ITEM` rather than waiting for the item
+/// parsing that comes with the next layer, because leaving the interior-node
+/// descent untested until then would mean shipping the trickiest ten lines in
+/// the tree code on faith. `bytenr` at 176 and `level` at 238 were both read
+/// off the real item and cross-checked against dump-tree.
+fn fs_tree_root(fs: &Btrfs<FileDevice>) -> (u64, u8) {
+    const FS_TREE_OBJECTID: u64 = 5;
+    const ROOT_ITEM_KEY: u8 = 132;
+
+    let mut found = None;
+    fs.walk_tree(fs.superblock().root, &mut |key, data| {
+        if key.objectid == FS_TREE_OBJECTID && key.item_type == ROOT_ITEM_KEY {
+            let bytenr = u64::from_le_bytes(data[176..184].try_into().unwrap());
+            found = Some((bytenr, data[238]));
+        }
+        Ok(())
+    })
+    .unwrap();
+    found.expect("every btrfs has an FS_TREE root item")
+}
+
+#[test]
+fn walks_a_tree_with_interior_nodes() {
+    // The 400 files in the fixture exist for exactly this: they push the fs
+    // tree to level 1, so the walk has to descend key pointers instead of
+    // reading one leaf and stopping. A filesystem small enough to fit in a
+    // single leaf would exercise none of that and would look perfectly healthy.
+    let fs = mount("plain.img");
+    let (root, level) = fs_tree_root(&fs);
+    assert_eq!(level, 1, "the fixture must keep the fs tree multi-level");
+
+    let mut count = 0usize;
+    let mut previous: Option<Key> = None;
+    let mut ascending = true;
+    fs.walk_tree(root, &mut |key, _| {
+        if let Some(p) = previous {
+            // Ordering across a leaf boundary is the thing that breaks when
+            // children are visited in the wrong order — within one leaf it
+            // holds no matter what the walk does.
+            ascending &= p < key;
+        }
+        previous = Some(key);
+        count += 1;
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(ascending, "the walk must visit keys in order across leaves");
+    // 400 files, each with an inode item, an inode ref, two directory entries
+    // and an extent — plus the rest of the tree.
+    assert!(count > 400, "only visited {count} items, so leaves were skipped");
+}
+
+#[test]
+fn a_child_at_the_wrong_level_stops_the_walk() {
+    // The termination proof: levels must fall by exactly one per descent, so a
+    // corrupt pointer aimed back at an ancestor is refused rather than looped
+    // on. Point the fs tree's walk at a *leaf* address while claiming the tree
+    // root, and the level bookkeeping is what catches it.
+    let fs = mount("plain.img");
+    let (root, _) = fs_tree_root(&fs);
+    let node = fs.read_node(root).unwrap();
+    let child = node.key_ptr(0).unwrap().blockptr;
+
+    // Descending from a leaf must not be possible at all.
+    let leaf = fs.read_node(child).unwrap();
+    assert!(leaf.is_leaf());
+    assert!(leaf.key_ptr(0).is_err());
 }

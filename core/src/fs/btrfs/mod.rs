@@ -23,13 +23,22 @@
 //! to make *allocation* work. A reader never consults them, which is why
 //! several incompat flags that sound alarming are safe to accept.
 
+pub mod chunk;
 pub mod crc32c;
 pub mod superblock;
+pub mod tree;
 
+pub use chunk::{Chunk, ChunkMap};
 pub use superblock::{CsumType, Superblock};
+pub use tree::{Key, Node};
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
+
+/// A tree deeper than this is corrupt: btrfs's own limit is 8 levels, and a
+/// node's level must drop by exactly one per descent, so this doubles as the
+/// termination proof for the walk below.
+const MAX_LEVEL: u8 = 8;
 
 /// A mounted, read-only btrfs filesystem.
 ///
@@ -39,67 +48,128 @@ use crate::error::{LuksError, Result};
 pub struct Btrfs<D: ReadAt> {
     device: D,
     sb: Superblock,
+    chunks: ChunkMap,
 }
 
 impl<D: ReadAt> Btrfs<D> {
-    /// Find the newest valid superblock and check that this reader can cope
-    /// with the filesystem it describes.
+    /// Find the newest valid superblock, then build the logical-to-physical
+    /// map without which nothing else on the filesystem can be read.
     pub fn mount(device: D) -> Result<Self> {
-        let sb = Self::read_superblock(&device)?;
-        Ok(Btrfs { device, sb })
+        let sb = Superblock::find(&device)?;
+        let chunks = ChunkMap::bootstrap(&sb)?;
+        let mut fs = Btrfs {
+            device,
+            sb,
+            chunks,
+        };
+        fs.load_chunk_tree()?;
+        fs.chunks.check_single_device(fs.sb.dev_id)?;
+        Ok(fs)
     }
 
-    /// Pick the copy with the highest generation among those that verify.
+    /// Replace the bootstrap map with the real one.
     ///
-    /// The kernel does the same, and it matters more here than the equivalent
-    /// would on ext4: btrfs writes the mirrors in a fixed order, so a machine
-    /// that lost power mid-commit can leave copy 0 newer than copy 1, or copy 1
-    /// intact while copy 0 is torn. Taking the primary unconditionally would
-    /// read a filesystem that is recoverable as one that is corrupt.
-    fn read_superblock(device: &D) -> Result<Superblock> {
-        let device_len = device.len();
-        let mut best: Option<Superblock> = None;
-        let mut first_error: Option<LuksError> = None;
-
-        for offset in superblock::SUPER_OFFSETS {
-            // A mirror only exists if the device is long enough for it. On a
-            // 146 MiB fixture only the first two are present, and on anything
-            // under 256 GiB the third never is.
-            if let Some(len) = device_len {
-                if offset + superblock::SUPER_SIZE as u64 > len {
-                    continue;
-                }
+    /// The bootstrap map covers the chunk tree and, on a filesystem of any
+    /// size, very little else — it is capped at 2 KiB of superblock space.
+    /// Reading the chunk tree through it and adding every `CHUNK_ITEM` found is
+    /// what makes the rest of the address space addressable.
+    fn load_chunk_tree(&mut self) -> Result<()> {
+        let mut found = Vec::new();
+        self.walk_tree(self.sb.chunk_root, &mut |key, data| {
+            if key.item_type == tree::CHUNK_ITEM_KEY
+                && key.objectid == tree::FIRST_CHUNK_TREE_OBJECTID
+            {
+                found.push(Chunk::parse(key.offset, data)?);
             }
+            Ok(())
+        })?;
 
-            let mut buf = vec![0u8; superblock::SUPER_SIZE];
-            if device.read_at(offset, &mut buf).is_err() {
-                // Short device with an unknown length. Not an error in itself:
-                // the copy simply is not there.
-                continue;
-            }
+        if found.is_empty() {
+            return Err(LuksError::CorruptFs("btrfs chunk tree holds no chunks"));
+        }
+        for chunk in found {
+            self.chunks.insert(chunk);
+        }
+        Ok(())
+    }
 
-            match Superblock::parse(&buf, offset) {
-                Ok(sb) => {
-                    if best.as_ref().is_none_or(|b| sb.generation > b.generation) {
-                        best = Some(sb);
-                    }
-                }
-                Err(e) => {
-                    // Report what the *primary* copy said. "bad checksum on the
-                    // mirror at 64 MiB" is a confusing thing to show someone
-                    // whose drive simply is not btrfs.
-                    first_error.get_or_insert(e);
-                }
+    // --- logical addressing -------------------------------------------------
+
+    /// Read `buf.len()` bytes starting at logical address `logical`.
+    ///
+    /// A request may span chunks, so this loops — but the chunk map hands back
+    /// a run length, and chunks are at least 8 MiB, so in practice this is one
+    /// device read.
+    pub fn read_logical(&self, logical: u64, buf: &mut [u8]) -> Result<()> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let (physical, run) = self.chunks.map(logical + done as u64)?;
+            let take = (buf.len() - done).min(run as usize);
+            self.device
+                .read_at(physical, &mut buf[done..done + take])?;
+            done += take;
+        }
+        Ok(())
+    }
+
+    /// Read and verify the tree node at logical address `logical`.
+    pub fn read_node(&self, logical: u64) -> Result<Node> {
+        // Node reads are always node_size, whatever the caller wants out of
+        // them, because the checksum covers the whole block.
+        let mut raw = vec![0u8; self.sb.node_size as usize];
+        self.read_logical(logical, &mut raw)?;
+        Node::parse(raw, logical, self.sb.csum_type, &self.sb.metadata_uuid)
+    }
+
+    /// Visit every item in the tree rooted at `root`, in key order.
+    ///
+    /// Termination is structural rather than by a visit counter: each descent
+    /// must drop the level by exactly one, and the root's level is bounded, so
+    /// a corrupt tree pointing a node back at an ancestor is rejected instead
+    /// of looping.
+    pub fn walk_tree(
+        &self,
+        root: u64,
+        visit: &mut dyn FnMut(Key, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let node = self.read_node(root)?;
+        if node.level > MAX_LEVEL {
+            return Err(LuksError::CorruptFs("btrfs tree is implausibly deep"));
+        }
+        self.walk_node(node, visit)
+    }
+
+    fn walk_node(
+        &self,
+        node: Node,
+        visit: &mut dyn FnMut(Key, &[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if node.is_leaf() {
+            for i in 0..node.nr_items {
+                visit(node.key(i)?, node.item_data(i)?)?;
             }
+            return Ok(());
         }
 
-        best.ok_or_else(|| {
-            first_error.unwrap_or(LuksError::NotBtrfs([0; 8]))
-        })
+        for i in 0..node.nr_items {
+            let ptr = node.key_ptr(i)?;
+            let child = self.read_node(ptr.blockptr)?;
+            if child.level + 1 != node.level {
+                return Err(LuksError::CorruptFs(
+                    "btrfs child node is not one level below its parent",
+                ));
+            }
+            self.walk_node(child, visit)?;
+        }
+        Ok(())
     }
 
     pub fn superblock(&self) -> &Superblock {
         &self.sb
+    }
+
+    pub fn chunk_map(&self) -> &ChunkMap {
+        &self.chunks
     }
 
     pub fn label(&self) -> &str {

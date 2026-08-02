@@ -138,6 +138,8 @@ pub struct Superblock {
     /// Objectid of the tree holding the default subvolume's root. 6 = FS_TREE.
     pub root_dir_objectid: u64,
     pub num_devices: u64,
+    /// `dev_item.devid` — the id this device answers to in every chunk stripe.
+    pub dev_id: u64,
     pub sector_size: u32,
     pub node_size: u32,
     pub stripe_size: u32,
@@ -155,6 +157,54 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Find the newest valid superblock copy on `device`.
+    ///
+    /// The kernel picks by generation too, and it matters more here than the
+    /// equivalent would on ext4: btrfs writes the mirrors in a fixed order, so
+    /// a machine that lost power mid-commit can leave copy 0 stale while copy 1
+    /// is current. Taking the primary unconditionally would mount a filesystem
+    /// as it was one transaction ago — which reads perfectly and shows the
+    /// wrong contents, the worst failure this reader could have.
+    pub fn find<D: crate::device::ReadAt + ?Sized>(device: &D) -> Result<Self> {
+        let device_len = device.len();
+        let mut best: Option<Superblock> = None;
+        let mut first_error: Option<LuksError> = None;
+
+        for offset in SUPER_OFFSETS {
+            // A mirror only exists if the device is long enough for it. On a
+            // 146 MiB fixture only the first two are present, and on anything
+            // under 256 GiB the third never is.
+            if let Some(len) = device_len {
+                if offset + SUPER_SIZE as u64 > len {
+                    continue;
+                }
+            }
+
+            let mut buf = vec![0u8; SUPER_SIZE];
+            if device.read_at(offset, &mut buf).is_err() {
+                // A short device whose length we could not learn. Not an error
+                // in itself: the copy simply is not there.
+                continue;
+            }
+
+            match Superblock::parse(&buf, offset) {
+                Ok(sb) => {
+                    if best.as_ref().is_none_or(|b| sb.generation > b.generation) {
+                        best = Some(sb);
+                    }
+                }
+                // Report what the *primary* copy said. "bad checksum on the
+                // mirror at 64 MiB" is a baffling thing to show someone whose
+                // drive simply is not btrfs.
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+
+        best.ok_or_else(|| first_error.unwrap_or(LuksError::NotBtrfs([0; 8])))
+    }
+
     /// Parse and verify one superblock copy read from `offset`.
     pub fn parse(raw: &[u8], offset: u64) -> Result<Self> {
         if raw.len() < SUPER_SIZE {
@@ -246,6 +296,8 @@ impl Superblock {
             bytes_used: u64le(b, 0x78),
             root_dir_objectid: u64le(b, 0x80),
             num_devices,
+            // dev_item starts at 0xc9 and opens with its devid.
+            dev_id: u64le(b, 0xc9),
             sector_size,
             node_size,
             stripe_size: u32le(b, 0x9c),
