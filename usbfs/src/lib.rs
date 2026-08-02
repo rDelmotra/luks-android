@@ -24,6 +24,7 @@ use luks_core::error::{LuksError, Result};
 use luks_core::usb::BulkTransport;
 use std::os::raw::{c_uint, c_void};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------- ioctl codes
 
@@ -138,21 +139,36 @@ pub struct UsbFsTransport {
     ep_in: u8,
     ep_out: u8,
     interface: u8,
-    max_transfer: usize,
+    /// Shrinks itself on `EINVAL`. See [`UsbFsTransport::DEFAULT_MAX_TRANSFER`].
+    max_transfer: AtomicUsize,
     timeout_ms: u32,
     claimed: bool,
 }
 
 impl UsbFsTransport {
-    /// usbfs historically caps a single synchronous bulk transfer at 16 KiB
-    /// (`MAX_USBFS_BUFFER_SIZE`). Newer kernels allow more, but guessing high
-    /// turns into `EINVAL` on older Android devices, so the default is the
-    /// value that always works. Raise it with [`with_max_transfer`] once
-    /// measured. The SCSI layer splits reads to fit, so this costs throughput
-    /// and never correctness.
+    /// Start optimistic and let the kernel say no.
     ///
-    /// [`with_max_transfer`]: Self::with_max_transfer
-    pub const DEFAULT_MAX_TRANSFER: usize = 16 * 1024;
+    /// usbfs historically capped a single synchronous bulk transfer at 16 KiB
+    /// (`MAX_USBFS_BUFFER_SIZE`); newer kernels allow far more. That used to be
+    /// a guess we could only lose — too high meant `EINVAL` on older devices —
+    /// so the default was the value that always works.
+    ///
+    /// It is not a guess any more: [`bulk`](Self::bulk) halves this and retries
+    /// whenever the kernel rejects a transfer as too large, so the transport
+    /// self-tunes on the first oversized command and stays there.
+    ///
+    /// Why this is worth doing: every SCSI command costs three separate
+    /// synchronous ioctls — CBW out, data, CSW in — and the two wrappers are 31
+    /// and 13 bytes. At 16 KiB per data phase, reading 1 GiB measured 760 µs per
+    /// command of which only 273 µs was wire time, so two thirds of the link was
+    /// spent on overhead. Bigger transfers amortise the wrappers over more
+    /// payload.
+    pub const DEFAULT_MAX_TRANSFER: usize = 128 * 1024;
+
+    /// Never shrink below this. A transfer this small still works on any
+    /// kernel, so an `EINVAL` here means something other than the size and
+    /// must be reported rather than retried forever.
+    pub const MIN_MAX_TRANSFER: usize = 4 * 1024;
 
     /// Wrap a usbfs file descriptor.
     ///
@@ -176,14 +192,14 @@ impl UsbFsTransport {
             ep_in,
             ep_out,
             interface,
-            max_transfer: Self::DEFAULT_MAX_TRANSFER,
+            max_transfer: AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER),
             timeout_ms: 5_000,
             claimed: false,
         }
     }
 
     pub fn with_max_transfer(mut self, bytes: usize) -> Self {
-        self.max_transfer = bytes.max(512);
+        self.max_transfer = AtomicUsize::new(bytes.max(Self::MIN_MAX_TRANSFER));
         self
     }
 
@@ -241,30 +257,55 @@ impl UsbFsTransport {
         if buf.is_empty() {
             return Ok(0);
         }
-        let len = buf.len().min(self.max_transfer);
 
-        let mut req = UsbFsBulkTransfer {
-            ep: ep as c_uint,
-            len: len as c_uint,
-            timeout: self.timeout_ms,
-            data: buf.as_mut_ptr() as *mut c_void,
-        };
+        loop {
+            let limit = self.max_transfer.load(Ordering::Relaxed);
+            let len = buf.len().min(limit);
 
-        // SAFETY: `req.data` points at `len` writable bytes owned by `buf`, and
-        // `req.len` is exactly that count, so the kernel cannot write out of
-        // bounds. The struct layout is `#[repr(C)]` and its size is what the
-        // ioctl code was computed from.
-        let rc = unsafe {
-            libc::ioctl(
-                self.fd,
-                bulk_code() as IoctlReq,
-                &mut req as *mut UsbFsBulkTransfer as *mut c_void,
-            )
-        };
-        if rc < 0 {
-            return Err(transfer_err("USBDEVFS_BULK", errno()));
+            let mut req = UsbFsBulkTransfer {
+                ep: ep as c_uint,
+                len: len as c_uint,
+                timeout: self.timeout_ms,
+                data: buf.as_mut_ptr() as *mut c_void,
+            };
+
+            // SAFETY: `req.data` points at `len` writable bytes owned by `buf`,
+            // and `req.len` is exactly that count, so the kernel cannot write
+            // out of bounds. The struct layout is `#[repr(C)]` and its size is
+            // what the ioctl code was computed from.
+            let rc = unsafe {
+                libc::ioctl(
+                    self.fd,
+                    bulk_code() as IoctlReq,
+                    &mut req as *mut UsbFsBulkTransfer as *mut c_void,
+                )
+            };
+            if rc >= 0 {
+                return Ok(rc as usize);
+            }
+
+            let e = errno();
+
+            // A buffer the kernel considers too large is rejected by usbfs
+            // *before* it submits anything to the bus — it is pure argument
+            // validation. That is what makes retrying safe here: no data was
+            // moved, no packet was sent, so the Bulk-Only Transport state
+            // machine is exactly where it was and cannot desynchronise.
+            //
+            // Retrying a transfer that had actually started would be a serious
+            // bug: a repeated data phase against a live CBW would put the
+            // device and us permanently out of step.
+            if e == libc::EINVAL && limit > Self::MIN_MAX_TRANSFER {
+                let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                // Only lower it. Racing callers may each observe EINVAL; taking
+                // the minimum means the limit converges downward and never
+                // bounces back up to a size already known to fail.
+                self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                continue;
+            }
+
+            return Err(transfer_err("USBDEVFS_BULK", e));
         }
-        Ok(rc as usize)
     }
 }
 
@@ -282,7 +323,7 @@ impl BulkTransport for UsbFsTransport {
     }
 
     fn max_transfer(&self) -> usize {
-        self.max_transfer
+        self.max_transfer.load(Ordering::Relaxed)
     }
 
     fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
@@ -412,5 +453,35 @@ mod tests {
             matches!(err, LuksError::UsbTransfer(ref m) if m.contains("errno")),
             "unexpected error: {err}"
         );
+    }
+
+    /// The shrink-on-EINVAL loop in `bulk` terminates only because the limit
+    /// has a floor. If `with_max_transfer` could set a value at or below
+    /// `MIN_MAX_TRANSFER / 2`, or if the floor were ever zero, a device that
+    /// answers `EINVAL` for another reason would spin forever inside an ioctl
+    /// loop with no way out.
+    #[test]
+    fn the_transfer_limit_has_a_floor_so_the_retry_loop_ends() {
+        assert!(UsbFsTransport::MIN_MAX_TRANSFER > 0);
+        assert!(UsbFsTransport::DEFAULT_MAX_TRANSFER > UsbFsTransport::MIN_MAX_TRANSFER);
+
+        // SAFETY: never used for I/O; only the size arithmetic is inspected.
+        let t = unsafe { UsbFsTransport::from_raw_fd(-1, 0x81, 0x02, 0) };
+        assert_eq!(t.max_transfer(), UsbFsTransport::DEFAULT_MAX_TRANSFER);
+
+        // Absurdly small requests clamp up to the floor rather than through it.
+        let t = t.with_max_transfer(1);
+        assert_eq!(t.max_transfer(), UsbFsTransport::MIN_MAX_TRANSFER);
+
+        // Halving from the default reaches the floor in a bounded number of
+        // steps and stops there, which is what makes the loop finite.
+        let mut limit = UsbFsTransport::DEFAULT_MAX_TRANSFER;
+        let mut steps = 0;
+        while limit > UsbFsTransport::MIN_MAX_TRANSFER {
+            limit = (limit / 2).max(UsbFsTransport::MIN_MAX_TRANSFER);
+            steps += 1;
+            assert!(steps < 64, "shrink did not converge");
+        }
+        assert_eq!(limit, UsbFsTransport::MIN_MAX_TRANSFER);
     }
 }
