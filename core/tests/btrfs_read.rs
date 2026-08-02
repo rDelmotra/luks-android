@@ -953,7 +953,7 @@ fn a_symlink_is_reported_as_one_rather_than_followed() {
 fn every_image_lists_its_own_contents() {
     assert_eq!(
         names(&mount("mixed-4k.img").list_dir("/").unwrap()),
-        vec!["docs", "hello.txt"]
+        vec!["data.bin", "docs", "hello.txt"]
     );
     assert_eq!(
         names(&mount("compress.img").list_dir("/").unwrap()),
@@ -1169,10 +1169,16 @@ fn reading_a_file_costs_one_device_read_per_extent() {
         .load(std::sync::atomic::Ordering::Relaxed)
         - before;
     assert_eq!(data.len(), 2 * 1024 * 1024);
+    // Measured: 12. Eight of those are the mount and the extent runs; the
+    // other four are the checksum tree, which costs one search per extent
+    // read. That is the price of verifying the data and it is bounded by the
+    // number of extents, not by the size of the file — which is the property
+    // that matters, since a 1 GiB file has the same handful of searches.
     assert!(
-        reads <= 12,
-        "reading a two-extent file took {reads} device reads — the extent runs \
-         are being chopped up"
+        reads <= 16,
+        "reading a two-extent file took {reads} device reads — either the \
+         extent runs are being chopped up, or the checksum lookup is being \
+         repeated per sector instead of per extent"
     );
 }
 
@@ -1616,4 +1622,149 @@ fn the_fixtures_are_all_cleanly_unmounted() {
     for name in IMAGES {
         assert_eq!(mount(name).superblock().log_root, 0, "{name}");
     }
+}
+
+// --- data checksums --------------------------------------------------------
+
+/// Metadata checksums were enforced from the start; file *contents* were not.
+/// This asserts the csum tree is actually being consulted — a lookup bug that
+/// found nothing would leave every read passing, silently unverified, which
+/// looks identical to working from the outside.
+#[test]
+fn file_data_is_covered_by_checksums() {
+    use luks_core::fs::btrfs::Verified;
+
+    for (image, path) in [
+        ("plain.img", "/big.bin"),
+        // Compressed extents are checksummed over their on-disk (compressed)
+        // bytes, so this exercises a different range than the file's size.
+        ("compress.img", "/zlib.txt"),
+        ("compress.img", "/lzo.txt"),
+        // nodesize == sectorsize here, which is where a per-sector indexing
+        // error would not show up on the other images.
+        ("mixed-4k.img", "/data.bin"),
+    ] {
+        let fs = mount(image);
+        let found = fs.resolve_no_follow(fs.fs_tree(), path).unwrap();
+        let extents = fs
+            .file_extents(found.tree.bytenr, found.inode.objectid)
+            .unwrap();
+
+        let mut checked = 0;
+        for e in &extents {
+            // Inline extents live in a tree node and are covered by that node's
+            // own checksum, so they have no entry here.
+            if e.disk_bytenr == 0 {
+                continue;
+            }
+            let mut raw = vec![0u8; e.disk_num_bytes as usize];
+            let outcome = fs.read_data(e.disk_bytenr, &mut raw).unwrap();
+            assert_eq!(
+                outcome,
+                Verified::All,
+                "{image}{path}: extent at {} is not fully checksummed",
+                e.disk_bytenr
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "{image}{path}: nothing was checked");
+    }
+
+    // The skip above is real, not a way to pass vacuously: a small file is
+    // stored *inside* a tree node, so it has no data extent and no entry in
+    // the csum tree — it is covered by that node's own checksum instead.
+    let fs = mount("plain.img");
+    let found = fs.resolve_no_follow(fs.fs_tree(), "/docs/readme.md").unwrap();
+    let inline = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
+        .unwrap();
+    assert!(
+        inline.iter().all(|e| e.disk_bytenr == 0),
+        "readme.md was expected to be inline"
+    );
+}
+
+/// The test that decides whether any of this is worth having: corrupt one byte
+/// of file data on the disk and the read must fail, not hand back a file that
+/// is quietly wrong.
+///
+/// A single flipped bit is the realistic failure — bit rot, a dying cell, a
+/// bad cable. Everything else about the filesystem stays valid, so nothing
+/// *except* the data checksum can catch it: the extent item is intact, the
+/// tree nodes verify, the size is right.
+#[test]
+fn a_single_corrupted_byte_of_file_data_is_caught() {
+    let fs = mount("plain.img");
+    let found = fs.resolve_no_follow(fs.fs_tree(), "/big.bin").unwrap();
+    let extents = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
+        .unwrap();
+    let victim = extents
+        .iter()
+        .find(|e| e.disk_bytenr != 0)
+        .expect("big.bin has an out-of-line extent");
+    // Logical addresses mean nothing to a file on disk; the chunk map is what
+    // turns one into a byte offset we can reach.
+    let (physical, _) = fs.chunk_map().map(victim.disk_bytenr).unwrap();
+
+    let mut image = std::fs::read(format!(
+        "{}/../fixtures/btrfs/plain.img",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    // Not the first byte of the sector — anywhere in it must be caught.
+    let at = physical as usize + 1234;
+    image[at] ^= 0x01;
+
+    let corrupt = std::env::temp_dir().join("luks-btrfs-corrupt.img");
+    std::fs::write(&corrupt, &image).unwrap();
+
+    let fs = Btrfs::mount(FileDevice::open(&corrupt).unwrap()).expect("still mounts");
+    // The filesystem itself is untouched: listing and metadata still work, so
+    // the failure below is specifically about data.
+    assert!(fs.list_dir("/").is_ok(), "metadata should be unaffected");
+
+    let err = fs
+        .read_file("/big.bin")
+        .err()
+        .expect("a corrupted data extent must not be returned as a file");
+    assert!(
+        matches!(err, LuksError::FsChecksumMismatch(_)),
+        "expected a checksum error, got {err}"
+    );
+
+    // A file whose data was not touched still reads.
+    assert_eq!(
+        fs.read_file("/hello.txt").unwrap(),
+        b"hello btrfs\n",
+        "corruption in one extent must not condemn the whole filesystem"
+    );
+
+    std::fs::remove_file(&corrupt).ok();
+}
+
+/// Checksums cover whole sectors, so an unaligned read cannot be verified from
+/// its own bytes. It must still be verified — by reading the sectors around
+/// it — rather than silently skipping the edges, which on a stream of small
+/// reads would mean verifying almost nothing.
+#[test]
+fn an_unaligned_read_is_still_verified() {
+    use luks_core::fs::btrfs::Verified;
+    let fs = mount("plain.img");
+    let found = fs.resolve_no_follow(fs.fs_tree(), "/big.bin").unwrap();
+    let extents = fs
+        .file_extents(found.tree.bytenr, found.inode.objectid)
+        .unwrap();
+    let e = extents.iter().find(|e| e.disk_bytenr != 0).unwrap();
+
+    // Deliberately ragged at both ends.
+    let mut buf = vec![0u8; 100];
+    let outcome = fs.read_data(e.disk_bytenr + 7, &mut buf).unwrap();
+    assert_eq!(outcome, Verified::All);
+
+    // And the bytes are still the right ones, not the sector they were read
+    // inside of.
+    let mut whole = vec![0u8; 4096];
+    fs.read_data(e.disk_bytenr, &mut whole).unwrap();
+    assert_eq!(buf, whole[7..107]);
 }

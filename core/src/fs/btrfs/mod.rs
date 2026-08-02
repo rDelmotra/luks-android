@@ -25,6 +25,7 @@
 
 pub mod chunk;
 pub mod compress;
+pub mod csum;
 pub mod crc32c;
 pub mod cursor;
 pub mod dir;
@@ -35,6 +36,7 @@ pub mod superblock;
 pub mod tree;
 
 pub use chunk::{Chunk, ChunkMap};
+pub use csum::Verified;
 pub use cursor::Cursor;
 pub use dir::Located;
 pub use extent::{ExtentKind, FileExtent};
@@ -95,6 +97,9 @@ pub struct Btrfs<D: ReadAt> {
     /// each time costs a root-tree search — two device reads before any real
     /// work, on a link where round trips are the whole cost.
     fs_tree: TreeRoot,
+    /// Same reasoning, and it matters more: every data read consults this.
+    /// `None` on a filesystem that keeps no data checksums.
+    csum_tree: Option<TreeRoot>,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -128,10 +133,12 @@ impl<D: ReadAt> Btrfs<D> {
             // Placeholder: resolving it needs the chunk map that the next two
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
+            csum_tree: None,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
         fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
+        fs.csum_tree = csum::load(&fs);
         Ok(fs)
     }
 

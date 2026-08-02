@@ -88,6 +88,15 @@ impl CsumType {
 
     /// Compute the checksum of `data` and compare it with the leading bytes of
     /// `stored`, which is always the full 32-byte csum field.
+    /// Bytes per checksum. Data checksums are packed at this width, so getting
+    /// it wrong misaligns every checksum after the first.
+    pub fn size(self) -> usize {
+        match self {
+            CsumType::Crc32c => 4,
+            CsumType::Sha256 => 32,
+        }
+    }
+
     pub fn verify(self, stored: &[u8], data: &[u8]) -> bool {
         match self {
             CsumType::Crc32c => {

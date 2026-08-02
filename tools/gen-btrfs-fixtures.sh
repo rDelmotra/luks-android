@@ -140,6 +140,13 @@ mount -o loop "$IMG" "$MNT"
 mkdir -p "$MNT/docs"
 printf 'hello mixed\n' > "$MNT/hello.txt"
 printf 'nested content\n' > "$MNT/docs/readme.md"
+# Both files above are small enough to be stored inline, inside a tree node,
+# which means this image had no out-of-line data at all — and so could not
+# exercise data checksums, whose whole subject is data outside the trees.
+# 1 MiB is past any inlining threshold. It matters here specifically because
+# nodesize == sectorsize in mixed mode, which is where an off-by-one in
+# per-sector checksum indexing would be invisible on the other images.
+python3 -c "import sys; sys.stdout.buffer.write(bytes((i*17+3)%256 for i in range(1024*1024)))" > "$MNT/data.bin"
 sync
 umount "$MNT"
 echo "  -> mixed-4k.img"

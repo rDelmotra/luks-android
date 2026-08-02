@@ -265,7 +265,11 @@ impl<D: ReadAt> Btrfs<D> {
                         "btrfs extent range falls outside the allocated extent",
                     ));
                 }
-                self.read_logical(extent.disk_bytenr + start, out)?;
+                // `read_data`, not `read_logical`: file contents go through
+                // the checksum tree. This is the difference between "we copied
+                // the bytes that were there" and "we copied the bytes that
+                // were written", which on a failing drive is the whole point.
+                self.read_data(extent.disk_bytenr + start, out)?;
             }
 
             done += take;
@@ -290,7 +294,12 @@ impl<D: ReadAt> Btrfs<D> {
             ),
             None => {
                 let mut raw = vec![0u8; extent.disk_num_bytes as usize];
-                self.read_logical(extent.disk_bytenr, &mut raw)?;
+                // Checksums cover the *compressed* bytes as they sit on disk,
+                // so this verifies before decompressing — which also means a
+                // corrupt extent is reported as corrupt rather than as a
+                // decompression failure, and the decompressor is never fed
+                // bytes the filesystem already knows are wrong.
+                self.read_data(extent.disk_bytenr, &mut raw)?;
                 super::compress::decompress(
                     extent.compression,
                     &raw,

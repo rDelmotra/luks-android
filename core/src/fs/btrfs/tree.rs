@@ -33,6 +33,9 @@ pub const XATTR_ITEM_KEY: u8 = 24;
 pub const DIR_ITEM_KEY: u8 = 84;
 pub const DIR_INDEX_KEY: u8 = 96;
 pub const EXTENT_DATA_KEY: u8 = 108;
+/// One item holds a run of per-sector data checksums, keyed by the *disk*
+/// address the run starts at — not by inode, and not by file offset.
+pub const EXTENT_CSUM_KEY: u8 = 128;
 pub const ROOT_ITEM_KEY: u8 = 132;
 /// A subvolume's view of its parent: key `(subvol id, ROOT_BACKREF, parent id)`,
 /// data naming the directory it appears in. The direction that matters for a
@@ -47,10 +50,15 @@ pub const CHUNK_ITEM_KEY: u8 = 228;
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const ROOT_TREE_OBJECTID: u64 = 1;
 pub const FS_TREE_OBJECTID: u64 = 5;
+pub const CSUM_TREE_OBJECTID: u64 = 7;
 /// The root tree's own directory, which holds exactly one entry: `default`,
 /// naming the subvolume a plain `mount` shows.
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
+/// The objectid every `EXTENT_CSUM` item is filed under: `-10` as a `u64`.
+/// btrfs reserves the top of the objectid space by counting down, so this sorts
+/// after every real tree and inode.
+pub const EXTENT_CSUM_OBJECTID: u64 = u64::MAX - 9;
 /// Objectid of the root directory inside any fs tree, and the point above
 /// which every objectid is a file rather than a reserved tree id.
 pub const FIRST_FREE_OBJECTID: u64 = 256;
