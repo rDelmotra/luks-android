@@ -127,7 +127,7 @@ impl<D: ReadAt> Btrfs<D> {
 
     /// List a path in the default subvolume.
     pub fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
-        let root = self.fs_tree()?;
+        let root = self.fs_tree();
         let inode = self.resolve_no_follow(root.bytenr, root.root_dirid, path)?;
         if !inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(path.to_string()));
@@ -137,7 +137,7 @@ impl<D: ReadAt> Btrfs<D> {
 
     /// Metadata for a path in the default subvolume.
     pub fn file_info(&self, path: &str) -> Result<FileInfo> {
-        let root = self.fs_tree()?;
+        let root = self.fs_tree();
         Ok(self
             .resolve_no_follow(root.bytenr, root.root_dirid, path)?
             .info())

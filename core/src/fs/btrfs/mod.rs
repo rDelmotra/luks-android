@@ -27,12 +27,14 @@ pub mod chunk;
 pub mod crc32c;
 pub mod cursor;
 pub mod dir;
+pub mod extent;
 pub mod inode;
 pub mod superblock;
 pub mod tree;
 
 pub use chunk::{Chunk, ChunkMap};
 pub use cursor::Cursor;
+pub use extent::{ExtentKind, FileExtent};
 pub use inode::{DirEntryItem, Inode};
 pub use superblock::{CsumType, Superblock};
 pub use tree::{Key, Node};
@@ -46,7 +48,7 @@ use crate::error::{LuksError, Result};
 const MAX_LEVEL: u8 = 8;
 
 /// Where one tree lives, from its `ROOT_ITEM`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TreeRoot {
     /// Logical address of the root node.
     pub bytenr: u64,
@@ -65,6 +67,10 @@ pub struct Btrfs<D: ReadAt> {
     device: D,
     sb: Superblock,
     chunks: ChunkMap,
+    /// Resolved once at mount. Every path operation needs it, and looking it up
+    /// each time costs a root-tree search — two device reads before any real
+    /// work, on a link where round trips are the whole cost.
+    fs_tree: TreeRoot,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -77,9 +83,13 @@ impl<D: ReadAt> Btrfs<D> {
             device,
             sb,
             chunks,
+            // Placeholder: resolving it needs the chunk map that the next two
+            // lines build. Nothing reads it in between.
+            fs_tree: TreeRoot::default(),
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
+        fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
         Ok(fs)
     }
 
@@ -216,8 +226,8 @@ impl<D: ReadAt> Btrfs<D> {
     /// it does put `/` and `/home` in separate subvolumes mounted by name, so
     /// browsing the whole install will eventually mean enumerating subvolumes
     /// rather than just this one. Noted, not done.
-    pub fn fs_tree(&self) -> Result<TreeRoot> {
-        self.tree_root(tree::FS_TREE_OBJECTID)
+    pub fn fs_tree(&self) -> TreeRoot {
+        self.fs_tree
     }
 
     pub fn superblock(&self) -> &Superblock {

@@ -70,6 +70,88 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         Ok(cursor)
     }
 
+    /// Position at the last item whose key is <= `key`.
+    ///
+    /// The counterpart to [`Cursor::search`], and the one a file read needs:
+    /// extents are keyed by the file offset they *start* at, so the extent
+    /// covering byte 5000 is filed under some smaller offset and an
+    /// equal-or-greater search would sail straight past it. Reading from the
+    /// middle of a file is the common case — every chunk after the first — so
+    /// getting this wrong would return zeros for most of a large file.
+    ///
+    /// Leaves the cursor invalid if every key in the tree is greater.
+    pub fn search_le(fs: &'a Btrfs<D>, root: u64, key: &Key) -> Result<Self> {
+        let mut cursor = Cursor::search(fs, root, key)?;
+        if cursor.valid() && cursor.key()? == *key {
+            return Ok(cursor);
+        }
+        // `search` left us on the first key strictly greater than the target
+        // (or past the end), so the answer is one step back either way.
+        cursor.retreat()?;
+        Ok(cursor)
+    }
+
+    /// Step back one item in key order.
+    fn retreat(&mut self) -> Result<()> {
+        let last = self.path.len() - 1;
+        let (_, i) = &mut self.path[last];
+        if *i > 0 {
+            *i -= 1;
+            return Ok(());
+        }
+        self.retreat_leaf()
+    }
+
+    /// Move to the last item of the previous leaf, mirroring [`advance_leaf`].
+    fn retreat_leaf(&mut self) -> Result<()> {
+        loop {
+            if self.path.len() == 1 {
+                // Nothing precedes the first item. Park past the end of the
+                // leaf so `valid()` reports false rather than pointing at the
+                // wrong item.
+                let (node, i) = &mut self.path[0];
+                *i = node.nr_items;
+                return Ok(());
+            }
+            self.path.pop();
+
+            let last = self.path.len() - 1;
+            let (node, i) = &mut self.path[last];
+            if *i == 0 {
+                continue;
+            }
+            *i -= 1;
+
+            // Descend rightmost from here.
+            let mut ptr = node.key_ptr(*i)?.blockptr;
+            let mut level = node.level;
+            loop {
+                let child = self.fs.read_node(ptr)?;
+                if child.level + 1 != level {
+                    return Err(LuksError::CorruptFs(
+                        "btrfs child node is not one level below its parent",
+                    ));
+                }
+                level = child.level;
+                if child.nr_items == 0 {
+                    return Err(LuksError::CorruptFs("btrfs node has no items"));
+                }
+                let last_index = child.nr_items - 1;
+                let leaf = child.is_leaf();
+                let next = if leaf {
+                    0
+                } else {
+                    child.key_ptr(last_index)?.blockptr
+                };
+                self.path.push((child, last_index));
+                if leaf {
+                    return Ok(());
+                }
+                ptr = next;
+            }
+        }
+    }
+
     fn leaf(&self) -> &(Node, usize) {
         self.path.last().expect("a cursor always has a leaf")
     }
@@ -155,6 +237,11 @@ impl<D: ReadAt> Btrfs<D> {
     /// Position a cursor in the tree rooted at `root`.
     pub fn search(&self, root: u64, key: &Key) -> Result<Cursor<'_, D>> {
         Cursor::search(self, root, key)
+    }
+
+    /// Position a cursor at the last item at or before `key`.
+    pub fn search_le(&self, root: u64, key: &Key) -> Result<Cursor<'_, D>> {
+        Cursor::search_le(self, root, key)
     }
 
     /// Find the item with exactly this key, if it exists.

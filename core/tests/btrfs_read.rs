@@ -22,7 +22,7 @@
 
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::error::LuksError;
-use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, Key, Node};
+use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, ExtentKind, Key, Node};
 use luks_core::fs::{Btrfs, FileType};
 
 const IMAGES: [&str; 3] = ["plain.img", "compress.img", "mixed-4k.img"];
@@ -561,7 +561,7 @@ fn a_child_at_the_wrong_level_stops_the_walk() {
 #[test]
 fn finds_the_fs_tree_through_its_root_item() {
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap();
+    let root = fs.fs_tree();
     // Cross-checked against dump-tree, which reports the FS_TREE node at this
     // address and level.
     assert_eq!(root.bytenr, 30605312);
@@ -570,7 +570,7 @@ fn finds_the_fs_tree_through_its_root_item() {
     assert_eq!(root.root_dirid, 256);
 
     for name in IMAGES {
-        assert_eq!(mount(name).fs_tree().unwrap().root_dirid, 256, "{name}");
+        assert_eq!(mount(name).fs_tree().root_dirid, 256, "{name}");
     }
 }
 
@@ -619,7 +619,7 @@ fn stepping_a_cursor_visits_exactly_what_walking_does() {
     // is level 1 with 13 leaves, so a cursor that mishandles the climb-and-
     // descend would diverge here and nowhere else.
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap().bytenr;
+    let root = fs.fs_tree().bytenr;
 
     let mut walked = Vec::new();
     fs.walk_tree(root, &mut |key, data| {
@@ -643,7 +643,7 @@ fn stepping_a_cursor_visits_exactly_what_walking_does() {
 #[test]
 fn a_run_scan_stops_at_the_end_of_the_run() {
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap().bytenr;
+    let root = fs.fs_tree().bytenr;
 
     // The root directory's DIR_INDEX entries: hello.txt, big.bin, docs, many,
     // the unicode name, and the two symlinks.
@@ -661,7 +661,7 @@ fn a_run_scan_stops_at_the_end_of_the_run() {
 #[test]
 fn a_run_scan_can_stop_early() {
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap().bytenr;
+    let root = fs.fs_tree().bytenr;
     let mut seen = 0;
     fs.for_each_item(root, 256, 96, &mut |_, _| {
         seen += 1;
@@ -700,7 +700,7 @@ fn searching_costs_the_depth_of_the_tree_not_its_size() {
         reads: std::sync::atomic::AtomicUsize::new(0),
     };
     let fs = Btrfs::mount(counting).unwrap();
-    let root = fs.fs_tree().unwrap().bytenr;
+    let root = fs.fs_tree().bytenr;
 
     let load = |fs: &Btrfs<CountingDevice>| {
         fs.device().reads.load(std::sync::atomic::Ordering::Relaxed)
@@ -838,7 +838,7 @@ fn looks_a_name_up_without_scanning_the_directory() {
         reads: std::sync::atomic::AtomicUsize::new(0),
     };
     let fs = Btrfs::mount(counting).unwrap();
-    let root = fs.fs_tree().unwrap();
+    let root = fs.fs_tree();
     let load = || {
         fs.device()
             .reads
@@ -886,7 +886,7 @@ fn looks_a_name_up_without_scanning_the_directory() {
 #[test]
 fn a_missing_name_is_not_found_rather_than_an_error() {
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap();
+    let root = fs.fs_tree();
     assert!(fs
         .lookup(root.bytenr, root.root_dirid, "nope.txt")
         .unwrap()
@@ -900,7 +900,7 @@ fn a_missing_name_is_not_found_rather_than_an_error() {
 #[test]
 fn a_unicode_name_round_trips() {
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap();
+    let root = fs.fs_tree();
     let found = fs
         .lookup(root.bytenr, root.root_dirid, "café-naïve-日本語.txt")
         .unwrap()
@@ -972,11 +972,217 @@ fn the_name_hash_matches_what_mkfs_filed_entries_under() {
     // And the hash must actually agree with the key mkfs used, for every entry
     // in the root directory rather than just the two above.
     let fs = mount("plain.img");
-    let root = fs.fs_tree().unwrap();
+    let root = fs.fs_tree();
     for entry in fs.list_dir("/").unwrap() {
         let found = fs
             .lookup(root.bytenr, root.root_dirid, &entry.name)
             .unwrap();
         assert!(found.is_some(), "{} was listed but not findable", entry.name);
     }
+}
+
+// --- file contents ---------------------------------------------------------
+
+/// The same pattern `tools/gen-btrfs-fixtures.sh` writes into `big.bin`.
+fn expected_big() -> Vec<u8> {
+    (0..2 * 1024 * 1024)
+        .map(|i| ((i * 31 + 7) % 256) as u8)
+        .collect()
+}
+
+#[test]
+fn reads_an_inline_file() {
+    // Small files have no data block at all — the bytes are in the leaf.
+    let fs = mount("plain.img");
+    assert_eq!(fs.read_file("/hello.txt").unwrap(), b"hello btrfs\n");
+    assert_eq!(
+        fs.read_file("/docs/readme.md").unwrap(),
+        b"# readme\n\nnested content\n"
+    );
+    assert_eq!(
+        fs.read_file("/docs/nested/deep.txt").unwrap(),
+        b"three levels down\n"
+    );
+
+    let root = fs.fs_tree();
+    let inode = fs.resolve_no_follow(root.bytenr, root.root_dirid, "/hello.txt").unwrap();
+    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+    assert_eq!(extents.len(), 1);
+    assert_eq!(extents[0].kind, ExtentKind::Inline);
+}
+
+#[test]
+fn reads_a_file_that_spans_several_extents() {
+    // 2 MiB written as two 1 MiB extents, so a read that stops at the first
+    // one returns exactly half a file and looks fine until the bytes are
+    // checked.
+    let fs = mount("plain.img");
+    let data = fs.read_file("/big.bin").unwrap();
+    assert_eq!(data.len(), 2 * 1024 * 1024);
+    assert_eq!(data, expected_big());
+
+    let root = fs.fs_tree();
+    let inode = fs.resolve_no_follow(root.bytenr, root.root_dirid, "/big.bin").unwrap();
+    let extents = fs.file_extents(root.bytenr, inode.objectid).unwrap();
+    assert_eq!(extents.len(), 2);
+    assert!(extents.iter().all(|e| e.kind == ExtentKind::Regular));
+}
+
+#[test]
+fn reads_from_the_middle_of_a_file() {
+    // The case search_le exists for: the extent covering byte 1_500_000 is
+    // filed under 1_048_576, so an equal-or-greater search sails past it and
+    // the read returns zeros.
+    let fs = mount("plain.img");
+    let expected = expected_big();
+
+    for (offset, len) in [
+        (0usize, 100usize),
+        (4095, 4098),          // straddles a sector boundary
+        (1_048_575, 3),        // straddles the extent boundary
+        (1_500_000, 65536),    // squarely inside the second extent
+        (2 * 1024 * 1024 - 10, 10), // the very end
+    ] {
+        let mut buf = vec![0u8; len];
+        let n = fs.read_chunk("/big.bin", offset as u64, &mut buf).unwrap();
+        assert_eq!(n, len, "at offset {offset}");
+        assert_eq!(buf, expected[offset..offset + len], "at offset {offset}");
+    }
+}
+
+#[test]
+fn a_read_past_the_end_of_a_file_is_short_not_an_error() {
+    let fs = mount("plain.img");
+    let mut buf = vec![0u8; 1000];
+    let n = fs.read_chunk("/hello.txt", 0, &mut buf).unwrap();
+    assert_eq!(n, 12);
+    assert_eq!(&buf[..n], b"hello btrfs\n");
+
+    assert_eq!(fs.read_chunk("/hello.txt", 12, &mut buf).unwrap(), 0);
+    assert_eq!(fs.read_chunk("/hello.txt", 9999, &mut buf).unwrap(), 0);
+}
+
+#[test]
+fn a_sparse_file_reads_as_zeros_where_it_has_no_extents() {
+    // NO_HOLES means the gap has *no* item covering it. The reader has to infer
+    // zeros from an item that is absent, which is the case that returns
+    // whatever was in the buffer if it is handled by iterating items instead of
+    // by walking file offsets.
+    let fs = mount("compress.img");
+    let info = fs.file_info("/sparse.bin").unwrap();
+    assert_eq!(info.size, 1048576);
+
+    let data = fs.read_file("/sparse.bin").unwrap();
+    assert_eq!(data.len(), 1048576);
+    assert!(
+        data[..1048573].iter().all(|&b| b == 0),
+        "the hole must read as zeros"
+    );
+    assert_eq!(&data[1048573..], b"end");
+
+    // And the same through a partial read that starts inside the hole.
+    let mut buf = vec![0xAAu8; 64];
+    fs.read_chunk("/sparse.bin", 500_000, &mut buf).unwrap();
+    assert!(buf.iter().all(|&b| b == 0), "a stale buffer must be cleared");
+}
+
+#[test]
+fn reads_a_symlink_target() {
+    // Symlink targets are stored exactly like file contents, which is why this
+    // could not work before the extent reader existed.
+    let fs = mount("plain.img");
+    assert_eq!(fs.read_link("/link-to-hello").unwrap(), "hello.txt");
+    assert_eq!(fs.read_link("/docs/link-to-deep").unwrap(), "nested/deep.txt");
+
+    assert!(fs.read_link("/hello.txt").is_err(), "not a symlink");
+}
+
+#[test]
+fn reading_a_directory_is_refused() {
+    let fs = mount("plain.img");
+    assert!(matches!(
+        fs.read_file("/docs").unwrap_err(),
+        LuksError::IsADirectory(_)
+    ));
+}
+
+#[test]
+fn reads_every_file_in_a_multi_leaf_directory() {
+    // 400 files, each an inline extent in a different leaf than its neighbours
+    // near the boundaries. Content is derived from the name, so a mix-up
+    // between two files is caught rather than just a truncation.
+    let fs = mount("plain.img");
+    for entry in fs.list_dir("/many").unwrap() {
+        let i: u32 = entry.name[1..5].parse().unwrap();
+        let got = fs.read_file(&format!("/many/{}", entry.name)).unwrap();
+        assert_eq!(got, format!("file number {i}\n").into_bytes(), "{}", entry.name);
+    }
+}
+
+#[test]
+fn reads_files_on_a_mixed_block_group_filesystem() {
+    // Data and metadata share one chunk here, so a mapping that assumed a
+    // chunk is only ever one or the other would fail on the data read.
+    let fs = mount("mixed-4k.img");
+    assert_eq!(fs.read_file("/hello.txt").unwrap(), b"hello mixed\n");
+    assert_eq!(fs.read_file("/docs/readme.md").unwrap(), b"nested content\n");
+}
+
+#[test]
+fn a_compressed_extent_is_refused_by_name_for_now() {
+    // Not implemented yet, and the important part is that it says so rather
+    // than handing back the compressed bytes as if they were the file.
+    let fs = mount("compress.img");
+    for name in ["/zlib.txt", "/lzo.txt", "/zstd.txt"] {
+        let err = fs.read_file(name).expect_err(name);
+        assert!(
+            err.to_string().contains("compressed"),
+            "{name}: unhelpful error {err}"
+        );
+    }
+}
+
+#[test]
+fn an_inline_file_is_readable_on_the_compressed_image() {
+    // tiny.txt is below max_inline, and the mount that wrote it had no
+    // compression forced, so it is a plain inline extent.
+    let fs = mount("compress.img");
+    let data = fs.read_file("/tiny.txt").unwrap();
+    assert!(data.starts_with(b"inline extent"));
+}
+
+#[test]
+fn reading_a_file_costs_one_device_read_per_extent() {
+    // The regression guard this project has already paid for once. The ext4
+    // reader originally mapped one block at a time, turning a 1 GiB file into
+    // a quarter of a million SCSI round trips and minutes of wall clock on real
+    // hardware. btrfs is more prone to it, not less: every data read goes
+    // through a logical-to-physical translation, so a loop that re-translates
+    // per block looks perfectly correct and is unusably slow.
+    //
+    // big.bin is 2 MiB in two extents. A per-sector reader would take 512
+    // reads for the data alone.
+    let counting = CountingDevice {
+        inner: device("plain.img"),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let fs = Btrfs::mount(counting).unwrap();
+    let before = fs
+        .device()
+        .reads
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let data = fs.read_file("/big.bin").unwrap();
+
+    let reads = fs
+        .device()
+        .reads
+        .load(std::sync::atomic::Ordering::Relaxed)
+        - before;
+    assert_eq!(data.len(), 2 * 1024 * 1024);
+    assert!(
+        reads <= 12,
+        "reading a two-extent file took {reads} device reads — the extent runs \
+         are being chopped up"
+    );
 }
