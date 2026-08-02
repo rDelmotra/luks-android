@@ -1555,3 +1555,65 @@ fn crossing_a_boundary_costs_one_extra_search() {
         "{no_crossing} reads without a crossing, {one_crossing} with one"
     );
 }
+
+// --- an unclean filesystem -------------------------------------------------
+
+/// A btrfs that was not unmounted cleanly keeps its newest writes in a log
+/// tree, which this reader does not walk — replaying one is a write. Mounting
+/// anyway would show the filesystem as it was *before* the interruption:
+/// recent files missing, or holding their previous contents, with every
+/// checksum verifying, because that stale data is genuinely what is there.
+///
+/// The fixtures are all cleanly unmounted, so the dirty state is synthesised:
+/// take a real superblock, set `log_root`, and repair the checksum — which is
+/// only possible because the CRC is ours to compute, and is the same trick the
+/// mirror-selection tests use.
+#[test]
+fn a_filesystem_with_an_unreplayed_log_tree_is_refused() {
+    let mut original = vec![0u8; 4096];
+    device("plain.img").read_at(0x1_0000, &mut original).unwrap();
+
+    let with_log = |log_root: u64| -> Vec<u8> {
+        let mut disk = vec![0u8; 0x400_0000 + 4096];
+        for offset in [0x1_0000u64, 0x400_0000] {
+            let mut copy = original.clone();
+            copy[0x30..0x38].copy_from_slice(&offset.to_le_bytes());
+            copy[0x60..0x68].copy_from_slice(&log_root.to_le_bytes());
+            fix_checksum(&mut copy);
+            disk[offset as usize..offset as usize + 4096].copy_from_slice(&copy);
+        }
+        disk
+    };
+
+    let dirty = with_log(30_000_000);
+    // `.err()` rather than `expect_err`: Btrfs has no Debug, and giving it one
+    // would mean dumping a 16 KiB node on every failed assertion.
+    let err = Btrfs::mount(&dirty[..])
+        .err()
+        .expect("a dirty filesystem must be refused");
+    assert!(
+        matches!(err, LuksError::FsNeedsRecovery),
+        "expected FsNeedsRecovery, got {err}"
+    );
+
+    // The guard must be the log tree specifically, not the synthetic disk:
+    // with log_root cleared the same disk gets past this check and fails later
+    // for the reason it should — no chunk tree behind the superblock.
+    let clean = with_log(0);
+    let err = Btrfs::mount(&clean[..])
+        .err()
+        .expect("this disk has no chunk tree");
+    assert!(
+        !matches!(err, LuksError::FsNeedsRecovery),
+        "cleared log_root still reported as needing recovery"
+    );
+}
+
+/// Every committed fixture is cleanly unmounted, so the guard above cannot be
+/// silently rejecting all of them.
+#[test]
+fn the_fixtures_are_all_cleanly_unmounted() {
+    for name in IMAGES {
+        assert_eq!(mount(name).superblock().log_root, 0, "{name}");
+    }
+}

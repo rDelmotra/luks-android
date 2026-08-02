@@ -102,6 +102,24 @@ impl<D: ReadAt> Btrfs<D> {
     /// map without which nothing else on the filesystem can be read.
     pub fn mount(device: D) -> Result<Self> {
         let sb = Superblock::find(&device)?;
+
+        // A non-empty log tree means this filesystem was not unmounted
+        // cleanly — a yanked drive, a crash, a phone that pulled the cable.
+        // The newest writes live in that tree and **not** in the trees this
+        // reader walks, so mounting anyway would show a filesystem as it was
+        // some time before the interruption: files missing, or holding their
+        // previous contents, with every checksum verifying.
+        //
+        // Replaying the log is a write operation and out of scope by design.
+        // Refusing matches what ext4 already does with a dirty journal
+        // (`INCOMPAT_RECOVER`), and for the same reason: silently handing back
+        // stale data is worse than saying no. If the rescue case ever needs an
+        // "I know, show me anyway" override, it belongs at the UI layer where
+        // a person can consent to it, not as a default here.
+        if sb.log_root != 0 {
+            return Err(LuksError::FsNeedsRecovery);
+        }
+
         let chunks = ChunkMap::bootstrap(&sb)?;
         let mut fs = Btrfs {
             device,
