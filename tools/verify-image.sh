@@ -61,9 +61,19 @@ trap cleanup EXIT
 TARGET="$IMG"
 if [ "$(blkid -o value -s PTTYPE "$IMG" 2>/dev/null || true)" = "gpt" ]; then
     LOOP="$(losetup --find --show --partscan "$IMG")"
-    TARGET="${LOOP}p1"
-    [ -b "$TARGET" ] || { echo "GPT present but no partition 1" >&2; exit 1; }
-    echo "container: GPT, partition 1"
+    # Not necessarily partition 1: a disk can carry an unencrypted partition
+    # ahead of the encrypted one, and blindly taking p1 reports "not a valid
+    # LUKS device" for an image that is perfectly fine. Ask the kernel.
+    TARGET=""
+    for part in "${LOOP}"p*; do
+        [ -b "$part" ] || continue
+        if [ "$(blkid -o value -s TYPE "$part" 2>/dev/null || true)" = "crypto_LUKS" ]; then
+            TARGET="$part"
+            echo "container: GPT, ${part##*/}"
+            break
+        fi
+    done
+    [ -n "$TARGET" ] || { echo "GPT present but no LUKS partition" >&2; exit 1; }
 else
     echo "container: bare LUKS"
 fi
