@@ -21,6 +21,19 @@ const OP_READ_CAPACITY_10: u8 = 0x25;
 const OP_READ_10: u8 = 0x28;
 const OP_READ_16: u8 = 0x88;
 const OP_READ_CAPACITY_16: u8 = 0x9E;
+/// Write opcodes exist only with `dangerous-write-support`. This is the
+/// literal statement of the safety guarantee: without the feature, the byte
+/// `0x2A` is never assembled into a command block, so no build of this crate
+/// can tell a drive to overwrite a sector.
+#[cfg(feature = "dangerous-write-support")]
+const OP_WRITE_10: u8 = 0x2A;
+#[cfg(feature = "dangerous-write-support")]
+const OP_WRITE_16: u8 = 0x8A;
+/// SYNCHRONIZE CACHE(10). A USB bridge acknowledges a write once it is in the
+/// bridge's own buffer, not once it is on flash, so without this a "completed"
+/// write can still be lost to a yanked cable.
+#[cfg(feature = "dangerous-write-support")]
+const OP_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 const SA_READ_CAPACITY_16: u8 = 0x10;
 
 /// READ(10) carries a 16-bit block count and a 32-bit LBA.
@@ -274,6 +287,51 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         self.command(cdb, Direction::In, &mut buf[..expected])
     }
+
+    /// Write `count` blocks starting at `lba`, choosing WRITE(10) or WRITE(16).
+    ///
+    /// The mirror of [`ScsiBlockDevice::read_blocks`], and deliberately built
+    /// the same way: the CDB layout is identical, only the opcode and the
+    /// direction change. Divergence between the two would be a bug that shows
+    /// up as data landing at the wrong LBA.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+        let expected = count as usize * self.capacity.block_size as usize;
+        if buf.len() < expected {
+            return Err(LuksError::ScsiProtocol("write buffer too small"));
+        }
+
+        let cdb = if lba > READ10_MAX_LBA || count as u64 > READ10_MAX_BLOCKS {
+            let mut cdb = vec![0u8; 16];
+            cdb[0] = OP_WRITE_16;
+            cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+            cdb[10..14].copy_from_slice(&count.to_be_bytes());
+            cdb
+        } else {
+            let mut cdb = vec![0u8; 10];
+            cdb[0] = OP_WRITE_10;
+            cdb[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+            cdb[7..9].copy_from_slice(&(count as u16).to_be_bytes());
+            cdb
+        };
+
+        // `command` takes `&mut [u8]` because an IN transfer fills it. An OUT
+        // transfer only reads it, so a copy is needed to satisfy the signature.
+        // Widening that signature would let a read path hand out a mutable
+        // borrow it does not need; the copy is the cheaper mistake.
+        let mut data = buf[..expected].to_vec();
+        self.command(cdb, Direction::Out, &mut data)
+    }
+
+    /// Tell the drive to commit its write cache to the medium.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn synchronize_cache(&self) -> Result<()> {
+        let mut cdb = vec![0u8; 10];
+        cdb[0] = OP_SYNCHRONIZE_CACHE_10;
+        // LBA 0, count 0 means "everything", which is what a flush wants.
+        self.command(cdb, Direction::None, &mut [])?;
+        Ok(())
+    }
 }
 
 /// Byte-addressed reads on top of block-addressed SCSI.
@@ -320,5 +378,72 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
 
     fn len(&self) -> Option<u64> {
         Some(self.capacity.bytes())
+    }
+}
+
+/// Byte-addressed writes on top of block-addressed SCSI.
+///
+/// A drive has no concept of writing part of a block, so any request that does
+/// not start and end on a block boundary becomes read-modify-write: fetch the
+/// straddled blocks, patch them, send them back. That costs an extra round trip
+/// *and* puts bytes the caller never named at risk if the write fails partway.
+///
+/// It is not a hypothetical cost here. Over USB a single SCSI command was
+/// measured at 760 us, so an unaligned write is two commands where an aligned
+/// one is a single command — before any of the data moves. Callers above this
+/// layer should align to the block size; the LUKS layer already works in whole
+/// cipher sectors, which on every drive seen so far is a multiple of the block
+/// size, so in practice this path should stay cold.
+#[cfg(feature = "dangerous-write-support")]
+impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let bs = self.capacity.block_size as u64;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(LuksError::OutOfBounds)?;
+        if end > self.capacity.bytes() {
+            return Err(LuksError::OutOfBounds);
+        }
+
+        let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+
+        let mut done = 0usize;
+        let mut chunk = vec![0u8; (max_blocks * bs) as usize];
+
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let lba = pos / bs;
+            let within = (pos % bs) as usize;
+
+            let remaining = buf.len() - done;
+            let blocks = ((within + remaining) as u64).div_ceil(bs).min(max_blocks);
+            let span = (blocks * bs) as usize;
+            let take = (span - within).min(remaining);
+
+            // Whole blocks: nothing around the payload needs preserving, so
+            // the read is skipped entirely.
+            let partial = within != 0 || take != span;
+            if partial {
+                let got = self.read_blocks(lba, blocks as u32, &mut chunk[..span])?;
+                if got < span {
+                    return Err(LuksError::ScsiProtocol("short data phase"));
+                }
+            }
+
+            chunk[within..within + take].copy_from_slice(&buf[done..done + take]);
+            let put = self.write_blocks(lba, blocks as u32, &chunk[..span])?;
+            if put < span {
+                return Err(LuksError::ScsiProtocol("short data phase"));
+            }
+            done += take;
+        }
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.synchronize_cache()
     }
 }

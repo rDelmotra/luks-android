@@ -21,17 +21,28 @@ pub struct Stats {
     pub read_commands: usize,
     pub bytes_read: usize,
     pub largest_read_blocks: u32,
+    pub write_commands: usize,
+    pub bytes_written: usize,
+    pub largest_write_blocks: u32,
+    pub sync_commands: usize,
 }
 
 enum Phase {
     Idle,
     /// Data to hand back, then the CSW.
     DataIn { data: Vec<u8>, pos: usize },
+    /// Data the host still owes us, and where it lands when it arrives.
+    ///
+    /// Bulk-Only Transport has no framing inside the data phase: after the CBW
+    /// the host simply writes bytes to the OUT endpoint, and only the byte
+    /// count in the CBW says when the phase ends. So the mock has to remember
+    /// what the pending command was, exactly as a real bridge does.
+    DataOut { at: usize, want: usize, got: Vec<u8> },
     Csw { pos: usize },
 }
 
 pub struct MockUsbDrive {
-    image: Vec<u8>,
+    image: RefCell<Vec<u8>>,
     block_size: u32,
     max_transfer: usize,
     phase: RefCell<Phase>,
@@ -44,7 +55,7 @@ pub struct MockUsbDrive {
 impl MockUsbDrive {
     pub fn new(image: Vec<u8>) -> Self {
         Self {
-            image,
+            image: RefCell::new(image),
             block_size: 512,
             max_transfer: 128 * 1024,
             phase: RefCell::new(Phase::Idle),
@@ -65,7 +76,7 @@ impl MockUsbDrive {
     }
 
     pub fn blocks(&self) -> u64 {
-        self.image.len() as u64 / self.block_size as u64
+        self.image.borrow().len() as u64 / self.block_size as u64
     }
 
     fn set_csw(&self, tag: u32, residue: u32, status: u8) {
@@ -138,7 +149,7 @@ impl MockUsbDrive {
 
                 let start = lba * self.block_size as u64;
                 let len = count as u64 * self.block_size as u64;
-                if start + len > self.image.len() as u64 {
+                if start + len > self.image.borrow().len() as u64 {
                     // Out of range: fail the command the way a real drive would.
                     self.set_csw(tag, expected_len, 1);
                     *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
@@ -151,7 +162,53 @@ impl MockUsbDrive {
                 s.largest_read_blocks = s.largest_read_blocks.max(count);
                 drop(s);
 
-                self.image[start as usize..(start + len) as usize].to_vec()
+                self.image.borrow()[start as usize..(start + len) as usize].to_vec()
+            }
+            // WRITE(10) / WRITE(16). The CDB layout is identical to READ, and
+            // it is decoded by the same arithmetic on purpose: if the reader
+            // and writer ever disagree about where an LBA lives, the tests
+            // should fail rather than agree with the bug.
+            0x2A | 0x8A => {
+                let (lba, count) = if cdb[0] == 0x2A {
+                    (
+                        u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]) as u64,
+                        u16::from_be_bytes([cdb[7], cdb[8]]) as u32,
+                    )
+                } else {
+                    (
+                        u64::from_be_bytes(cdb[2..10].try_into().unwrap()),
+                        u32::from_be_bytes([cdb[10], cdb[11], cdb[12], cdb[13]]),
+                    )
+                };
+
+                let start = lba * self.block_size as u64;
+                let len = count as u64 * self.block_size as u64;
+                if start + len > self.image.borrow().len() as u64 {
+                    self.set_csw(tag, expected_len, 1);
+                    *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
+                    return Ok(());
+                }
+
+                let mut st = self.stats.borrow_mut();
+                st.write_commands += 1;
+                st.bytes_written += len as usize;
+                st.largest_write_blocks = st.largest_write_blocks.max(count);
+                drop(st);
+
+                *self.phase.borrow_mut() = Phase::DataOut {
+                    at: start as usize,
+                    want: len as usize,
+                    got: Vec::with_capacity(len as usize),
+                };
+                // The CSW is prepared now and sent once the data has arrived.
+                self.set_csw(tag, 0, 0);
+                return Ok(());
+            }
+            // SYNCHRONIZE CACHE(10): nothing is cached here, but the command
+            // must succeed or a flush looks like a device error.
+            0x35 => {
+                self.stats.borrow_mut().sync_commands += 1;
+                Vec::new()
             }
             _ => {
                 self.set_csw(tag, expected_len, 1);
@@ -173,6 +230,21 @@ impl MockUsbDrive {
 
 impl BulkTransport for MockUsbDrive {
     fn write(&self, data: &[u8]) -> Result<usize> {
+        // Mid data-out phase: these bytes are payload, not a new command.
+        {
+            let mut phase = self.phase.borrow_mut();
+            if let Phase::DataOut { at, want, got } = &mut *phase {
+                let n = data.len().min(*want - got.len()).min(self.max_transfer);
+                got.extend_from_slice(&data[..n]);
+                if got.len() == *want {
+                    let (at, got) = (*at, std::mem::take(got));
+                    *phase = Phase::Csw { pos: 0 };
+                    drop(phase);
+                    self.image.borrow_mut()[at..at + got.len()].copy_from_slice(&got);
+                }
+                return Ok(n);
+            }
+        }
         if data.len() < CBW_LEN {
             return Err(LuksError::UsbTransfer("short CBW".into()));
         }
@@ -193,6 +265,10 @@ impl BulkTransport for MockUsbDrive {
         let mut phase = self.phase.borrow_mut();
         match &mut *phase {
             Phase::Idle => Ok(0),
+            // The host is reading while the drive is still waiting for the
+            // data it promised to send. A real bridge stalls; returning zero
+            // surfaces it as a hang in the test rather than as silent success.
+            Phase::DataOut { .. } => Ok(0),
             Phase::DataIn { data, pos } => {
                 // Serve at most max_transfer per call, as a real endpoint would.
                 let n = (data.len() - *pos).min(buf.len()).min(self.max_transfer);
