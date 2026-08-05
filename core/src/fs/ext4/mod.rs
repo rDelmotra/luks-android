@@ -9,6 +9,8 @@
 //! Skipping `inode == 0` is therefore both correct and complete — and it avoids
 //! needing the hash code, which in lwext4 is the GPLv2 part.
 
+#[cfg(feature = "dangerous-write-support")]
+pub mod alloc;
 pub mod csum;
 
 use crate::device::ReadAt;

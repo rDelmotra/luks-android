@@ -57,6 +57,8 @@ pub mod code {
     pub const BAD_HANDLE: i32 = 10;
     /// A Rust panic that `catch_unwind` intercepted. Always a bug in us.
     pub const PANIC: i32 = 11;
+    /// The drive is out of space — or out of the space we can currently reach.
+    pub const NO_SPACE: i32 = 12;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -78,6 +80,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | UnknownFs
         | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
+        FilesystemFull | NoFreeInodes => code::NO_SPACE,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,

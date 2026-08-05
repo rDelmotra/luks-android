@@ -121,6 +121,15 @@ pub enum LuksError {
     #[error("corrupt filesystem structure: {0}")]
     CorruptFs(&'static str),
 
+    /// No group had a free block the allocator could reach. Note that on a
+    /// filesystem with uninitialised groups this can mean "full" long before
+    /// the drive is — see the note in `fs::ext4::alloc`.
+    #[error("no space left on the filesystem")]
+    FilesystemFull,
+
+    #[error("no free inodes left on the filesystem")]
+    NoFreeInodes,
+
     // --- USB / SCSI transport ---
     #[error("SCSI protocol error: {0}")]
     ScsiProtocol(&'static str),
