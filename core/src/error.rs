@@ -134,14 +134,14 @@ pub enum LuksError {
     /// it was. Almost always means the path now points at a different drive
     /// than when it was checked — see `FileDevice::open_writable`.
     #[error(
-        "refusing to write to {path}: caller expected a {expected}-byte device \
-         but it is {actual} bytes — the path points at something other than \
-         what was confirmed"
+        "refusing to write to {path}: it is not the {expected}-byte device it \
+         was confirmed as ({detail}) — the path points at something other than \
+         what was checked"
     )]
     WrongWriteTarget {
         path: String,
         expected: u64,
-        actual: u64,
+        detail: &'static str,
     },
 
     /// The size of a write target could not be determined, so the caller's

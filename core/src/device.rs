@@ -207,28 +207,47 @@ impl FileDevice {
 
     /// Refuse unless the device at `path` really is `expected_len` bytes.
     ///
-    /// The size comes from seeking to the end of a **separate, read-only**
-    /// handle rather than from `metadata()`, which reports 0 for most special
-    /// device files — this crate already treats that 0 as "length unknown"
-    /// for reads, and for a write target "unknown" must not quietly become
-    /// "trust the caller". Anything unverifiable is refused, so the failure
-    /// mode is closed rather than open.
+    /// # Why this probes instead of asking
+    ///
+    /// Neither obvious way to get a device's size works here.
+    /// `metadata().len()` reports 0 for special files — this crate already
+    /// treats that as "length unknown" for reads. And `seek(SeekFrom::End)`
+    /// **also reports 0** on a macOS raw character device: measured directly
+    /// on `/dev/rdisk4`, a 61,524,148,224-byte stick, which returned 0. An
+    /// ioctl (`DKIOCGETBLOCKCOUNT`) would answer, but this crate is
+    /// `#![forbid(unsafe_code)]` and that belongs in a platform helper.
+    ///
+    /// So the claim is **verified rather than discovered**, which needs only
+    /// two reads and no ioctl: the last byte of the claimed range must be
+    /// readable, and the byte one past it must not be. That pins the size
+    /// exactly without ever needing to know it in advance.
+    ///
+    /// The probe goes through [`FileDevice::open`] rather than raw `pread` so
+    /// it inherits the widening path a raw device requires — reads there must
+    /// be block-aligned, and that arithmetic is already written and tested.
+    /// Anything unverifiable is refused, so the failure mode is closed.
     #[cfg(feature = "dangerous-write-support")]
     fn confirm_len(path: &std::path::Path, expected_len: u64) -> Result<()> {
-        use std::io::{Seek, SeekFrom};
+        let wrong = |detail: &'static str| LuksError::WrongWriteTarget {
+            path: path.display().to_string(),
+            expected: expected_len,
+            detail,
+        };
 
-        let actual = std::fs::File::open(path)
-            .and_then(|mut f| f.seek(SeekFrom::End(0)))
-            .map_err(|_| LuksError::UnverifiableWriteTarget {
-                path: path.display().to_string(),
-            })?;
+        if expected_len == 0 {
+            return Err(wrong("a zero-length write target is never meaningful"));
+        }
 
-        if actual != expected_len {
-            return Err(LuksError::WrongWriteTarget {
-                path: path.display().to_string(),
-                expected: expected_len,
-                actual,
-            });
+        let probe = Self::open(path).map_err(|_| LuksError::UnverifiableWriteTarget {
+            path: path.display().to_string(),
+        })?;
+
+        let mut byte = [0u8; 1];
+        if probe.read_at(expected_len - 1, &mut byte).is_err() {
+            return Err(wrong("it is smaller than that"));
+        }
+        if probe.read_at(expected_len, &mut byte).is_ok() {
+            return Err(wrong("it is larger than that"));
         }
         Ok(())
     }

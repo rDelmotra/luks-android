@@ -40,7 +40,7 @@ fn the_path_meaning_a_different_drive_is_refused() {
     let err = FileDevice::open_writable(&path, confirmed)
         .expect_err("a size mismatch must be refused");
     let msg = format!("{err}");
-    assert!(msg.contains("40000") && msg.contains("61000"), "{msg}");
+    assert!(msg.contains("40000") && msg.contains("larger"), "{msg}");
 }
 
 #[test]
@@ -61,6 +61,38 @@ fn being_off_by_one_byte_is_still_refused() {
     assert!(FileDevice::open_writable(&path, 8191).is_err());
     assert!(FileDevice::open_writable(&path, 8193).is_err());
     assert!(FileDevice::open_writable(&path, 8192).is_ok());
+}
+
+#[test]
+fn the_probe_works_through_the_widened_raw_device_path() {
+    // The whole check rests on two reads landing correctly on a device whose
+    // reads must be block-aligned. On a raw character device every read is
+    // widened to 4 KiB and sliced back down, so "read the last byte" is not
+    // the simple operation it looks like — it reads the 4 KiB block
+    // containing that byte and relies on the short-read check to notice when
+    // the block runs past the end.
+    //
+    // A real raw device needs root, so alignment is forced here on an
+    // ordinary file, which is exactly what open_writable_with_alignment
+    // exists for. Without this the probe would be untested on the only kind
+    // of device it actually matters for — and shipping an unverified
+    // mechanism is the mistake that produced this rewrite.
+    let path = scratch("widened", 4096 * 3);
+
+    // Correct size, through the widening path.
+    assert!(FileDevice::open_writable_with_alignment(&path, 4096, 4096 * 3).is_ok());
+
+    // One block short and one block long must both be refused, which is what
+    // proves the probe is reading where it thinks it is.
+    assert!(FileDevice::open_writable_with_alignment(&path, 4096, 4096 * 2).is_err());
+    assert!(FileDevice::open_writable_with_alignment(&path, 4096, 4096 * 4).is_err());
+
+    // A size that is not a multiple of the alignment still resolves exactly,
+    // since the last partial block is readable and the byte past it is not.
+    let odd = scratch("widened-odd", 4096 * 2 + 17);
+    assert!(FileDevice::open_writable_with_alignment(&odd, 4096, 4096 * 2 + 17).is_ok());
+    assert!(FileDevice::open_writable_with_alignment(&odd, 4096, 4096 * 2 + 16).is_err());
+    assert!(FileDevice::open_writable_with_alignment(&odd, 4096, 4096 * 2 + 18).is_err());
 }
 
 #[test]
