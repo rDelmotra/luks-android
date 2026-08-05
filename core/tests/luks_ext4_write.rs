@@ -60,7 +60,7 @@ const CONTAINERS: [&str; 3] = [
 /// Open a bare LUKS container and mount the ext4 inside it for writing.
 fn mount_container(dev: &FileDevice) -> Ext4<LuksVolume<&FileDevice>> {
     let header = luks::read_from(dev, 0).expect("parse LUKS header");
-    let volume = LuksVolume::open(dev, 0, &header, PASSWORD).expect("unlock");
+    let volume = LuksVolume::open(dev, 0, None, &header, PASSWORD).expect("unlock");
     Ext4::mount(volume).expect("mount ext4 inside the container")
 }
 
@@ -152,7 +152,7 @@ fn the_files_that_were_already_in_the_container_survive() {
         let before: Vec<(String, Vec<u8>)> = {
             let dev = FileDevice::open(&path).expect("open");
             let header = luks::read_from(&dev, 0).expect("header");
-            let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+            let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
             let fs = Ext4::mount(volume).expect("mount");
             fs.list_dir("/")
                 .expect("list")
@@ -176,7 +176,7 @@ fn the_files_that_were_already_in_the_container_survive() {
 
         let dev = FileDevice::open(&path).expect("reopen");
         let header = luks::read_from(&dev, 0).expect("header");
-        let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+        let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
         let fs = Ext4::mount(volume).expect("mount");
 
         for (name, data) in &before {
@@ -261,14 +261,15 @@ fn a_file_written_through_gpt_and_luks_is_readable_by_the_kernel() {
     {
         let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let table = partition::scan(&dev, 512).expect("scan GPT");
-        let offset = table
+        let part = table
             .luks_partitions()
             .next()
-            .expect("a LUKS partition")
-            .offset_bytes();
+            .expect("a LUKS partition");
+        let offset = part.offset_bytes();
+        let part_len = Some(part.size_bytes());
 
         let header = luks::read_from(&dev, offset).expect("header");
-        let volume = LuksVolume::open(&dev, offset, &header, PASSWORD).expect("unlock");
+        let volume = LuksVolume::open(&dev, offset, part_len, &header, PASSWORD).expect("unlock");
         let mut fs = Ext4::mount(volume).expect("mount ext4");
 
         let ino = fs.write_new_file(content).expect("write file");

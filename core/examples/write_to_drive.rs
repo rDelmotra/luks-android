@@ -90,10 +90,11 @@ fn run(
         .next()
         .expect("no LUKS partition on this device");
     let offset = part.offset_bytes();
+    let part_len = Some(part.size_bytes());
     println!("luks at  {offset} bytes");
 
     let header = luks::read_from(&dev, offset)?;
-    let volume = LuksVolume::open(&dev, offset, &header, password)?;
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, password)?;
     println!("unlocked");
 
     let mut fs = Ext4::mount(volume)?;

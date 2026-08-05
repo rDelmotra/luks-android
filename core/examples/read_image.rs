@@ -234,7 +234,7 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
 
     // A whole disk has a partition table; a bare container does not. Try for a
     // table, and fall back to treating the whole thing as one LUKS volume.
-    let offset = match partition::scan(&dev, 512) {
+    let (offset, part_len) = match partition::scan(&dev, 512) {
         Ok(table) => {
             println!("table   {:?}, {} partitions", table.kind, table.partitions.len());
             for p in &table.partitions {
@@ -248,16 +248,16 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
                 );
             }
             match table.luks_partitions().next() {
-                Some(p) => p.offset_bytes(),
+                Some(p) => (p.offset_bytes(), Some(p.size_bytes())),
                 None => {
                     println!("no LUKS partition in the table; trying offset 0");
-                    0
+                    (0, None)
                 }
             }
         }
         Err(e) => {
             println!("table   none ({e}); treating as a bare container");
-            0
+            (0, None)
         }
     };
     println!("luks at offset {offset} ({} MiB)", offset / (1024 * 1024));
@@ -273,7 +273,7 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
     );
 
     let t = Instant::now();
-    let volume = LuksVolume::open(&dev, offset, &header, password)?;
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, password)?;
     println!("unlock  {:.2} s", t.elapsed().as_secs_f64());
 
     // Which filesystem it is, decided by signature — the same call the phone

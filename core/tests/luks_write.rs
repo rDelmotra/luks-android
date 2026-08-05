@@ -57,7 +57,7 @@ fn our_ciphertext_is_byte_identical_to_the_kernels() {
     for name in CONTAINERS {
         let (dev, header) = open(&fixture(name));
         let seg = header.primary_segment().expect("segment");
-        let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+        let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
         // A region well past the start, so a bug in the tweak *step* shows up.
         // Sector 0 encrypts correctly under almost any wrong stepping rule,
@@ -79,7 +79,7 @@ fn our_ciphertext_is_byte_identical_to_the_kernels() {
         let path = scratch(name, "identical");
         let wdev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let wheader = luks::read_from(&wdev, 0).expect("parse header");
-        let wvol = LuksVolume::open(&wdev, 0, &wheader, PASSWORD).expect("unlock");
+        let wvol = LuksVolume::open(&wdev, 0, None, &wheader, PASSWORD).expect("unlock");
         wvol.write_at(offset, &plain).expect("encrypt and write");
         wvol.flush().expect("flush");
 
@@ -104,7 +104,7 @@ fn the_tweak_step_is_actually_being_exercised() {
     // all zeros, or identical across sectors, the comparison could pass under
     // a wrong tweak rule. Require the plaintext to differ between sectors.
     let (dev, header) = open(&fixture("unlock-argon2id-4096.img"));
-    let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
     let ss = volume.sector_size();
 
     let mut plain = vec![0u8; ss * 4];
@@ -128,7 +128,7 @@ fn a_partial_sector_write_preserves_the_rest_of_the_sector() {
     let path = scratch("unlock-argon2id-512.img", "partial");
     let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
-    let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
     let ss = volume.sector_size();
     let base = (ss * 40) as u64;
@@ -158,7 +158,7 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
     {
         let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let header = luks::read_from(&dev, 0).expect("header");
-        let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+        let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
         // Well past the superblock and group descriptors.
         let offset = volume.len().map(|n| n / 2).unwrap_or(1 << 20);
         let aligned = offset - (offset % volume.sector_size() as u64);
@@ -170,7 +170,7 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
 
     let dev = FileDevice::open(&path).expect("reopen");
     let header = luks::read_from(&dev, 0).expect("header");
-    let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock after write");
+    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock after write");
     let fs = MountedFs::mount(&volume).expect("the filesystem must still mount");
     assert_eq!(fs.kind().name(), "ext4");
     fs.list_dir("/").expect("root must still list");
@@ -181,7 +181,7 @@ fn writing_past_the_end_of_the_segment_is_refused() {
     let path = scratch("unlock-argon2id-512.img", "bounds");
     let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
-    let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
+    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
     if let Some(len) = volume.len() {
         assert!(
@@ -193,4 +193,58 @@ fn writing_past_the_end_of_the_segment_is_refused() {
             "a write running off the end of the segment must be refused"
         );
     }
+}
+
+/// The container's length must bound writes, not just the device's.
+///
+/// Every container `cryptsetup` produces declares `"size":"dynamic"`, so the
+/// header alone never says where the plaintext ends. Before this bound the
+/// only backstop was the *device* length — which stops a write running off
+/// the end of the disk but happily lets one run off the end of the container
+/// and into whatever partition follows, still encrypted with this volume's
+/// key and therefore pure destruction to its contents.
+///
+/// The fixture is a bare container, so its real bound and the device's are
+/// the same number; declaring a deliberately short partition length is what
+/// separates the two and shows which one is doing the work.
+#[test]
+fn a_write_past_the_container_is_refused() {
+    let path = scratch("unlock-argon2id-512.img", "bounded");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+        .expect("open writable");
+    let header = luks::read_from(&dev, 0).expect("header");
+    let seg = header.primary_segment().expect("segment");
+
+    // Claim the container is one cipher sector shorter than it really is.
+    let real = std::fs::metadata(&path).expect("stat").len();
+    let ss = seg.sector_size as u64;
+    let claimed = real - ss;
+
+    let bounded = LuksVolume::open(&dev, 0, Some(claimed), &header, PASSWORD).expect("unlock");
+    let plain_len = bounded.len().expect("a bounded volume knows its length");
+    assert_eq!(
+        plain_len,
+        claimed - seg.offset,
+        "the plaintext length should be the claimed partition minus the header"
+    );
+
+    let buf = vec![0u8; ss as usize];
+    bounded
+        .write_at(plain_len, &buf)
+        .expect_err("a write starting past the container must be refused");
+    bounded
+        .write_at(plain_len - ss / 2, &buf)
+        .expect_err("a write straddling the end of the container must be refused");
+    bounded
+        .write_at(plain_len - ss, &buf)
+        .expect("the last sector inside the container must still be writable");
+
+    // The same volume opened without a partition length falls back to the
+    // device, which is genuinely larger — so the refusals above came from the
+    // container bound, not from something that would have refused anyway.
+    let unbounded = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
+    assert!(
+        unbounded.len().expect("device-derived length") > plain_len,
+        "the control must be less strict, or the test proves nothing"
+    );
 }

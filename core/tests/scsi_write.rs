@@ -153,14 +153,15 @@ fn the_write_path_reaches_a_luks_volume_through_scsi() {
     let dev = ScsiBlockDevice::open(MockUsbDrive::new(disk)).expect("open");
 
     let table = partition::scan(&dev, 512).expect("gpt");
-    let offset = table
+    let part = table
         .luks_partitions()
         .next()
-        .expect("a LUKS partition")
-        .offset_bytes();
+        .expect("a LUKS partition");
+    let offset = part.offset_bytes();
+    let part_len = Some(part.size_bytes());
 
     let header = luks::read_from(&dev, offset).expect("header");
-    let volume = LuksVolume::open(&dev, offset, &header, b"test").expect("unlock");
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, b"test").expect("unlock");
 
     // Sector-aligned, so no read-modify-write anywhere in the stack.
     let ss = volume.sector_size() as u64;

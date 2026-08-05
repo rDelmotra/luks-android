@@ -35,7 +35,7 @@ fn browses_an_encrypted_ext4_volume() {
         let data = container(name);
 
         let header = luks::parse(&data).unwrap_or_else(|e| panic!("{name}: header: {e}"));
-        let volume = LuksVolume::open(&data, 0, &header, PASSWORD)
+        let volume = LuksVolume::open(&data, 0, None, &header, PASSWORD)
             .unwrap_or_else(|e| panic!("{name}: unlock: {e}"));
         let fs = Ext4::mount(&volume).unwrap_or_else(|e| panic!("{name}: mount: {e}"));
 
@@ -80,7 +80,7 @@ fn browses_an_encrypted_ext4_volume() {
 fn wrong_password_never_yields_a_filesystem() {
     let data = container("unlock-argon2id-512.img");
     let header = luks::parse(&data).unwrap();
-    assert!(LuksVolume::open(&data, 0, &header, b"wrong").is_err());
+    assert!(LuksVolume::open(&data, 0, None, &header, b"wrong").is_err());
 }
 
 /// Decrypting with the right key but the wrong tweak numbering would still
@@ -92,7 +92,7 @@ fn sector_size_4096_produces_identical_content_to_512() {
     for name in ["unlock-argon2id-512.img", "unlock-argon2id-4096.img"] {
         let data = container(name);
         let header = luks::parse(&data).unwrap();
-        let volume = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+        let volume = LuksVolume::open(&data, 0, None, &header, PASSWORD).unwrap();
         let fs = Ext4::mount(&volume).unwrap();
         contents.push(fs.read_file("/marker.txt").unwrap());
     }

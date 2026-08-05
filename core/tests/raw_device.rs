@@ -107,9 +107,10 @@ fn the_whole_stack_reads_through_a_widened_device() {
     let table = partition::scan(&dev, 512).expect("gpt");
     let part = table.luks_partitions().next().expect("a LUKS partition");
     let offset = part.offset_bytes();
+    let part_len = Some(part.size_bytes());
 
     let header = luks::read_from(&dev, offset).expect("header parses through widened reads");
-    let volume = LuksVolume::open(&dev, offset, &header, b"test").expect("unlock");
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, b"test").expect("unlock");
     let fs = MountedFs::mount(&volume).expect("mount");
 
     assert_eq!(fs.kind().name(), "btrfs");
@@ -126,7 +127,7 @@ fn the_whole_stack_reads_through_a_widened_device() {
     // allocator chose, so this is where a misplaced slice would show up.
     let plain = FileDevice::open(fixture()).expect("fixture");
     let via_plain = {
-        let v = LuksVolume::open(&plain, offset, &header, b"test").expect("unlock");
+        let v = LuksVolume::open(&plain, offset, part_len, &header, b"test").expect("unlock");
         let f = MountedFs::mount(&v).expect("mount");
         f.read_file("/proof.txt").expect("read")
     };

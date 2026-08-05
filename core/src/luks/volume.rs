@@ -40,22 +40,47 @@ pub struct LuksVolume<D: ReadAt> {
 
 impl<D: ReadAt> LuksVolume<D> {
     /// Derive the master key and open the volume. This is the slow call.
+    ///
+    /// `partition_len` is how many bytes the container occupies on the device,
+    /// or `None` when it runs to the end (a bare container, or a whole-disk
+    /// LUKS). See [`LuksVolume::with_master_key`] for why it is asked for.
     pub fn open(
         device: D,
         partition_offset: u64,
+        partition_len: Option<u64>,
         header: &Luks2Header,
         password: &[u8],
     ) -> Result<Self> {
         let master_key = keyslot::unlock(&device, partition_offset, header, password)?;
-        Self::with_master_key(device, partition_offset, header, master_key)
+        Self::with_master_key(device, partition_offset, partition_len, header, master_key)
     }
 
     /// Open using an already-derived master key. Skips the KDF entirely, which
     /// is what makes it possible to test decryption against cryptsetup's
     /// `--dump-master-key` output without going through our own derivation.
+    ///
+    /// # Why `partition_len` is a parameter
+    ///
+    /// Nearly every container `cryptsetup` produces declares its segment size
+    /// as `"dynamic"` — meaning "the rest of whatever I am in" — so the header
+    /// alone does not say where the plaintext ends. Left unbounded, a write
+    /// derived from a corrupt filesystem structure runs past the container and
+    /// into whatever partition follows it, still encrypted with this volume's
+    /// key and therefore pure destruction to its contents.
+    ///
+    /// The device's own length is not a substitute. It stops writes running
+    /// off the end of the *disk*, which the layers below already do; the
+    /// partition length is the only thing that stops them running off the end
+    /// of the *container*. `partition::scan` reports it, so the caller that
+    /// found the container always has it.
+    ///
+    /// `None` means "to the end of the device" and is the honest answer for a
+    /// bare container. It is not a way to opt out: the bound simply comes from
+    /// the device instead, which for a bare container is the same number.
     pub fn with_master_key(
         device: D,
         partition_offset: u64,
+        partition_len: Option<u64>,
         header: &Luks2Header,
         master_key: Secret,
     ) -> Result<Self> {
@@ -68,14 +93,30 @@ impl<D: ReadAt> LuksVolume<D> {
             return Err(LuksError::BadSectorSize(seg.sector_size));
         }
 
+        // How much room the ciphertext actually has: the container's length
+        // (or the device's, less where the container starts) minus the header
+        // that precedes the segment. Whichever of the two is known and
+        // smaller wins — a header claiming a fixed size larger than the space
+        // it sits in is describing a filesystem that cannot fit.
+        let room = partition_len
+            .or_else(|| {
+                device
+                    .len()
+                    .and_then(|d| d.checked_sub(partition_offset))
+            })
+            .and_then(|p| p.checked_sub(seg.offset));
+
+        let segment_len = match (seg.size, room) {
+            (SegmentSize::Fixed(n), Some(r)) => Some(n.min(r)),
+            (SegmentSize::Fixed(n), None) => Some(n),
+            (SegmentSize::Dynamic, r) => r,
+        };
+
         Ok(Self {
             device,
             partition_offset,
             segment_offset: seg.offset,
-            segment_len: match seg.size {
-                SegmentSize::Fixed(n) => Some(n),
-                SegmentSize::Dynamic => None,
-            },
+            segment_len,
             sector_size: seg.sector_size as usize,
             iv_tweak: seg.iv_tweak as u128,
             tweak_step: seg.tweak_step(),

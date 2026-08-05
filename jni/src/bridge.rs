@@ -343,8 +343,26 @@ impl DeviceHandle {
     /// Android, inside a foreground service so the low-memory killer does not
     /// take the app during the allocation.
     pub fn unlock(&self, partition_offset: u64, password: &[u8]) -> Result<VolumeHandle> {
+        // The container's length is what bounds every write inside it. The
+        // caller passes only an offset — that is what the partition list it
+        // was shown contains — so look the matching partition back up rather
+        // than widening the JNI signature. A bare container has no table and
+        // no bound tighter than the device, which is an honest `None`; the
+        // extra scan is nothing beside the Argon2 run below.
+        let partition_len = partition::scan(&self.dev, 512).ok().and_then(|t| {
+            t.partitions
+                .iter()
+                .find(|p| p.offset_bytes() == partition_offset)
+                .map(|p| p.size_bytes())
+        });
         let header = luks::read_from(&self.dev, partition_offset)?;
-        let volume = LuksVolume::open(self.dev.clone(), partition_offset, &header, password)?;
+        let volume = LuksVolume::open(
+            self.dev.clone(),
+            partition_offset,
+            partition_len,
+            &header,
+            password,
+        )?;
         let fs = MountedFs::mount(volume)?;
         Ok(VolumeHandle {
             fs,

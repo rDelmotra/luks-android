@@ -92,7 +92,7 @@ const EXT4_LABEL_OFFSET: u64 = 1024 + 0x78;
 fn assert_reveals_ext4(name: &str) {
     let data = container(name);
     let header = luks::parse(&data).unwrap();
-    let vol = LuksVolume::open(&data, 0, &header, PASSWORD).expect("volume opens");
+    let vol = LuksVolume::open(&data, 0, None, &header, PASSWORD).expect("volume opens");
 
     let mut magic = [0u8; 2];
     vol.read_at(EXT4_MAGIC_OFFSET, &mut magic).unwrap();
@@ -145,7 +145,7 @@ fn decrypts_to_ext4_pbkdf2() {
 fn unaligned_reads_agree_with_aligned_ones() {
     let data = container("unlock-argon2id-512.img");
     let header = luks::parse(&data).unwrap();
-    let vol = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+    let vol = LuksVolume::open(&data, 0, None, &header, PASSWORD).unwrap();
 
     // One big aligned read as the reference.
     let mut whole = vec![0u8; 8192];
@@ -176,7 +176,7 @@ fn unaligned_reads_agree_with_aligned_ones() {
 fn empty_read_is_a_noop() {
     let data = container("unlock-argon2id-512.img");
     let header = luks::parse(&data).unwrap();
-    let vol = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+    let vol = LuksVolume::open(&data, 0, None, &header, PASSWORD).unwrap();
     let mut empty: [u8; 0] = [];
     assert!(vol.read_at(0, &mut empty).is_ok());
 }
@@ -188,9 +188,9 @@ fn master_key_path_and_password_path_agree() {
     let data = container("unlock-argon2id-512.img");
     let header = luks::parse(&data).unwrap();
 
-    let by_password = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+    let by_password = LuksVolume::open(&data, 0, None, &header, PASSWORD).unwrap();
     let by_key =
-        LuksVolume::with_master_key(&data, 0, &header, Secret::new(unhex(MK_ARGON2ID_512))).unwrap();
+        LuksVolume::with_master_key(&data, 0, None, &header, Secret::new(unhex(MK_ARGON2ID_512))).unwrap();
 
     let mut a = vec![0u8; 4096];
     let mut b = vec![0u8; 4096];
@@ -239,7 +239,7 @@ fn content_past_the_first_sector_agrees_across_sector_sizes() {
     for name in ["unlock-argon2id-512.img", "unlock-argon2id-4096.img"] {
         let data = container(name);
         let header = luks::parse(&data).unwrap();
-        let vol = LuksVolume::open(&data, 0, &header, PASSWORD).unwrap();
+        let vol = LuksVolume::open(&data, 0, None, &header, PASSWORD).unwrap();
 
         // Block group descriptor at block 1: inode table pointer at +8.
         let mut gd = [0u8; 16];

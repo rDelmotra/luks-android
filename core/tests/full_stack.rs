@@ -35,12 +35,13 @@ fn walk(image: &str) {
         .next()
         .unwrap_or_else(|| panic!("{image}: no LUKS partition found"));
     let offset = luks_part.offset_bytes();
+    let part_len = Some(luks_part.size_bytes());
 
     let header =
         luks::read_from(&dev, offset).unwrap_or_else(|e| panic!("{image}: header: {e}"));
     assert_eq!(header.primary_segment().unwrap().encryption, "aes-xts-plain64");
 
-    let volume = LuksVolume::open(&dev, offset, &header, PASSWORD)
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, PASSWORD)
         .unwrap_or_else(|e| panic!("{image}: unlock: {e}"));
 
     let fs = Ext4::mount(&volume).unwrap_or_else(|e| panic!("{image}: mount: {e}"));
@@ -85,9 +86,11 @@ fn works_with_a_16k_transfer_limit() {
     let dev = luks_core::usb::ScsiBlockDevice::open(drive).unwrap();
 
     let table = partition::scan(&dev, 512).unwrap();
-    let offset = table.luks_partitions().next().unwrap().offset_bytes();
+    let luks_part = table.luks_partitions().next().unwrap();
+    let offset = luks_part.offset_bytes();
+    let part_len = Some(luks_part.size_bytes());
     let header = luks::read_from(&dev, offset).unwrap();
-    let volume = LuksVolume::open(&dev, offset, &header, PASSWORD).unwrap();
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, PASSWORD).unwrap();
     let fs = Ext4::mount(&volume).unwrap();
 
     assert_eq!(fs.read_file("/proof.txt").unwrap(), b"whole disk stack works\n");
@@ -104,9 +107,11 @@ fn reports_scsi_command_count_for_a_browse() {
     .unwrap();
 
     let table = partition::scan(&dev, 512).unwrap();
-    let offset = table.luks_partitions().next().unwrap().offset_bytes();
+    let luks_part = table.luks_partitions().next().unwrap();
+    let offset = luks_part.offset_bytes();
+    let part_len = Some(luks_part.size_bytes());
     let header = luks::read_from(&dev, offset).unwrap();
-    let volume = LuksVolume::open(&dev, offset, &header, PASSWORD).unwrap();
+    let volume = LuksVolume::open(&dev, offset, part_len, &header, PASSWORD).unwrap();
     let fs = Ext4::mount(&volume).unwrap();
     let _ = fs.list_dir("/").unwrap();
     let _ = fs.read_file("/proof.txt").unwrap();
