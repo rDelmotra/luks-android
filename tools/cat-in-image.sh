@@ -53,9 +53,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# `losetup --partscan` returns as soon as the loop device itself is attached.
+# The kernel discovers the partitions and udev creates the loopXpN nodes a
+# moment later, asynchronously. Globbing them right away is a race: it loses
+# only under load, and when it loses it reports "no partition of type ..." for
+# an image that is perfectly fine. That is a *false failure* in the oracle the
+# whole write path is graded against, which is worse than it sounds — an oracle
+# that cries wolf one run in five teaches you to ignore it.
+wait_for_partitions() {
+    local loop="$1" i p
+    udevadm settle --timeout=5 >/dev/null 2>&1 || true
+    for i in $(seq 1 50); do
+        for p in "${loop}"p*; do
+            [ -b "$p" ] && return 0
+        done
+        sleep 0.1
+    done
+    return 1
+}
+
 TARGET="$IMG"
 if [ "$(blkid -o value -s PTTYPE "$IMG" 2>/dev/null || true)" = "gpt" ]; then
     LOOP="$(losetup --find --show --partscan "$IMG")"
+    wait_for_partitions "$LOOP" || {
+        echo "partition nodes never appeared for $LOOP (not an image fault)" >&2
+        exit 1
+    }
     # Do not assume partition 1. A real disk — and the gpt-luks fixture — can
     # carry an unencrypted partition ahead of the interesting one, and picking
     # p1 blindly reports "not a valid LUKS device" for a perfectly good image.

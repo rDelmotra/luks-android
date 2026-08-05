@@ -58,9 +58,28 @@ trap cleanup EXIT
 # partition table (the test stick, and every real drive). Ask the kernel which,
 # rather than guessing from the size or the filename — `blkid` on the raw image
 # reports the partition table if there is one.
+# See the long note in cat-in-image.sh: `losetup --partscan` returns before the
+# loopXpN nodes exist, so globbing them immediately is a race that reports a
+# missing partition for a sound image. Same fix, same reason.
+wait_for_partitions() {
+    local loop="$1" i p
+    udevadm settle --timeout=5 >/dev/null 2>&1 || true
+    for i in $(seq 1 50); do
+        for p in "${loop}"p*; do
+            [ -b "$p" ] && return 0
+        done
+        sleep 0.1
+    done
+    return 1
+}
+
 TARGET="$IMG"
 if [ "$(blkid -o value -s PTTYPE "$IMG" 2>/dev/null || true)" = "gpt" ]; then
     LOOP="$(losetup --find --show --partscan "$IMG")"
+    wait_for_partitions "$LOOP" || {
+        echo "partition nodes never appeared for $LOOP (not an image fault)" >&2
+        exit 1
+    }
     # Not necessarily partition 1: a disk can carry an unencrypted partition
     # ahead of the encrypted one, and blindly taking p1 reports "not a valid
     # LUKS device" for an image that is perfectly fine. Ask the kernel.
