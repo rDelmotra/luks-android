@@ -272,6 +272,76 @@ fn the_seed_derivations_are_not_interchangeable() {
     );
 }
 
+/// The physical block number of a single-extent inode's one and only extent.
+/// Every fixture's root directory fits in one block, so this is enough
+/// without pulling in the full extent-tree walker.
+fn only_extent_block(inode: &luks_core::fs::ext4::Inode) -> u64 {
+    let b = &inode.block_area;
+    let entries = u16::from_le_bytes([b[2], b[3]]);
+    assert_eq!(entries, 1, "test fixture's root should be a single extent");
+    let lo = u32::from_le_bytes([b[20], b[21], b[22], b[23]]);
+    let hi = u16::from_le_bytes([b[18], b[19]]);
+    lo as u64 | ((hi as u64) << 32)
+}
+
+#[test]
+fn the_directory_block_tail_checksum_matches_mke2fs() {
+    // Four fixtures, both block sizes, both seed derivations — the same
+    // spread of gaps the other checksum tests close. dirtail-1k is new: none
+    // of the other fixtures happened to leave the tail readable at an offset
+    // this test could find by inspection alone, so it was built specifically
+    // to pin this format down before any directory gets written.
+    let cases: [(&str, u64); 4] = [
+        ("big-4k.img", 2),
+        ("csum-uuid-4k.img", 2),
+        ("many-groups-1k.img", 2),
+        ("dirtail-1k.img", 2),
+    ];
+
+    for (name, root_ino) in cases {
+        let f = open(name);
+        let sb = f.fs.superblock();
+        let seed = Seed::of(sb);
+        let bs = sb.block_size as u64;
+
+        let root = f.fs.read_inode(root_ino).expect("read root inode");
+        let block_no = only_extent_block(&root);
+
+        let mut block = vec![0u8; bs as usize];
+        f.dev
+            .read_at(block_no * bs, &mut block)
+            .expect("read root directory block");
+
+        // The tail is a 12-byte fake dirent: 4 zero bytes where an inode
+        // number would go (so a reader skips it), rec_len 12, a zero
+        // name_len, the 0xDE file_type marker, then the checksum.
+        let tail = &block[block.len() - 12..];
+        assert_eq!(
+            u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]),
+            0,
+            "tail inode field should be 0 so readers skip it"
+        );
+        assert_eq!(
+            u16::from_le_bytes([tail[4], tail[5]]),
+            12,
+            "tail rec_len should be 12"
+        );
+        assert_eq!(tail[6], 0, "tail name_len should be 0");
+        assert_eq!(tail[7], 0xDE, "tail file_type should be the 0xDE marker");
+        let stored = u32::from_le_bytes([tail[8], tail[9], tail[10], tail[11]]);
+
+        let computed = seed
+            .dir_block(root_ino, 0, &block)
+            .expect("checksums enabled");
+
+        assert_eq!(
+            computed, stored,
+            "{name}: directory block checksum mismatch — computed \
+             {computed:#010x}, on disk {stored:#010x}"
+        );
+    }
+}
+
 #[test]
 fn a_filesystem_without_checksums_reports_none() {
     // ext2 predates all of this. The seed must report itself disabled rather

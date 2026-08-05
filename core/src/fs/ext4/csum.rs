@@ -19,6 +19,7 @@
 //! | group descriptor | fs seed, then the group number as LE32 |
 //! | block/inode bitmap | fs seed |
 //! | inode | fs seed, then inode number LE32, then `i_generation` LE32 |
+//! | directory block | fs seed, then the *directory's* inode number and generation, then the block up to its 12-byte tail |
 //!
 //! and the fs seed is itself either `s_checksum_seed` from the superblock, or,
 //! when that feature is absent, `crc32c(!0, uuid)`.
@@ -33,6 +34,11 @@
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::crc32c::crc32c_seed;
 use crate::fs::ext4::Superblock;
+
+/// Size of the fake trailing dirent that carries a directory block's
+/// checksum: 4 bytes of zero where an inode number would go, `rec_len` 12, a
+/// zero `name_len`, the `0xDE` type marker, then the 4-byte checksum.
+pub const DIR_TAIL_SIZE: usize = 12;
 
 /// Byte offset of `bg_checksum` within a group descriptor.
 const BG_CHECKSUM_OFFSET: usize = 0x1E;
@@ -176,5 +182,23 @@ impl Seed {
         } else {
             lo as u32
         }
+    }
+
+    /// A non-htree directory block's checksum, carried in a fake trailing
+    /// dirent (`inode == 0`, `file_type == 0xDE`) rather than a header field —
+    /// directory blocks have no field of their own to hold one.
+    ///
+    /// `block` is the **whole** block. The checksummed region stops at the
+    /// *start* of the 12-byte tail — the tail's own `rec_len` and `0xDE`
+    /// marker are **not** covered, only the real dirents before it. Covering
+    /// four fewer bytes (up to the checksum field rather than up to the tail)
+    /// is the obvious wrong guess and produces a stable, plausible mismatch.
+    pub fn dir_block(&self, dir_ino: u64, dir_generation: u32, block: &[u8]) -> Option<u32> {
+        if !self.enabled || block.len() < DIR_TAIL_SIZE {
+            return None;
+        }
+        let crc = crc32c_seed(self.seed, &(dir_ino as u32).to_le_bytes());
+        let crc = crc32c_seed(crc, &dir_generation.to_le_bytes());
+        Some(crc32c_seed(crc, &block[..block.len() - DIR_TAIL_SIZE]))
     }
 }

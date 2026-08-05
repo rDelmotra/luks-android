@@ -13,6 +13,8 @@
 pub mod alloc;
 pub mod csum;
 #[cfg(feature = "dangerous-write-support")]
+pub mod dirent;
+#[cfg(feature = "dangerous-write-support")]
 pub mod file;
 
 use crate::device::ReadAt;
@@ -292,6 +294,9 @@ pub struct Inode {
     pub atime: i64,
     pub ctime: i64,
     pub mtime: i64,
+    /// `i_generation`. Needed to check or write any checksum belonging to this
+    /// inode or to a directory block it owns — both fold it into the seed.
+    pub generation: u32,
     /// `i_block`: an extent tree, an indirect block chain, or inline data.
     pub block_area: [u8; 60],
 }
@@ -427,8 +432,8 @@ impl<D: ReadAt> Ext4<D> {
             .read_at(block * self.sb.block_size as u64, buf)
     }
 
-    /// Load an inode by number. Inode 1 is the bad-blocks inode; 2 is the root.
-    pub fn read_inode(&self, ino: u64) -> Result<Inode> {
+    /// Byte offset of an inode's on-disk record.
+    pub(crate) fn inode_offset(&self, ino: u64) -> Result<u64> {
         if ino == 0 || ino > self.sb.inodes_count as u64 {
             return Err(LuksError::BadInode(ino));
         }
@@ -439,10 +444,21 @@ impl<D: ReadAt> Ext4<D> {
             .get(group as usize)
             .ok_or(LuksError::BadInode(ino))?
             .inode_table;
+        Ok(table * self.sb.block_size as u64 + index * self.sb.inode_size as u64)
+    }
 
-        let offset = table * self.sb.block_size as u64 + index * self.sb.inode_size as u64;
+    /// An inode's raw on-disk bytes, `s_inode_size` long. Checksumming an
+    /// inode needs the exact bytes, not a parsed subset.
+    pub(crate) fn read_raw_inode(&self, ino: u64) -> Result<Vec<u8>> {
+        let offset = self.inode_offset(ino)?;
         let mut raw = vec![0u8; self.sb.inode_size as usize];
         self.device.read_at(offset, &mut raw)?;
+        Ok(raw)
+    }
+
+    /// Load an inode by number. Inode 1 is the bad-blocks inode; 2 is the root.
+    pub fn read_inode(&self, ino: u64) -> Result<Inode> {
+        let raw = self.read_raw_inode(ino)?;
 
         let mut block_area = [0u8; 60];
         block_area.copy_from_slice(&raw[40..100]);
@@ -468,6 +484,7 @@ impl<D: ReadAt> Ext4<D> {
             atime: u32le(&raw, 8) as i64,
             ctime: u32le(&raw, 12) as i64,
             mtime: u32le(&raw, 16) as i64,
+            generation: u32le(&raw, 100),
             block_area,
         })
     }

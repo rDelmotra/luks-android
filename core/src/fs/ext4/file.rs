@@ -57,20 +57,6 @@ struct Run {
 }
 
 impl<D: WriteAt> Ext4<D> {
-    fn inode_offset(&self, ino: u64) -> Result<u64> {
-        if ino == 0 || ino > self.sb.inodes_count as u64 {
-            return Err(LuksError::BadInode(ino));
-        }
-        let group = (ino - 1) / self.sb.inodes_per_group as u64;
-        let index = (ino - 1) % self.sb.inodes_per_group as u64;
-        let table = self
-            .groups
-            .get(group as usize)
-            .ok_or(LuksError::BadInode(ino))?
-            .inode_table;
-        Ok(table * self.sb.block_size as u64 + index * self.sb.inode_size as u64)
-    }
-
     /// Allocate blocks for `data`, write it, and create an inode pointing at
     /// it. Returns the new inode number.
     ///
