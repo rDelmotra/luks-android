@@ -44,18 +44,34 @@ IMG="$1"
 NAME="$2"
 MAPPER="/dev/mapper/$NAME"
 MNT="/tmp/mnt-$NAME"
+LOOP=""
 
 cleanup() {
     umount "$MNT" 2>/dev/null || true
     cryptsetup close "$NAME" 2>/dev/null || true
+    [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null || true
     rm -rf "$MNT" "$IMG"
 }
 trap cleanup EXIT
 
+# The image may be a bare LUKS container (the fixtures) or a whole disk with a
+# partition table (the test stick, and every real drive). Ask the kernel which,
+# rather than guessing from the size or the filename — `blkid` on the raw image
+# reports the partition table if there is one.
+TARGET="$IMG"
+if [ "$(blkid -o value -s PTTYPE "$IMG" 2>/dev/null || true)" = "gpt" ]; then
+    LOOP="$(losetup --find --show --partscan "$IMG")"
+    TARGET="${LOOP}p1"
+    [ -b "$TARGET" ] || { echo "GPT present but no partition 1" >&2; exit 1; }
+    echo "container: GPT, partition 1"
+else
+    echo "container: bare LUKS"
+fi
+
 # --key-file=- reads the passphrase from stdin, which is where it already is,
 # and which is the only place it ever appears. Never on a command line: argv is
 # visible to every user on the machine via `ps`.
-cryptsetup open --key-file=- --type luks "$IMG" "$NAME"
+cryptsetup open --key-file=- --type luks "$TARGET" "$NAME"
 
 # What is inside decides which checker to run. `blkid` is the kernel's own
 # answer, not ours — using our own detector here would be exactly the
