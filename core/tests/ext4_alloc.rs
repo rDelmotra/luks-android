@@ -44,7 +44,11 @@ fn scratch(name: &str, test: &str) -> String {
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {
-    Ext4::mount(FileDevice::open_writable(path).expect("open writable")).expect("mount")
+    // The test made this copy itself, so it genuinely knows the size — this
+    // is a real confirmation, not a number read back from the thing being
+    // checked against it.
+    let len = std::fs::metadata(path).expect("stat scratch").len();
+    Ext4::mount(FileDevice::open_writable(path, len).expect("open writable")).expect("mount")
 }
 
 fn bytes(path: &str) -> Vec<u8> {

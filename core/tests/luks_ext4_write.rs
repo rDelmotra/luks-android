@@ -76,7 +76,7 @@ fn a_file_written_through_luks_is_readable_by_the_kernel() {
         let content = b"encrypted on the way in, plaintext on the way out\n";
 
         {
-            let dev = FileDevice::open_writable(&path).expect("open writable");
+            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(content).expect("write file");
             fs.link_file(2, "through-luks.txt", ino, FileType::Regular)
@@ -114,7 +114,7 @@ fn e2fsck_is_clean_inside_the_container() {
     for rel in CONTAINERS {
         let path = scratch(rel, "e2fsck");
         {
-            let dev = FileDevice::open_writable(&path).expect("open writable");
+            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(b"checked by e2fsck\n").expect("write");
             fs.link_file(2, "checked.txt", ino, FileType::Regular)
@@ -166,7 +166,7 @@ fn the_files_that_were_already_in_the_container_survive() {
         };
 
         {
-            let dev = FileDevice::open_writable(&path).expect("open writable");
+            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(b"newcomer\n").expect("write");
             fs.link_file(2, "newcomer.txt", ino, FileType::Regular)
@@ -219,7 +219,7 @@ fn the_luks_header_is_never_touched() {
         let before = read_guard(&path);
 
         {
-            let dev = FileDevice::open_writable(&path).expect("open writable");
+            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(&vec![0x5Au8; 8192]).expect("write");
             fs.link_file(2, "big.bin", ino, FileType::Regular)
@@ -259,7 +259,7 @@ fn a_file_written_through_gpt_and_luks_is_readable_by_the_kernel() {
     let content = b"partition table, container, filesystem\n";
 
     {
-        let dev = FileDevice::open_writable(&path).expect("open writable");
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let table = partition::scan(&dev, 512).expect("scan GPT");
         let offset = table
             .luks_partitions()

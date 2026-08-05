@@ -60,7 +60,7 @@ fn a_read_only_device_refuses_to_write() {
 #[test]
 fn what_was_written_is_what_comes_back() {
     let path = scratch("roundtrip");
-    let dev = FileDevice::open_writable(&path).expect("open writable");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     assert!(dev.is_writable());
 
     // Deliberately awkward offsets and lengths, including ones that straddle
@@ -115,7 +115,7 @@ fn a_partial_write_does_not_disturb_its_neighbours() {
         read(&dev, 0, 3 * 4096)
     };
 
-    let dev = FileDevice::open_writable_with_alignment(&path, 4096).expect("open writable");
+    let dev = FileDevice::open_writable_with_alignment(&path, 4096, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     let payload = [0xEEu8; 5];
     let at = 4096 + 17;
     dev.write_at(at, &payload).expect("write");
@@ -143,7 +143,7 @@ fn writing_past_the_end_of_a_widened_device_is_refused() {
     let path = scratch("past-end");
     let len = FileDevice::open(&path).expect("open").len().expect("length");
 
-    let dev = FileDevice::open_writable_with_alignment(&path, 4096).expect("open writable");
+    let dev = FileDevice::open_writable_with_alignment(&path, 4096, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     assert!(
         dev.write_at(len + 8192, &[1u8; 16]).is_err(),
         "a widened write well past the end must fail"

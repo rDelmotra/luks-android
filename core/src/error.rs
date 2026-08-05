@@ -130,11 +130,24 @@ pub enum LuksError {
     #[error("no free inodes left on the filesystem")]
     NoFreeInodes,
 
-    /// A write target failed the allowlist check in `device_guard` — an
-    /// unstated confirmation, a mismatched size, or a known system disk name.
-    /// See `device_guard`'s module doc for what this does and does not catch.
-    #[error("refusing to open write target: {0}")]
-    UnconfirmedWriteTarget(String),
+    /// The device behind a write target's path is not the one the caller said
+    /// it was. Almost always means the path now points at a different drive
+    /// than when it was checked — see `FileDevice::open_writable`.
+    #[error(
+        "refusing to write to {path}: caller expected a {expected}-byte device \
+         but it is {actual} bytes — the path points at something other than \
+         what was confirmed"
+    )]
+    WrongWriteTarget {
+        path: String,
+        expected: u64,
+        actual: u64,
+    },
+
+    /// The size of a write target could not be determined, so the caller's
+    /// claim about it could not be checked. Refused rather than assumed.
+    #[error("refusing to write to {path}: could not determine its size to confirm it")]
+    UnverifiableWriteTarget { path: String },
 
     // --- USB / SCSI transport ---
     #[error("SCSI protocol error: {0}")]

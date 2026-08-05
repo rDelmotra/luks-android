@@ -170,33 +170,67 @@ impl FileDevice {
         Self::open_inner(path.as_ref(), false)
     }
 
-    /// Open for reading **and writing**.
+    /// Open for reading **and writing**, refusing unless the device is
+    /// `expected_len` bytes.
     ///
     /// Gated behind `dangerous-write-support` so that a default build cannot
     /// call it at all. Everything about the read path's safety argument rests
     /// on `core` having no way to obtain a writable descriptor; this is that
     /// way, and it is compiled out unless asked for by name.
+    ///
+    /// # Why the length is not optional
+    ///
+    /// Device numbering is assigned by plug order on every OS this targets,
+    /// not fixed by identity. In this project's own history `/dev/disk4` was a
+    /// 1 TB Fedora SSD in one session and an unrelated 61 GB stick in the
+    /// next — same path, different drive. A path checked by a human at one
+    /// moment and opened at another can mean a different disk.
+    ///
+    /// Requiring the caller to state the size they believe the target to be
+    /// turns that into a refusal instead of a corruption: two drives
+    /// essentially never share an exact byte count, so a stale path fails
+    /// loudly. It is a parameter rather than a separate "confirmed" variant
+    /// on purpose — a safety check that can be skipped by calling the other
+    /// function is decoration, and this crate had exactly that mistake in it
+    /// briefly. There is one door.
+    ///
+    /// This guards against a **mistake**, not a caller who states the wrong
+    /// size deliberately, and it cannot tell that a path belongs to the disk
+    /// the OS is booted from — that needs an OS-specific physical-disk lookup
+    /// which would mean ioctls or shelling out, neither available under this
+    /// crate's `#![forbid(unsafe_code)]`. See STATE.md.
     #[cfg(feature = "dangerous-write-support")]
-    pub fn open_writable<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+    pub fn open_writable<P: AsRef<std::path::Path>>(path: P, expected_len: u64) -> Result<Self> {
+        Self::confirm_len(path.as_ref(), expected_len)?;
         Self::open_inner(path.as_ref(), true)
     }
 
-    /// [`FileDevice::open_writable`], but refusing to open unless
-    /// `confirmation` matches what the OS actually reports for `path`.
+    /// Refuse unless the device at `path` really is `expected_len` bytes.
     ///
-    /// This is the entry point every tool and every real-hardware write
-    /// should use — see [`crate::device_guard`] for what it catches (a stale
-    /// or renumbered device path) and what it deliberately does not (writing
-    /// to a partition of the disk the OS itself is running from). Tests that
-    /// only ever target scratch files they created themselves have no
-    /// renumbering risk and can keep using the plain [`FileDevice::open_writable`].
+    /// The size comes from seeking to the end of a **separate, read-only**
+    /// handle rather than from `metadata()`, which reports 0 for most special
+    /// device files — this crate already treats that 0 as "length unknown"
+    /// for reads, and for a write target "unknown" must not quietly become
+    /// "trust the caller". Anything unverifiable is refused, so the failure
+    /// mode is closed rather than open.
     #[cfg(feature = "dangerous-write-support")]
-    pub fn open_writable_confirmed<P: AsRef<std::path::Path>>(
-        path: P,
-        confirmation: &crate::device_guard::TargetConfirmation,
-    ) -> Result<Self> {
-        crate::device_guard::check(path.as_ref(), confirmation)?;
-        Self::open_writable(path)
+    fn confirm_len(path: &std::path::Path, expected_len: u64) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        let actual = std::fs::File::open(path)
+            .and_then(|mut f| f.seek(SeekFrom::End(0)))
+            .map_err(|_| LuksError::UnverifiableWriteTarget {
+                path: path.display().to_string(),
+            })?;
+
+        if actual != expected_len {
+            return Err(LuksError::WrongWriteTarget {
+                path: path.display().to_string(),
+                expected: expected_len,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     fn open_inner(path: &std::path::Path, writable: bool) -> Result<Self> {
@@ -263,24 +297,9 @@ impl FileDevice {
     pub fn open_writable_with_alignment<P: AsRef<std::path::Path>>(
         path: P,
         align: u64,
+        expected_len: u64,
     ) -> Result<Self> {
-        let mut dev = Self::open_writable(path)?;
-        dev.align = align;
-        Ok(dev)
-    }
-
-    /// [`FileDevice::open_writable_confirmed`] with the alignment forced —
-    /// what a real raw device write needs, since a raw character device
-    /// (`/dev/rdiskN` on macOS) requires the widened-read/read-modify-write
-    /// path already used for reads.
-    #[cfg(feature = "dangerous-write-support")]
-    pub fn open_writable_confirmed_with_alignment<P: AsRef<std::path::Path>>(
-        path: P,
-        align: u64,
-        confirmation: &crate::device_guard::TargetConfirmation,
-    ) -> Result<Self> {
-        crate::device_guard::check(path.as_ref(), confirmation)?;
-        let mut dev = Self::open_writable(path)?;
+        let mut dev = Self::open_writable(path, expected_len)?;
         dev.align = align;
         Ok(dev)
     }

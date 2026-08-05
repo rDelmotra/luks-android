@@ -77,7 +77,7 @@ fn our_ciphertext_is_byte_identical_to_the_kernels() {
 
         // Re-encrypt that plaintext with the writer, into a scratch copy.
         let path = scratch(name, "identical");
-        let wdev = FileDevice::open_writable(&path).expect("open writable");
+        let wdev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let wheader = luks::read_from(&wdev, 0).expect("parse header");
         let wvol = LuksVolume::open(&wdev, 0, &wheader, PASSWORD).expect("unlock");
         wvol.write_at(offset, &plain).expect("encrypt and write");
@@ -126,7 +126,7 @@ fn a_partial_sector_write_preserves_the_rest_of_the_sector() {
     // re-encrypting. If the surrounding plaintext is not carried through
     // correctly, the damage lands outside anything the caller named.
     let path = scratch("unlock-argon2id-512.img", "partial");
-    let dev = FileDevice::open_writable(&path).expect("open writable");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
     let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
 
@@ -156,7 +156,7 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
     // wrong, the damage usually lands somewhere the superblock notices.
     let path = scratch("unlock-argon2id-512.img", "mounts");
     {
-        let dev = FileDevice::open_writable(&path).expect("open writable");
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
         let header = luks::read_from(&dev, 0).expect("header");
         let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
         // Well past the superblock and group descriptors.
@@ -179,7 +179,7 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
 #[test]
 fn writing_past_the_end_of_the_segment_is_refused() {
     let path = scratch("unlock-argon2id-512.img", "bounds");
-    let dev = FileDevice::open_writable(&path).expect("open writable");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
     let volume = LuksVolume::open(&dev, 0, &header, PASSWORD).expect("unlock");
 
