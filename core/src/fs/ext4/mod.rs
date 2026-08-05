@@ -9,6 +9,8 @@
 //! Skipping `inode == 0` is therefore both correct and complete — and it avoids
 //! needing the hash code, which in lwext4 is the GPLv2 part.
 
+pub mod csum;
+
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::{DirEntry, FileInfo, FileType};
@@ -25,7 +27,21 @@ const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 const INCOMPAT_META_BG: u32 = 0x0010;
 const INCOMPAT_64BIT: u32 = 0x0080;
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
 const INCOMPAT_ENCRYPT: u32 = 0x1_0000;
+
+// s_feature_ro_compat bits
+/// Group descriptors carry a crc16 and bitmaps may be lazily initialised.
+const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+/// Everything — superblock, descriptors, bitmaps, inodes, extents, dirents —
+/// carries a crc32c.
+const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+
+// bg_flags bits
+/// The inode bitmap and table for this group have never been written.
+pub const BG_INODE_UNINIT: u16 = 0x0001;
+/// The block bitmap for this group has never been written.
+pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 // i_flags bits
 const INODE_FL_EXTENTS: u32 = 0x0008_0000;
@@ -53,6 +69,15 @@ pub struct Superblock {
     pub desc_size: u16,
     pub uuid: [u8; 16],
     pub volume_name: String,
+    pub free_blocks_count: u64,
+    pub free_inodes_count: u32,
+    pub clusters_per_group: u32,
+    /// First inode a file may use. Everything below is reserved (2 is root,
+    /// 8 is the journal), so an allocator must never hand one of them out.
+    pub first_ino: u32,
+    /// `s_checksum_seed`, present only with the `csum_seed` incompat feature.
+    /// Without it the seed is derived from the UUID — see [`csum::Seed`].
+    pub checksum_seed: Option<u32>,
 }
 
 impl Superblock {
@@ -103,6 +128,26 @@ impl Superblock {
             return Err(LuksError::CorruptFs("zero inodes or blocks per group"));
         }
 
+        let free_blocks_lo = u32le(b, 12) as u64;
+        let free_blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
+            u32le(b, 340) as u64
+        } else {
+            0
+        };
+
+        // s_clusters_per_group equals s_blocks_per_group unless bigalloc is on,
+        // which we do not support; falling back keeps old revisions working.
+        let clusters_per_group = match u32le(b, 36) {
+            0 => blocks_per_group,
+            n => n,
+        };
+
+        let checksum_seed = if feature_incompat & INCOMPAT_CSUM_SEED != 0 {
+            Some(u32le(b, 0x270))
+        } else {
+            None
+        };
+
         Ok(Superblock {
             inodes_count: u32le(b, 0),
             blocks_count: blocks_lo | (blocks_hi << 32),
@@ -116,6 +161,11 @@ impl Superblock {
             desc_size,
             uuid,
             volume_name,
+            free_blocks_count: free_blocks_lo | (free_blocks_hi << 32),
+            free_inodes_count: u32le(b, 16),
+            clusters_per_group,
+            first_ino: if rev_level >= 1 { u32le(b, 84) } else { 11 },
+            checksum_seed,
         })
     }
 
@@ -123,8 +173,19 @@ impl Superblock {
         self.feature_incompat & INCOMPAT_64BIT != 0
     }
 
+    /// Whether every metadata structure carries a crc32c.
+    pub fn has_metadata_csum(&self) -> bool {
+        self.feature_ro_compat & RO_COMPAT_METADATA_CSUM != 0
+    }
+
+    /// The older scheme: a crc16 on group descriptors only. We can read these
+    /// filesystems but refuse to write them — see [`csum::Seed::for_writing`].
+    pub fn has_gdt_csum_only(&self) -> bool {
+        self.feature_ro_compat & RO_COMPAT_GDT_CSUM != 0 && !self.has_metadata_csum()
+    }
+
     /// Bytes per block group descriptor.
-    fn group_desc_size(&self) -> usize {
+    pub fn group_desc_size(&self) -> usize {
         if self.is_64bit() && self.desc_size >= 64 {
             self.desc_size as usize
         } else {
@@ -132,9 +193,76 @@ impl Superblock {
         }
     }
 
-    fn group_count(&self) -> u64 {
+    pub fn group_count(&self) -> u64 {
         let per = self.blocks_per_group as u64;
         (self.blocks_count - self.first_data_block as u64).div_ceil(per)
+    }
+
+    /// Byte offset of the group descriptor table.
+    ///
+    /// The table starts in the block after the superblock. With a 1 KiB block
+    /// size the superblock occupies block 1, so the table is at block 2;
+    /// otherwise the superblock shares block 0 and the table is at block 1.
+    pub fn group_desc_offset(&self) -> u64 {
+        (self.first_data_block as u64 + 1) * self.block_size as u64
+    }
+}
+
+/// One block group descriptor, parsed whole.
+///
+/// The reader only ever needed `inode_table`. A writer needs all of it: the
+/// bitmaps to allocate from, the counters to keep consistent with them, and the
+/// checksum fields that make a stale counter a detectable error rather than a
+/// silent one.
+#[derive(Debug, Clone, Default)]
+pub struct GroupDesc {
+    pub block_bitmap: u64,
+    pub inode_bitmap: u64,
+    pub inode_table: u64,
+    pub free_blocks_count: u32,
+    pub free_inodes_count: u32,
+    pub used_dirs_count: u32,
+    pub flags: u16,
+    /// Inodes at the tail of this group's table that have never been used, so
+    /// e2fsck may skip them. Allocating into that region must shrink it.
+    pub itable_unused: u32,
+    pub checksum: u16,
+    pub block_bitmap_csum: u32,
+    pub inode_bitmap_csum: u32,
+}
+
+impl GroupDesc {
+    /// Parse one descriptor. `d` is exactly `desc_size` bytes.
+    ///
+    /// The high halves exist only in 64-byte descriptors. Reading them from a
+    /// 32-byte descriptor would pick up the *next* group's fields, which is the
+    /// kind of mistake that produces plausible numbers.
+    fn parse(d: &[u8]) -> Self {
+        let wide = d.len() >= 64;
+        let hi16 = |o: usize| if wide { u16le(d, o) as u32 } else { 0 };
+        let hi32 = |o: usize| if wide { u32le(d, o) as u64 } else { 0 };
+
+        GroupDesc {
+            block_bitmap: u32le(d, 0x00) as u64 | (hi32(0x20) << 32),
+            inode_bitmap: u32le(d, 0x04) as u64 | (hi32(0x24) << 32),
+            inode_table: u32le(d, 0x08) as u64 | (hi32(0x28) << 32),
+            free_blocks_count: u16le(d, 0x0C) as u32 | (hi16(0x2C) << 16),
+            free_inodes_count: u16le(d, 0x0E) as u32 | (hi16(0x2E) << 16),
+            used_dirs_count: u16le(d, 0x10) as u32 | (hi16(0x30) << 16),
+            flags: u16le(d, 0x12),
+            block_bitmap_csum: u16le(d, 0x18) as u32 | (hi16(0x38) << 16),
+            inode_bitmap_csum: u16le(d, 0x1A) as u32 | (hi16(0x3A) << 16),
+            itable_unused: u16le(d, 0x1C) as u32 | (hi16(0x32) << 16),
+            checksum: u16le(d, 0x1E),
+        }
+    }
+
+    pub fn block_bitmap_uninit(&self) -> bool {
+        self.flags & BG_BLOCK_UNINIT != 0
+    }
+
+    pub fn inode_bitmap_uninit(&self) -> bool {
+        self.flags & BG_INODE_UNINIT != 0
     }
 }
 
@@ -201,8 +329,8 @@ impl Inode {
 pub struct Ext4<D: ReadAt> {
     device: D,
     sb: Superblock,
-    /// Block number of each group's inode table.
-    inode_tables: Vec<u64>,
+    /// Every block group descriptor, parsed at mount.
+    groups: Vec<GroupDesc>,
 }
 
 impl<D: ReadAt> Ext4<D> {
@@ -234,38 +362,32 @@ impl<D: ReadAt> Ext4<D> {
             return Err(LuksError::UnsupportedFsFeature("meta_bg layout".into()));
         }
 
-        let inode_tables = Self::read_group_descriptors(&device, &sb)?;
+        let groups = Self::read_group_descriptors(&device, &sb)?;
         Ok(Ext4 {
             device,
             sb,
-            inode_tables,
+            groups,
         })
     }
 
-    fn read_group_descriptors(device: &D, sb: &Superblock) -> Result<Vec<u64>> {
-        let groups = sb.group_count();
+    fn read_group_descriptors(device: &D, sb: &Superblock) -> Result<Vec<GroupDesc>> {
+        let count = sb.group_count();
         let desc_size = sb.group_desc_size();
 
-        // The descriptor table starts in the block after the superblock. With a
-        // 1 KiB block size the superblock occupies block 1, so the table is at
-        // block 2; otherwise the superblock shares block 0 and the table is at 1.
-        let table_block = sb.first_data_block as u64 + 1;
-        let table_offset = table_block * sb.block_size as u64;
-
-        let total = (groups as usize)
+        let total = (count as usize)
             .checked_mul(desc_size)
             .ok_or(LuksError::CorruptFs("group descriptor table too large"))?;
         let mut buf = vec![0u8; total];
-        device.read_at(table_offset, &mut buf)?;
+        device.read_at(sb.group_desc_offset(), &mut buf)?;
 
-        let mut tables = Vec::with_capacity(groups as usize);
-        for g in 0..groups as usize {
-            let d = &buf[g * desc_size..(g + 1) * desc_size];
-            let lo = u32le(d, 8) as u64;
-            let hi = if desc_size >= 64 { u32le(d, 40) as u64 } else { 0 };
-            tables.push(lo | (hi << 32));
-        }
-        Ok(tables)
+        Ok((0..count as usize)
+            .map(|g| GroupDesc::parse(&buf[g * desc_size..(g + 1) * desc_size]))
+            .collect())
+    }
+
+    /// The parsed block group descriptors.
+    pub fn groups(&self) -> &[GroupDesc] {
+        &self.groups
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -299,10 +421,11 @@ impl<D: ReadAt> Ext4<D> {
         }
         let group = (ino - 1) / self.sb.inodes_per_group as u64;
         let index = (ino - 1) % self.sb.inodes_per_group as u64;
-        let table = *self
-            .inode_tables
+        let table = self
+            .groups
             .get(group as usize)
-            .ok_or(LuksError::BadInode(ino))?;
+            .ok_or(LuksError::BadInode(ino))?
+            .inode_table;
 
         let offset = table * self.sb.block_size as u64 + index * self.sb.inode_size as u64;
         let mut raw = vec![0u8; self.sb.inode_size as usize];
