@@ -12,6 +12,8 @@
 #[cfg(feature = "dangerous-write-support")]
 pub mod alloc;
 pub mod csum;
+#[cfg(feature = "dangerous-write-support")]
+pub mod file;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
@@ -80,6 +82,12 @@ pub struct Superblock {
     /// `s_checksum_seed`, present only with the `csum_seed` incompat feature.
     /// Without it the seed is derived from the UUID — see [`csum::Seed`].
     pub checksum_seed: Option<u32>,
+    /// `s_min_extra_isize`: how much of the extra area past the 128-byte base
+    /// inode a new inode must reserve. A writer that ignores this and uses a
+    /// smaller value produces an inode `e2fsck` rejects as too small to hold
+    /// what the filesystem requires — the checksum's own `i_checksum_hi` among
+    /// it, on any filesystem with `metadata_csum`.
+    pub min_extra_isize: u16,
 }
 
 impl Superblock {
@@ -150,6 +158,8 @@ impl Superblock {
             None
         };
 
+        let min_extra_isize = if rev_level >= 1 { u16le(b, 0x158) } else { 0 };
+
         Ok(Superblock {
             inodes_count: u32le(b, 0),
             blocks_count: blocks_lo | (blocks_hi << 32),
@@ -168,6 +178,7 @@ impl Superblock {
             clusters_per_group,
             first_ino: if rev_level >= 1 { u32le(b, 84) } else { 11 },
             checksum_seed,
+            min_extra_isize,
         })
     }
 
