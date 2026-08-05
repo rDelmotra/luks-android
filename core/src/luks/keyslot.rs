@@ -134,6 +134,59 @@ pub fn xts_decrypt(
     Ok(())
 }
 
+/// AES-XTS-plain64 **encryption** over `buf`, the exact mirror of
+/// [`xts_decrypt`].
+///
+/// Only compiled with `dangerous-write-support`. Same tweak rules — and the
+/// same trap: `tweak_step` counts in 512-byte units regardless of the sector
+/// size, so getting it wrong encrypts sector 0 correctly and turns everything
+/// after it into ciphertext the kernel will decrypt to garbage. Read the note
+/// on [`xts_decrypt`] before touching either.
+///
+/// This is graded against the kernel rather than against our own decryptor:
+/// take a region of a container that real `cryptsetup` and dm-crypt produced,
+/// decrypt it with the proven read path, re-encrypt the plaintext with this
+/// function, and require the ciphertext to come back **byte-identical**. A
+/// pair of functions that are merely inverses of each other would pass a round
+/// trip and still write a drive Linux cannot read.
+#[cfg(feature = "dangerous-write-support")]
+pub fn xts_encrypt(
+    key: &[u8],
+    buf: &mut [u8],
+    sector_size: usize,
+    first_tweak: u128,
+    tweak_step: u128,
+) -> Result<()> {
+    use aes::cipher::KeyInit;
+    use aes::{Aes128, Aes256};
+    use xts_mode::{get_tweak_default, Xts128};
+
+    match key.len() {
+        64 => {
+            let xts = Xts128::new(
+                Aes256::new_from_slice(&key[..32]).map_err(|_| LuksError::BadKeyLength(64))?,
+                Aes256::new_from_slice(&key[32..]).map_err(|_| LuksError::BadKeyLength(64))?,
+            );
+            for (i, chunk) in buf.chunks_mut(sector_size).enumerate() {
+                let tweak = first_tweak + (i as u128) * tweak_step;
+                xts.encrypt_sector(chunk, get_tweak_default(tweak));
+            }
+        }
+        32 => {
+            let xts = Xts128::new(
+                Aes128::new_from_slice(&key[..16]).map_err(|_| LuksError::BadKeyLength(32))?,
+                Aes128::new_from_slice(&key[16..]).map_err(|_| LuksError::BadKeyLength(32))?,
+            );
+            for (i, chunk) in buf.chunks_mut(sector_size).enumerate() {
+                let tweak = first_tweak + (i as u128) * tweak_step;
+                xts.encrypt_sector(chunk, get_tweak_default(tweak));
+            }
+        }
+        other => return Err(LuksError::BadKeyLength(other)),
+    }
+    Ok(())
+}
+
 /// Reverse the anti-forensic splitter: fold `stripes` blocks down to one.
 ///
 /// `d = 0; for each stripe but the last: d = diffuse(d XOR stripe); d ^= last`

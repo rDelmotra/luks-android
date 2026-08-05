@@ -12,6 +12,8 @@ use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::luks::header::{Luks2Header, SegmentSize};
 use crate::luks::keyslot::{self, xts_decrypt};
+#[cfg(feature = "dangerous-write-support")]
+use crate::luks::keyslot::xts_encrypt;
 use crate::secret::Secret;
 
 /// Owns its device rather than borrowing it.
@@ -141,6 +143,101 @@ impl<D: ReadAt> LuksVolume<D> {
         let skip = (offset - first_sector * ss) as usize;
         buf.copy_from_slice(&scratch[skip..skip + buf.len()]);
         Ok(())
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl<D: crate::device::WriteAt> LuksVolume<D> {
+    /// Write plaintext at `offset` bytes from the start of the decrypted
+    /// volume.
+    ///
+    /// # Why this reads before it writes
+    ///
+    /// XTS encrypts a whole cipher sector as a unit — the tweak covers the
+    /// entire block, so there is no such thing as encrypting 100 bytes of one.
+    /// A write that does not cover whole sectors therefore has to fetch them,
+    /// decrypt, patch the plaintext, re-encrypt and put them back.
+    ///
+    /// That makes an unaligned write **destructive to bytes the caller never
+    /// mentioned** if it is interrupted: the surrounding plaintext has been
+    /// decrypted and is on its way back out. Callers that care — which means
+    /// any filesystem writer — should align their requests to
+    /// [`LuksVolume::sector_size`] so this path is never taken. The aligned
+    /// case reads nothing at all.
+    ///
+    /// # Ordering
+    ///
+    /// This does not flush. Deciding *when* bytes must be durable is the
+    /// filesystem's job, not the cipher's: metadata that reaches the medium
+    /// before the data it points at describes blocks that were never written.
+    pub fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(LuksError::OutOfBounds)?;
+        if let Some(len) = self.segment_len {
+            if end > len {
+                return Err(LuksError::OutOfBounds);
+            }
+        }
+
+        let ss = self.sector_size as u64;
+        let first_sector = offset / ss;
+        let last_sector = end.div_ceil(ss);
+        let span = ((last_sector - first_sector) * ss) as usize;
+        let skip = (offset - first_sector * ss) as usize;
+        let aligned = skip == 0 && span == buf.len();
+
+        let disk_offset = self
+            .partition_offset
+            .checked_add(self.segment_offset)
+            .and_then(|o| o.checked_add(first_sector * ss))
+            .ok_or(LuksError::OutOfBounds)?;
+
+        let mut scratch = vec![0u8; span];
+        if aligned {
+            scratch.copy_from_slice(buf);
+        } else {
+            // Fetch the covering sectors and decrypt them, so the bytes
+            // around the caller's range survive re-encryption unchanged.
+            self.device.read_at(disk_offset, &mut scratch)?;
+            xts_decrypt(
+                self.master_key.expose(),
+                &mut scratch,
+                self.sector_size,
+                self.iv_tweak + first_sector as u128 * self.tweak_step,
+                self.tweak_step,
+            )?;
+            scratch[skip..skip + buf.len()].copy_from_slice(buf);
+        }
+
+        xts_encrypt(
+            self.master_key.expose(),
+            &mut scratch,
+            self.sector_size,
+            self.iv_tweak + first_sector as u128 * self.tweak_step,
+            self.tweak_step,
+        )?;
+        self.device.write_at(disk_offset, &scratch)
+    }
+
+    /// Push everything written so far to the medium.
+    pub fn flush(&self) -> Result<()> {
+        self.device.flush()
+    }
+}
+
+/// Lets the filesystem layer write straight through the encryption layer.
+#[cfg(feature = "dangerous-write-support")]
+impl<D: crate::device::WriteAt> crate::device::WriteAt for LuksVolume<D> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        LuksVolume::write_at(self, offset, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        LuksVolume::flush(self)
     }
 }
 

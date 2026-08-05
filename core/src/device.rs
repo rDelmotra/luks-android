@@ -64,6 +64,20 @@ impl<D: ReadAt + ?Sized> ReadAt for &D {
     }
 }
 
+/// The write-side mirror of the blanket `impl ReadAt for &D`, for the same
+/// reason: callers pass `&device`, and without this every one of them would
+/// have to hand over ownership just to write a byte.
+#[cfg(feature = "dangerous-write-support")]
+impl<D: WriteAt + ?Sized> WriteAt for &D {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        (**self).write_at(offset, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        (**self).flush()
+    }
+}
+
 impl ReadAt for [u8] {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let start = usize::try_from(offset).map_err(|_| LuksError::Truncated {
