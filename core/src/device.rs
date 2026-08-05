@@ -181,6 +181,24 @@ impl FileDevice {
         Self::open_inner(path.as_ref(), true)
     }
 
+    /// [`FileDevice::open_writable`], but refusing to open unless
+    /// `confirmation` matches what the OS actually reports for `path`.
+    ///
+    /// This is the entry point every tool and every real-hardware write
+    /// should use — see [`crate::device_guard`] for what it catches (a stale
+    /// or renumbered device path) and what it deliberately does not (writing
+    /// to a partition of the disk the OS itself is running from). Tests that
+    /// only ever target scratch files they created themselves have no
+    /// renumbering risk and can keep using the plain [`FileDevice::open_writable`].
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn open_writable_confirmed<P: AsRef<std::path::Path>>(
+        path: P,
+        confirmation: &crate::device_guard::TargetConfirmation,
+    ) -> Result<Self> {
+        crate::device_guard::check(path.as_ref(), confirmation)?;
+        Self::open_writable(path)
+    }
+
     fn open_inner(path: &std::path::Path, writable: bool) -> Result<Self> {
         let display = path.display().to_string();
         let opened = if writable {
@@ -246,6 +264,22 @@ impl FileDevice {
         path: P,
         align: u64,
     ) -> Result<Self> {
+        let mut dev = Self::open_writable(path)?;
+        dev.align = align;
+        Ok(dev)
+    }
+
+    /// [`FileDevice::open_writable_confirmed`] with the alignment forced —
+    /// what a real raw device write needs, since a raw character device
+    /// (`/dev/rdiskN` on macOS) requires the widened-read/read-modify-write
+    /// path already used for reads.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn open_writable_confirmed_with_alignment<P: AsRef<std::path::Path>>(
+        path: P,
+        align: u64,
+        confirmation: &crate::device_guard::TargetConfirmation,
+    ) -> Result<Self> {
+        crate::device_guard::check(path.as_ref(), confirmation)?;
         let mut dev = Self::open_writable(path)?;
         dev.align = align;
         Ok(dev)

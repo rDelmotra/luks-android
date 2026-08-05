@@ -130,6 +130,12 @@ pub enum LuksError {
     #[error("no free inodes left on the filesystem")]
     NoFreeInodes,
 
+    /// A write target failed the allowlist check in `device_guard` — an
+    /// unstated confirmation, a mismatched size, or a known system disk name.
+    /// See `device_guard`'s module doc for what this does and does not catch.
+    #[error("refusing to open write target: {0}")]
+    UnconfirmedWriteTarget(String),
+
     // --- USB / SCSI transport ---
     #[error("SCSI protocol error: {0}")]
     ScsiProtocol(&'static str),

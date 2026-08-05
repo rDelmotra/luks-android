@@ -59,6 +59,10 @@ pub mod code {
     pub const PANIC: i32 = 11;
     /// The drive is out of space — or out of the space we can currently reach.
     pub const NO_SPACE: i32 = 12;
+    /// A write target failed the allowlist in `device_guard` — not the same
+    /// as a permissions or I/O failure, and worth its own code so the UI can
+    /// say "wrong device" rather than a generic I/O message.
+    pub const UNCONFIRMED_TARGET: i32 = 13;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -81,6 +85,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
+        UnconfirmedWriteTarget(_) => code::UNCONFIRMED_TARGET,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,

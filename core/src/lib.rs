@@ -13,6 +13,8 @@
 #![warn(clippy::all)]
 
 pub mod device;
+#[cfg(feature = "dangerous-write-support")]
+pub mod device_guard;
 pub mod error;
 pub mod fs;
 pub mod luks;
