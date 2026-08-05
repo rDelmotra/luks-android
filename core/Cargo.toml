@@ -45,6 +45,14 @@ rpassword = "7"
 # there. Declared so `cfg!(aes_armv8)` does not trip the unexpected_cfgs lint.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_armv8)'] }
 
+[[example]]
+name = "write_to_drive"
+# Without this the example is compiled by a *default* `cargo test`, where
+# `FileDevice::open_writable` does not exist, and the default build fails.
+# The point of the feature is that a default build has no write code in it —
+# an example that assumes otherwise breaks exactly that guarantee.
+required-features = ["dangerous-write-support"]
+
 [features]
 default = []
 # V1 is read-only. Write opcodes are not compiled unless this is explicitly
