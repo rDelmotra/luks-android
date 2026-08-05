@@ -105,6 +105,18 @@ pub fn xts_decrypt(
 ) -> Result<()> {
     use aes::cipher::KeyInit;
     use aes::{Aes128, Aes256};
+
+    // XTS works in whole cipher sectors — there is no partial-sector mode in
+    // dm-crypt. A short trailing chunk would either panic inside the XTS
+    // crate (under 16 bytes) or silently do ciphertext stealing (16 up to a
+    // sector), producing bytes the kernel will never reproduce. Every in-crate
+    // caller passes whole sectors; this pins that as a contract rather than a
+    // habit, since both functions are `pub`.
+    if sector_size == 0 || !buf.len().is_multiple_of(sector_size) {
+        return Err(LuksError::CorruptFs(
+            "XTS length is not a whole number of cipher sectors",
+        ));
+    }
     use xts_mode::{get_tweak_default, Xts128};
 
     // An XTS key is two independent keys: one for data, one for the tweak.
@@ -159,6 +171,13 @@ pub fn xts_encrypt(
 ) -> Result<()> {
     use aes::cipher::KeyInit;
     use aes::{Aes128, Aes256};
+
+    // Same whole-sector contract as `xts_decrypt` — see the note there.
+    if sector_size == 0 || !buf.len().is_multiple_of(sector_size) {
+        return Err(LuksError::CorruptFs(
+            "XTS length is not a whole number of cipher sectors",
+        ));
+    }
     use xts_mode::{get_tweak_default, Xts128};
 
     match key.len() {

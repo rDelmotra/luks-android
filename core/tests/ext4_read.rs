@@ -391,3 +391,71 @@ fn a_sequential_read_does_not_cost_one_io_per_block() {
         );
     }
 }
+
+/// The four fields at the tail of the 64-bit superblock, and why they need
+/// sentinels rather than a fixture.
+///
+/// ```text
+///   0x150 s_blocks_count_hi
+///   0x154 s_r_blocks_count_hi   <- read by nobody, and that is the trap
+///   0x158 s_free_blocks_count_hi
+///   0x15C s_min_extra_isize (u16) | 0x15E s_want_extra_isize (u16)
+/// ```
+///
+/// They are adjacent and three of them are `u32`, so dropping the reserved
+/// count from a mental model shifts every field after it four bytes early.
+/// That is exactly what happened: `s_free_blocks_count_hi` was read from
+/// `s_r_blocks_count_hi`, and `s_min_extra_isize` from `s_free_blocks_count_hi`.
+///
+/// Nothing caught it, and nothing could have. Below 16 TiB every high word is
+/// zero, so the wrong offset and the right one return the same `0` on every
+/// fixture in this repo and on every drive this project has touched — and
+/// `min_extra_isize` was rescued downstream by a `.max(32)`. A fixture-based
+/// assertion agrees with a broken parser. Distinct values at each offset are
+/// the only thing that can tell them apart.
+#[test]
+fn superblock_tail_fields_come_from_their_own_offsets() {
+    const SB: usize = 1024; // the superblock starts 1024 bytes in
+    let mut img = image("csum-uuid-4k.img");
+
+    let put32 = |b: &mut [u8], off: usize, v: u32| {
+        b[SB + off..SB + off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    let put16 = |b: &mut [u8], off: usize, v: u16| {
+        b[SB + off..SB + off + 2].copy_from_slice(&v.to_le_bytes());
+    };
+
+    // A value no correct parser may ever surface, in the field between the two
+    // block counts.
+    put32(&mut img, 0x154, 0xDEAD_BEEF);
+    put32(&mut img, 0x158, 1); // s_free_blocks_count_hi
+    put16(&mut img, 0x15C, 28); // s_min_extra_isize, deliberately not 32
+    put16(&mut img, 0x15E, 44); // s_want_extra_isize — must not be mistaken for it
+
+    let fs = Ext4::mount(&img).expect("mount the patched fixture");
+    let sb = fs.superblock();
+
+    assert_eq!(
+        sb.min_extra_isize, 28,
+        "s_min_extra_isize must come from 0x15C; 0 means it was read from \
+         s_free_blocks_count_hi at 0x158, 44 means s_want_extra_isize at 0x15E",
+    );
+
+    let hi = sb.free_blocks_count >> 32;
+    assert_ne!(
+        hi, 0xDEAD_BEEF,
+        "free_blocks_count picked up s_r_blocks_count_hi at 0x154",
+    );
+    assert_eq!(
+        hi, 1,
+        "s_free_blocks_count_hi must come from 0x158, not 0x154",
+    );
+
+    // The low half is still the fixture's own, so the two are genuinely being
+    // combined rather than one of them being ignored.
+    assert_eq!(
+        sb.free_blocks_count & 0xFFFF_FFFF,
+        2793,
+        "s_free_blocks_count_lo (dumpe2fs: Free blocks: 2793) was disturbed",
+    );
+}

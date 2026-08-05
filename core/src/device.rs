@@ -202,7 +202,17 @@ impl FileDevice {
     #[cfg(feature = "dangerous-write-support")]
     pub fn open_writable<P: AsRef<std::path::Path>>(path: P, expected_len: u64) -> Result<Self> {
         Self::confirm_len(path.as_ref(), expected_len)?;
-        Self::open_inner(path.as_ref(), true)
+        let mut dev = Self::open_inner(path.as_ref(), true)?;
+        // The probe just proved the device is exactly this many bytes, which
+        // is better information than `metadata()` has for a device node (it
+        // says 0). Recording it does two things: `len()` stops answering
+        // "unknown" on raw devices, and — the part that matters — `write_at`
+        // gains a hard upper bound. Without it a raw device has no length
+        // anywhere in the stack, and a corrupt on-disk pointer that slipped
+        // every higher check would run off the end of the LUKS partition and
+        // keep going.
+        dev.len = Some(expected_len);
+        Ok(dev)
     }
 
     /// Refuse unless the device at `path` really is `expected_len` bytes.
@@ -430,9 +440,16 @@ impl FileDevice {
     /// not accept a partial block, so the bytes surrounding the caller's range
     /// have to be fetched and written back unchanged. Which means **a failure
     /// between the read and the write can lose data the caller never touched**
-    /// — the reason writes get their own feature gate, and the reason a
-    /// filesystem writer should align its own requests rather than leaning on
-    /// this.
+    /// — the reason writes get their own feature gate.
+    ///
+    /// Be honest about who takes this path: on a raw device it is hot, not
+    /// cold. The ext4 writer's metadata patches (a 64-byte descriptor, a
+    /// 256-byte inode) are sectored-up by the LUKS layer's own RMW into whole
+    /// cipher sectors — 512 bytes on the current test stick — and a 512-byte
+    /// write is still sub-`RAW_ALIGN`, so it lands here and RMWs again at
+    /// 4096. Two nested RMW cycles per metadata patch. Only a 4096-byte
+    /// cipher sector makes this path go quiet, and nothing guarantees one.
+    /// The blast radius of an interruption is `RAW_ALIGN` bytes, not zero.
     #[cfg(all(unix, feature = "dangerous-write-support"))]
     fn write_widened(&self, offset: u64, buf: &[u8]) -> Result<()> {
         let a = self.align;
@@ -491,6 +508,19 @@ impl WriteAt for FileDevice {
         if buf.is_empty() {
             return Ok(());
         }
+        // A write must land inside the device when the device's length is
+        // known — which for anything opened through `open_writable` it always
+        // is, because the size probe pinned it. This is the bottom of the
+        // stack: whatever upper layer produced a bad offset, the bytes stop
+        // here rather than off the end of the target.
+        if let Some(len) = self.len {
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or(LuksError::OutOfBounds)?;
+            if end > len {
+                return Err(LuksError::OutOfBounds);
+            }
+        }
         #[cfg(unix)]
         {
             if self.align == 0 {
@@ -515,10 +545,23 @@ impl WriteAt for FileDevice {
         // `sync_data`, not `sync_all`: the file's contents must reach the
         // medium, but its mtime need not. On a block device they are the same
         // call; on a regular image file this skips a metadata round trip.
-        self.file.sync_data().map_err(|source| LuksError::Io {
-            path: self.path.clone(),
-            source,
-        })
+        match self.file.sync_data() {
+            Ok(()) => Ok(()),
+            // A macOS raw character device is unbuffered by the OS, so the
+            // fsync machinery answers ENOTTY — "this operation does not apply
+            // here" — not "the write failed". Every write already went
+            // straight to the device. Only the raw path may read it that way
+            // (`align != 0` is exactly "this is a character device"); on a
+            // regular file ENOTTY would be a real, surprising error and stays
+            // one. Caveat, worth stating: this does not force the *drive's
+            // own* write cache — nothing available without an ioctl does.
+            // Seen live on /dev/rdisk4, 2026-08-05 (INCIDENTS.md).
+            Err(e) if self.align != 0 && e.raw_os_error() == Some(25) => Ok(()),
+            Err(source) => Err(LuksError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
     }
 }
 

@@ -32,9 +32,42 @@ const INCOMPAT_FILETYPE: u32 = 0x0002;
 const INCOMPAT_RECOVER: u32 = 0x0004;
 const INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 const INCOMPAT_META_BG: u32 = 0x0010;
+/// Inodes may carry extent trees. Absent on ext2/ext3 — where writing an
+/// extent-mapped inode, as [`file`] does, produces an inode `e2fsck` rejects.
+const INCOMPAT_EXTENTS: u32 = 0x0040;
 const INCOMPAT_64BIT: u32 = 0x0080;
 const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+/// Small files and directories live inside `i_block` itself. An inline
+/// directory has no extent tree, so mapping its "blocks" returns garbage —
+/// which a writer would then write to.
+const INCOMPAT_INLINE_DATA: u32 = 0x8000;
 const INCOMPAT_ENCRYPT: u32 = 0x1_0000;
+
+// s_feature_ro_compat bits beyond the checksum pair below
+/// Quota usage is tracked in hidden inodes that a writer must update in step
+/// with every allocation. This crate does not, so it must not write here.
+const RO_COMPAT_QUOTA: u32 = 0x0100;
+/// Block bitmaps address *clusters* of `2^(s_log_cluster_size - s_log_block_size)`
+/// blocks, and the free counters count clusters. An allocator that assumes
+/// bit == block hands out block numbers wrong by the cluster ratio — on top
+/// of other files.
+///
+/// ⚠️ This is a **ro_compat** bit (0x0200 there), *not* incompat — old
+/// kernels may still mount bigalloc read-only, which is exactly the situation
+/// this crate is in. The same value in `feature_incompat` is `flex_bg`, which
+/// nearly every modern filesystem has: testing the wrong field refuses to
+/// write everything real and lets actual bigalloc straight through. That
+/// exact mistake was made here and caught by the fixture suite within
+/// minutes, because every fixture carries `flex_bg`.
+const RO_COMPAT_BIGALLOC: u32 = 0x0200;
+
+// s_state bits
+/// The filesystem was cleanly unmounted. *Absent* means it is mounted right
+/// now or died mid-write — either way the on-disk metadata cannot be trusted
+/// as a base for further writes.
+const STATE_CLEANLY_UNMOUNTED: u16 = 0x0001;
+/// The kernel saw errors on this filesystem. `e2fsck` gets it first.
+const STATE_ERRORS_SEEN: u16 = 0x0002;
 
 // s_feature_ro_compat bits
 /// Group descriptors carry a crc16 and bitmaps may be lazily initialised.
@@ -42,6 +75,24 @@ const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
 /// Everything — superblock, descriptors, bitmaps, inodes, extents, dirents —
 /// carries a crc32c.
 const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
+
+// Superblock offsets in the 64-bit tail.
+//
+// These are four adjacent fields of the same shape, and `s_r_blocks_count_hi`
+// sits between the two block counts. Dropping it from a mental model shifts
+// everything after it four bytes early — which is exactly what happened here:
+// `s_free_blocks_count_hi` was read from `s_r_blocks_count_hi`, and
+// `s_min_extra_isize` from `s_free_blocks_count_hi`. Both were invisible
+// because every hi word is zero below 16 TiB. Named, not inlined, so the gap
+// stays on screen.
+//
+//   0x150 s_blocks_count_hi
+//   0x154 s_r_blocks_count_hi   <- read by nobody, and that is the trap
+//   0x158 s_free_blocks_count_hi
+//   0x15C s_min_extra_isize (u16) | 0x15E s_want_extra_isize (u16)
+const SB_BLOCKS_COUNT_HI: usize = 0x150;
+pub(crate) const SB_FREE_BLOCKS_COUNT_HI: usize = 0x158;
+const SB_MIN_EXTRA_ISIZE: usize = 0x15C;
 
 // bg_flags bits
 /// The inode bitmap and table for this group have never been written.
@@ -90,6 +141,10 @@ pub struct Superblock {
     /// what the filesystem requires — the checksum's own `i_checksum_hi` among
     /// it, on any filesystem with `metadata_csum`.
     pub min_extra_isize: u16,
+    /// `s_state`. Read for one purpose: refusing to *write* a filesystem that
+    /// is not cleanly unmounted or has recorded errors — see
+    /// [`csum::Seed::for_writing`].
+    pub state: u16,
 }
 
 impl Superblock {
@@ -123,7 +178,7 @@ impl Superblock {
 
         let blocks_lo = u32le(b, 4) as u64;
         let blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
-            u32le(b, 336) as u64
+            u32le(b, SB_BLOCKS_COUNT_HI) as u64
         } else {
             0
         };
@@ -142,7 +197,7 @@ impl Superblock {
 
         let free_blocks_lo = u32le(b, 12) as u64;
         let free_blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
-            u32le(b, 340) as u64
+            u32le(b, SB_FREE_BLOCKS_COUNT_HI) as u64
         } else {
             0
         };
@@ -160,7 +215,11 @@ impl Superblock {
             None
         };
 
-        let min_extra_isize = if rev_level >= 1 { u16le(b, 0x158) } else { 0 };
+        let min_extra_isize = if rev_level >= 1 {
+            u16le(b, SB_MIN_EXTRA_ISIZE)
+        } else {
+            0
+        };
 
         Ok(Superblock {
             inodes_count: u32le(b, 0),
@@ -181,6 +240,7 @@ impl Superblock {
             first_ino: if rev_level >= 1 { u32le(b, 84) } else { 11 },
             checksum_seed,
             min_extra_isize,
+            state: u16le(b, 0x3A),
         })
     }
 
@@ -432,6 +492,30 @@ impl<D: ReadAt> Ext4<D> {
             .read_at(block * self.sb.block_size as u64, buf)
     }
 
+    /// Byte offset of `block`, refusing numbers that cannot belong to a
+    /// metadata or directory block on this filesystem.
+    ///
+    /// Every other offset this crate writes to is either fixed (the
+    /// superblock) or derived from a bounded index (the descriptor table).
+    /// This is for the rest: block numbers read *from the disk itself* — an
+    /// extent's target, a descriptor's bitmap pointer — which are exactly as
+    /// trustworthy as the disk. A single flipped bit in `ee_start_hi` moves a
+    /// pointer by 4 TiB, and without this check that becomes a 4 KiB write at
+    /// an arbitrary offset: past the filesystem, over the LUKS header, into a
+    /// neighbouring partition.
+    ///
+    /// The lower bound also excludes block 0 on a 4 KiB filesystem and block 1
+    /// on a 1 KiB one — both hold the superblock, which a valid pointer can
+    /// never name.
+    pub(crate) fn metadata_block_offset(&self, block: u64) -> Result<u64> {
+        if block <= self.sb.first_data_block as u64 || block >= self.sb.blocks_count {
+            return Err(LuksError::CorruptFs(
+                "a block pointer reaches outside the filesystem",
+            ));
+        }
+        Ok(block * self.sb.block_size as u64)
+    }
+
     /// Byte offset of an inode's on-disk record.
     pub(crate) fn inode_offset(&self, ino: u64) -> Result<u64> {
         if ino == 0 || ino > self.sb.inodes_count as u64 {
@@ -444,7 +528,26 @@ impl<D: ReadAt> Ext4<D> {
             .get(group as usize)
             .ok_or(LuksError::BadInode(ino))?
             .inode_table;
-        Ok(table * self.sb.block_size as u64 + index * self.sb.inode_size as u64)
+
+        // The table pointer comes from the disk, so it gets the same treatment
+        // as any other on-disk block number: prove the record lands inside the
+        // filesystem before anything reads it — or, worse, writes it.
+        self.metadata_block_offset(table)?;
+        let offset = table * self.sb.block_size as u64 + index * self.sb.inode_size as u64;
+        let fs_bytes = self
+            .sb
+            .blocks_count
+            .checked_mul(self.sb.block_size as u64)
+            .ok_or(LuksError::CorruptFs("filesystem size overflows"))?;
+        if offset
+            .checked_add(self.sb.inode_size as u64)
+            .is_none_or(|end| end > fs_bytes)
+        {
+            return Err(LuksError::CorruptFs(
+                "an inode table places an inode outside the filesystem",
+            ));
+        }
+        Ok(offset)
     }
 
     /// An inode's raw on-disk bytes, `s_inode_size` long. Checksumming an

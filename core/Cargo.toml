@@ -23,7 +23,12 @@ base64 = "0.22"
 argon2 = "0.5"
 pbkdf2 = "0.12"
 hmac = "0.12"
-aes = "0.8"
+# `zeroize` is NOT default in `aes` — without it every expanded key schedule
+# (240 bytes per Aes256, from which the original key is trivially recoverable,
+# since the schedule is invertible) is dropped un-wiped. The XTS paths build
+# two cipher instances per call, so an un-wiped build litters the heap with
+# master-key residue. With the feature, `cipher`'s internals zeroize on drop.
+aes = { version = "0.8", features = ["zeroize"] }
 xts-mode = "0.5"
 subtle = "2"
 crc32c = "0.6"   # Castagnoli, hardware-accelerated. NOT crc32fast — wrong polynomial.

@@ -175,8 +175,15 @@ impl<D: WriteAt> Ext4<D> {
         write_extent_tree(&mut raw[0x28..0x28 + 60], runs)?;
 
         if isize_ > 128 {
-            let extra = (self.sb.min_extra_isize.max(32)) as usize;
-            put16(&mut raw, 0x80, extra as u16); // i_extra_isize
+            // Clamped to the room that actually exists past the base inode,
+            // and rounded up to 4 — e2fsck rejects an `i_extra_isize` that is
+            // odd-sized or larger than `s_inode_size - 128`. The cap is a
+            // multiple of 4 (inode sizes are powers of two), so rounding
+            // cannot push a clamped value back over it.
+            let cap = (isize_ - 128) as u16;
+            let extra = self.sb.min_extra_isize.max(32).min(cap);
+            let extra = (extra + 3) & !3;
+            put16(&mut raw, 0x80, extra); // i_extra_isize
         }
         if isize_ > 128 && size > u32::MAX as u64 {
             put32(&mut raw, 0x6C, (size >> 32) as u32); // i_size_high

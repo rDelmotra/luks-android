@@ -59,10 +59,15 @@ pub mod code {
     pub const PANIC: i32 = 11;
     /// The drive is out of space — or out of the space we can currently reach.
     pub const NO_SPACE: i32 = 12;
-    /// A write target was not the device the caller said it was, or its size
-    /// could not be confirmed. Distinct from a permissions or I/O failure so
-    /// the UI can say "wrong device" rather than a generic I/O message.
+    /// A write target was not the device the caller said it was. Distinct
+    /// from a permissions or I/O failure so the UI can say "wrong device"
+    /// rather than a generic I/O message.
     pub const WRONG_TARGET: i32 = 13;
+    /// A write target's size could not be probed at all. Split from
+    /// `WRONG_TARGET` because the user's next step differs: 13 means "your
+    /// byte count does not match this device", 14 means "this path cannot be
+    /// checked — is it present and readable?".
+    pub const UNVERIFIABLE_TARGET: i32 = 14;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -85,7 +90,8 @@ pub fn error_code(e: &LuksError) -> i32 {
         | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
-        WrongWriteTarget { .. } | UnverifiableWriteTarget { .. } => code::WRONG_TARGET,
+        WrongWriteTarget { .. } => code::WRONG_TARGET,
+        UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,

@@ -37,7 +37,14 @@ enum Phase {
     /// the host simply writes bytes to the OUT endpoint, and only the byte
     /// count in the CBW says when the phase ends. So the mock has to remember
     /// what the pending command was, exactly as a real bridge does.
-    DataOut { at: usize, want: usize, got: Vec<u8> },
+    /// `blocks` rides along so the write statistics can be counted when the
+    /// data actually lands, not when the command merely promises it.
+    DataOut {
+        at: usize,
+        want: usize,
+        got: Vec<u8>,
+        blocks: u32,
+    },
     Csw { pos: usize },
 }
 
@@ -88,8 +95,34 @@ impl MockUsbDrive {
         *self.csw.borrow_mut() = csw;
     }
 
-    fn execute(&self, cdb: &[u8], tag: u32, expected_len: u32) -> Result<()> {
+    /// `flags` is the CBW's `bmCBWFlags`: bit 7 set means the host expects an
+    /// IN data phase. A real bridge phase-errors when the flag contradicts the
+    /// command; a mock that ignored it (as this one did) would pass a WRITE
+    /// issued with `Direction::In` — agreeable in exactly the direction that
+    /// matters, given this mock is the only evidence the SCSI write path has
+    /// until it meets real hardware.
+    fn execute(&self, cdb: &[u8], tag: u32, expected_len: u32, flags: u8) -> Result<()> {
         self.stats.borrow_mut().commands += 1;
+
+        let host_expects_in = flags & 0x80 != 0;
+        let mut phase_error = |why: &str| {
+            let _ = why; // named for the reader; the CSW carries only a status
+            self.set_csw(tag, expected_len, 2); // 2 = phase error
+            *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
+        };
+
+        // Direction check: every command with a data phase declares its
+        // direction in the opcode; the CBW flag must agree.
+        let wants_in = matches!(cdb[0], 0x12 | 0x03 | 0x25 | 0x9E | 0x28 | 0x88);
+        let wants_out = matches!(cdb[0], 0x2A | 0x8A);
+        if expected_len > 0 && wants_in && !host_expects_in {
+            phase_error("IN command sent with an OUT flag");
+            return Ok(());
+        }
+        if wants_out && host_expects_in {
+            phase_error("OUT command sent with an IN flag");
+            return Ok(());
+        }
 
         let data: Vec<u8> = match cdb[0] {
             // INQUIRY
@@ -188,17 +221,22 @@ impl MockUsbDrive {
                     *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
                     return Ok(());
                 }
+                // The CBW's byte count and the CDB's block count are two
+                // statements of the same length; a host that disagrees with
+                // itself gets a phase error, as from a real bridge.
+                if expected_len as u64 != len {
+                    phase_error("CBW length disagrees with the WRITE CDB");
+                    return Ok(());
+                }
 
-                let mut st = self.stats.borrow_mut();
-                st.write_commands += 1;
-                st.bytes_written += len as usize;
-                st.largest_write_blocks = st.largest_write_blocks.max(count);
-                drop(st);
-
+                // Statistics are counted when the data lands (see `write`),
+                // not here — a command is not a write until its payload
+                // arrives.
                 *self.phase.borrow_mut() = Phase::DataOut {
                     at: start as usize,
                     want: len as usize,
                     got: Vec::with_capacity(len as usize),
+                    blocks: count,
                 };
                 // The CSW is prepared now and sent once the data has arrived.
                 self.set_csw(tag, 0, 0);
@@ -233,14 +271,27 @@ impl BulkTransport for MockUsbDrive {
         // Mid data-out phase: these bytes are payload, not a new command.
         {
             let mut phase = self.phase.borrow_mut();
-            if let Phase::DataOut { at, want, got } = &mut *phase {
+            if let Phase::DataOut {
+                at,
+                want,
+                got,
+                blocks,
+            } = &mut *phase
+            {
                 let n = data.len().min(*want - got.len()).min(self.max_transfer);
                 got.extend_from_slice(&data[..n]);
                 if got.len() == *want {
-                    let (at, got) = (*at, std::mem::take(got));
+                    let (at, got, blocks) = (*at, std::mem::take(got), *blocks);
                     *phase = Phase::Csw { pos: 0 };
                     drop(phase);
                     self.image.borrow_mut()[at..at + got.len()].copy_from_slice(&got);
+                    // Counted here, from the payload that actually arrived —
+                    // a `bytes_written` assertion should prove a data phase
+                    // happened, not that a command once made a promise.
+                    let mut st = self.stats.borrow_mut();
+                    st.write_commands += 1;
+                    st.bytes_written += got.len();
+                    st.largest_write_blocks = st.largest_write_blocks.max(blocks);
                 }
                 return Ok(n);
             }
@@ -254,10 +305,11 @@ impl BulkTransport for MockUsbDrive {
         }
         let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
         let expected_len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+        let flags = data[12];
         let cdb_len = data[14] as usize;
         let cdb = &data[15..15 + cdb_len.min(16)];
 
-        self.execute(cdb, tag, expected_len)?;
+        self.execute(cdb, tag, expected_len, flags)?;
         Ok(CBW_LEN)
     }
 

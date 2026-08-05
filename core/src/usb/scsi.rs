@@ -194,7 +194,24 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             return Err(LuksError::ScsiProtocol("CSW tag mismatch"));
         }
         match csw.status {
-            CswStatus::Passed => Ok(transferred),
+            CswStatus::Passed => {
+                // The residue is the *drive's* statement of how much of the
+                // data phase it did not process. For an IN transfer the host
+                // already knows (it counted what arrived), but for an OUT
+                // transfer `transferred` only counts what the host handed to
+                // the bridge — a drive can ACK every byte, report Passed, and
+                // still say via the residue that it committed less. Ignoring
+                // that turns a dropped sector into a success return, and the
+                // corruption surfaces weeks later as one unreadable block
+                // with no log line pointing anywhere. BOT requires the host
+                // to honour this field; here that means failing loudly.
+                if matches!(direction, Direction::Out) && csw.data_residue != 0 {
+                    return Err(LuksError::ScsiProtocol(
+                        "drive committed less than the full data phase",
+                    ));
+                }
+                Ok(transferred)
+            }
             CswStatus::Failed => Err(LuksError::ScsiCommandFailed),
             CswStatus::PhaseError => {
                 self.transport.reset()?;
@@ -258,10 +275,17 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         let last_lba = u64::from_be_bytes(buf[0..8].try_into().expect("8 bytes"));
         let block_size = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        Ok(Capacity {
-            blocks: last_lba + 1,
-            block_size,
-        })
+        // A drive can answer anything. `last_lba + 1` wrapping to zero would
+        // make `bytes()` zero, and a zero capacity passes every "end > bytes"
+        // bound trivially — so an absurd answer is refused here, once, rather
+        // than trusted everywhere.
+        let blocks = last_lba
+            .checked_add(1)
+            .ok_or(LuksError::ScsiProtocol("capacity overflows"))?;
+        blocks
+            .checked_mul(block_size as u64)
+            .ok_or(LuksError::ScsiProtocol("capacity overflows"))?;
+        Ok(Capacity { blocks, block_size })
     }
 
     /// Read `count` blocks starting at `lba`, choosing READ(10) or READ(16).
@@ -271,7 +295,14 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             return Err(LuksError::ScsiProtocol("read buffer too small"));
         }
 
-        let cdb = if lba > READ10_MAX_LBA || count as u64 > READ10_MAX_BLOCKS {
+        // The 10-byte form must fit the *whole* range, not just its first
+        // block: `lba` within 32 bits but `lba + count` past them runs off
+        // the end of the 32-bit LBA space mid-transfer.
+        let needs_16 = count as u64 > READ10_MAX_BLOCKS
+            || lba
+                .checked_add(count as u64)
+                .is_none_or(|end| end > READ10_MAX_LBA + 1);
+        let cdb = if needs_16 {
             let mut cdb = vec![0u8; 16];
             cdb[0] = OP_READ_16;
             cdb[2..10].copy_from_slice(&lba.to_be_bytes());
@@ -301,7 +332,12 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             return Err(LuksError::ScsiProtocol("write buffer too small"));
         }
 
-        let cdb = if lba > READ10_MAX_LBA || count as u64 > READ10_MAX_BLOCKS {
+        // Same whole-range condition as `read_blocks` — see the note there.
+        let needs_16 = count as u64 > READ10_MAX_BLOCKS
+            || lba
+                .checked_add(count as u64)
+                .is_none_or(|end| end > READ10_MAX_LBA + 1);
+        let cdb = if needs_16 {
             let mut cdb = vec![0u8; 16];
             cdb[0] = OP_WRITE_16;
             cdb[2..10].copy_from_slice(&lba.to_be_bytes());
@@ -390,10 +426,13 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
 ///
 /// It is not a hypothetical cost here. Over USB a single SCSI command was
 /// measured at 760 us, so an unaligned write is two commands where an aligned
-/// one is a single command — before any of the data moves. Callers above this
-/// layer should align to the block size; the LUKS layer already works in whole
-/// cipher sectors, which on every drive seen so far is a multiple of the block
-/// size, so in practice this path should stay cold.
+/// one is a single command — before any of the data moves. The LUKS layer
+/// above always emits whole cipher sectors, and a cipher sector is a multiple
+/// of the SCSI block size on every drive seen so far — **when that holds**,
+/// this RMW never runs. It is a property of the drive, not a guarantee: a
+/// 512-byte cipher sector on a 4096-byte-block drive (they exist) would land
+/// every metadata patch here. The read-back check below is what makes that
+/// case merely slow instead of dangerous.
 #[cfg(feature = "dangerous-write-support")]
 impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {

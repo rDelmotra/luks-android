@@ -52,23 +52,28 @@ impl<D: WriteAt> Ext4<D> {
     /// The length is not the block size. The kernel checksums exactly
     /// `clusters_per_group / 8` (or `inodes_per_group / 8`) bytes, and using
     /// the whole block instead produces a checksum that never matches.
-    fn bitmap_extent(&self, group: usize, which: Bitmap) -> (u64, usize) {
+    ///
+    /// The bitmap's block number is an on-disk pointer (it came out of the
+    /// group descriptor), so like every such pointer it is bounds-proven
+    /// before anything reads through it — or writes, which is the case that
+    /// matters: a corrupt descriptor must not aim a bitmap write at an
+    /// arbitrary offset.
+    fn bitmap_extent(&self, group: usize, which: Bitmap) -> Result<(u64, usize)> {
         let g = &self.groups[group];
-        let bs = self.sb.block_size as u64;
         match which {
-            Bitmap::Block => (
-                g.block_bitmap * bs,
+            Bitmap::Block => Ok((
+                self.metadata_block_offset(g.block_bitmap)?,
                 (self.sb.clusters_per_group as usize).div_ceil(8),
-            ),
-            Bitmap::Inode => (
-                g.inode_bitmap * bs,
+            )),
+            Bitmap::Inode => Ok((
+                self.metadata_block_offset(g.inode_bitmap)?,
                 (self.sb.inodes_per_group as usize).div_ceil(8),
-            ),
+            )),
         }
     }
 
     fn read_bitmap(&self, group: usize, which: Bitmap) -> Result<Vec<u8>> {
-        let (offset, len) = self.bitmap_extent(group, which);
+        let (offset, len) = self.bitmap_extent(group, which)?;
         let mut buf = vec![0u8; len];
         self.device.read_at(offset, &mut buf)?;
         Ok(buf)
@@ -78,7 +83,7 @@ impl<D: WriteAt> Ext4<D> {
     /// descriptor. The descriptor itself is not flushed here — the caller
     /// adjusts the counters first, so that it is written exactly once.
     fn write_bitmap(&mut self, group: usize, which: Bitmap, bm: &[u8], seed: &Seed) -> Result<()> {
-        let (offset, _) = self.bitmap_extent(group, which);
+        let (offset, _) = self.bitmap_extent(group, which)?;
         self.device.write_at(offset, bm)?;
 
         if let Some(csum) = seed.bitmap(bm) {
@@ -149,7 +154,14 @@ impl<D: WriteAt> Ext4<D> {
         put32(&mut sb, 12, self.sb.free_blocks_count as u32);
         put32(&mut sb, 16, self.sb.free_inodes_count);
         if self.sb.is_64bit() {
-            put32(&mut sb, 340, (self.sb.free_blocks_count >> 32) as u32);
+            // 0x158, not 0x154 — 0x154 is s_r_blocks_count_hi, and writing the
+            // free count there both loses the update and clobbers the reserved
+            // count. Invisible below 16 TiB, where every hi word is zero.
+            put32(
+                &mut sb,
+                super::SB_FREE_BLOCKS_COUNT_HI,
+                (self.sb.free_blocks_count >> 32) as u32,
+            );
         }
 
         if let Some(csum) = seed.superblock(&sb) {
@@ -204,7 +216,12 @@ impl<D: WriteAt> Ext4<D> {
 
             set_bit(&mut bm, bit);
             self.groups[g].free_blocks_count -= 1;
-            self.sb.free_blocks_count -= 1;
+            // Saturating: the superblock counter can already be stale-low on a
+            // filesystem that saw an unclean unmount. Wrapping it to 2^64-1
+            // and re-checksumming would *sign* the nonsense; sticking at 0
+            // leaves an off-by-some counter, which is exactly what e2fsck
+            // knows how to fix.
+            self.sb.free_blocks_count = self.sb.free_blocks_count.saturating_sub(1);
             self.commit(g, Bitmap::Block, &bm, &seed)?;
 
             return Ok(first + g as u64 * per + bit as u64);
@@ -284,7 +301,8 @@ impl<D: WriteAt> Ext4<D> {
 
             set_bit(&mut bm, bit);
             self.groups[g].free_inodes_count -= 1;
-            self.sb.free_inodes_count -= 1;
+            // Saturating for the same reason as the block counter above.
+            self.sb.free_inodes_count = self.sb.free_inodes_count.saturating_sub(1);
             if is_dir {
                 self.groups[g].used_dirs_count += 1;
             }
@@ -320,6 +338,18 @@ impl<D: WriteAt> Ext4<D> {
         }
         let g = ((ino - 1) / per) as usize;
         let bit = ((ino - 1) % per) as usize;
+
+        // Same refusal as `free_block`'s: an uninitialised group's bitmap was
+        // never written, so reading it yields noise — and if a noise bit
+        // happened to be set, the "freed" bitmap written back would be noise
+        // *with a valid checksum*. No inode from such a group can have been
+        // allocated by this crate, so the request is itself evidence of a
+        // caller that has lost track.
+        if self.groups[g].inode_bitmap_uninit() {
+            return Err(LuksError::CorruptFs(
+                "free of an inode in an uninitialised group",
+            ));
+        }
 
         let mut bm = self.read_bitmap(g, Bitmap::Inode)?;
         if !test_bit(&bm, bit) {

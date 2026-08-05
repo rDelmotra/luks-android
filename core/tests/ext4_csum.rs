@@ -354,6 +354,17 @@ fn a_filesystem_without_checksums_reports_none() {
     assert!(seed.group_desc(0, &[0u8; 32]).is_none());
     assert!(seed.bitmap(&[0u8; 128]).is_none());
 
-    // And it is still writable — no checksums to get wrong.
-    assert!(Seed::for_writing(f.fs.superblock()).is_ok());
+    // But it is NOT writable. Checksums are not the reason — there are none
+    // to get wrong — the inode format is: this crate writes extent-mapped
+    // inodes, which are invalid on an indirect-block filesystem. The write
+    // gate must say so rather than let file.rs produce an inode e2fsck
+    // rejects (or worse, one an old kernel misreads as an indirect chain).
+    let refused = Seed::for_writing(f.fs.superblock());
+    match refused {
+        Err(e) => assert!(
+            e.to_string().contains("extents"),
+            "refusal should name the missing extents feature, said: {e}"
+        ),
+        Ok(_) => panic!("an ext2 filesystem must be refused by the write gate"),
+    }
 }

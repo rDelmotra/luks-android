@@ -111,6 +111,19 @@ impl<D: WriteAt> Ext4<D> {
                 "writing into a hash-indexed (htree) directory".into(),
             ));
         }
+        // An inline directory keeps its entries inside `i_block` itself — no
+        // extent tree, no blocks. Mapping its "blocks" anyway falls through to
+        // the indirect-block walker, which reads `i_block[0]`: for an inline
+        // directory that is the inode number of `.`, so for the root it is 2 —
+        // and "insert a dirent into block 2" is a write into the group
+        // descriptor table. The write gate refuses whole filesystems with the
+        // feature; this refuses the per-inode flag, in case it is ever set
+        // where the feature bit is not.
+        if dir.is_inline() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "writing into an inline_data directory".into(),
+            ));
+        }
         if self.find_entry(&dir, name_bytes)?.is_some() {
             return Err(LuksError::CorruptFs("a directory entry already exists"));
         }
@@ -130,9 +143,15 @@ impl<D: WriteAt> Ext4<D> {
             let Some(phys) = self.map_block(&dir, lblock)? else {
                 continue;
             };
+            // `phys` came off the disk (an extent entry), so it is proven to
+            // land inside the filesystem before anything is read from it —
+            // and above all before anything is *written* to it. This is the
+            // only loop in the crate that writes to an offset derived from
+            // on-disk data.
+            let at = self.metadata_block_offset(phys)?;
 
             let mut block = vec![0u8; bs];
-            self.device.read_at(phys * bs as u64, &mut block)?;
+            self.device.read_at(at, &mut block)?;
 
             if !insert_into_block(&mut block, usable, name_bytes, ino, file_type, needed)? {
                 continue;
@@ -141,7 +160,7 @@ impl<D: WriteAt> Ext4<D> {
             if let Some(csum) = seed.dir_block(dir_ino, dir.generation, &block) {
                 put32(&mut block, bs - 4, csum);
             }
-            self.device.write_at(phys * bs as u64, &block)?;
+            self.device.write_at(at, &block)?;
             return Ok(());
         }
 
@@ -166,7 +185,10 @@ impl<D: WriteAt> Ext4<D> {
             let Some(phys) = self.map_block(dir, lblock)? else {
                 continue;
             };
-            self.device.read_at(phys * bs as u64, &mut block)?;
+            // Same bound as the insert loop: a pointer off the disk proves
+            // itself before it is used, or the answer here is meaningless.
+            self.device
+                .read_at(self.metadata_block_offset(phys)?, &mut block)?;
 
             let mut pos = 0usize;
             while pos + DIRENT_HEADER <= bs {
@@ -193,6 +215,28 @@ impl<D: WriteAt> Ext4<D> {
 ///
 /// `usable` is where the records end — before the checksum tail, if there is
 /// one.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The walk guard must stop a live record whose `name_len` claims more
+    /// bytes than its own `rec_len` provides. Without the guard the slack
+    /// subtraction underflows — a panic in debug, a bogus enormous "slack"
+    /// and an out-of-range slice index in release. Either way the process
+    /// dies mid-transfer on a merely *corrupt* (not even hostile) directory.
+    #[test]
+    fn a_name_longer_than_its_record_stops_the_walk() {
+        let mut block = vec![0u8; 64];
+        block[0..4].copy_from_slice(&1u32.to_le_bytes()); // live: ino 1
+        block[4..6].copy_from_slice(&64u16.to_le_bytes()); // rec_len: whole block
+        block[6] = 200; // name_len: needs 208 bytes — more than rec_len has
+
+        let fit = insert_into_block(&mut block, 64, b"x", 12, FileType::Regular, 12)
+            .expect("malformed chain is 'no room', not an error");
+        assert!(!fit, "a malformed record must not be split");
+    }
+}
+
 fn insert_into_block(
     block: &mut [u8],
     usable: usize,
@@ -209,8 +253,16 @@ fn insert_into_block(
         let name_len = block[pos + 6] as usize;
 
         // A malformed chain must stop the walk rather than wrap around or run
-        // past the block; treating it as "no room" is the safe answer.
-        if rec_len < DIRENT_HEADER || !rec_len.is_multiple_of(4) || pos + rec_len > usable {
+        // past the block; treating it as "no room" is the safe answer. The
+        // last clause guards the subtraction below: a live record whose
+        // `name_len` needs more bytes than its own `rec_len` provides is
+        // corrupt, and without the check `rec_len - in_use` underflows — a
+        // panic in debug and a bogus enormous "slack" in release.
+        if rec_len < DIRENT_HEADER
+            || !rec_len.is_multiple_of(4)
+            || pos + rec_len > usable
+            || (cur_ino != 0 && record_len(name_len) > rec_len)
+        {
             return Ok(false);
         }
 

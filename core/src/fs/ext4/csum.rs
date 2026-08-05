@@ -73,22 +73,60 @@ impl Seed {
         }
     }
 
-    /// Derive the seed for *writing*, refusing filesystems whose checksum
-    /// scheme this crate cannot produce.
+    /// Derive the seed for *writing* — and, because every write operation in
+    /// this crate calls it first, act as the **write gate**: the one place
+    /// that refuses filesystems this writer does not fully understand.
     ///
-    /// The old `uninit_bg`/`gdt_csum` scheme puts a **crc16** on group
-    /// descriptors, a different algorithm entirely. It would be a dozen lines
-    /// to implement, and it is deliberately not implemented: there is no
-    /// fixture in this repo that uses it, and shipping write code that has
-    /// never been graded against a real filesystem is precisely how drives get
-    /// corrupted. Reading such a filesystem still works.
+    /// Each refusal below is a filesystem that *reads* fine and would be
+    /// silently corrupted by a writer that assumes plain ext4:
+    ///
+    /// * `gdt_csum`-only: descriptors carry a crc16, a different algorithm.
+    /// * `bigalloc`: bitmap bits and free counters are in *clusters*, so this
+    ///   allocator's block numbers would be wrong by the cluster ratio — on
+    ///   top of other files' data.
+    /// * `inline_data`: directories can live inside `i_block`, where mapping
+    ///   their "blocks" yields garbage that a writer would then write to.
+    /// * missing `filetype`: the dirent byte this crate writes a type code
+    ///   into is the high half of a 16-bit `name_len` there.
+    /// * missing `extents`: the extent-mapped inodes this crate writes are
+    ///   invalid on an indirect-block filesystem (ext2/ext3).
+    /// * `quota`: hidden quota inodes must be updated in step with every
+    ///   allocation, which this crate does not do.
+    /// * a dirty or errored `s_state`: the metadata being patched cannot be
+    ///   trusted as a base — it belongs to `e2fsck` (or to the kernel that
+    ///   still has it mounted) first.
+    ///
+    /// Reading any of these still works; refusal is write-only.
     pub fn for_writing(sb: &Superblock) -> Result<Self> {
+        let refuse = |what: &str| {
+            Err(LuksError::UnsupportedFsFeature(format!(
+                "{what} — this filesystem can be read but not written"
+            )))
+        };
+
         if sb.has_gdt_csum_only() {
-            return Err(LuksError::UnsupportedFsFeature(
-                "gdt_csum group descriptors (crc16) — this filesystem can be \
-                 read but not written"
-                    .into(),
-            ));
+            return refuse("gdt_csum group descriptors (crc16)");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_BIGALLOC != 0 {
+            return refuse("bigalloc (cluster-based allocation)");
+        }
+        if sb.feature_incompat & super::INCOMPAT_INLINE_DATA != 0 {
+            return refuse("inline_data");
+        }
+        if sb.feature_incompat & super::INCOMPAT_FILETYPE == 0 {
+            return refuse("a directory format without file types (no filetype feature)");
+        }
+        if sb.feature_incompat & super::INCOMPAT_EXTENTS == 0 {
+            return refuse("an indirect-block filesystem (no extents feature; ext2/ext3)");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_QUOTA != 0 {
+            return refuse("quota tracking");
+        }
+        if sb.state & super::STATE_CLEANLY_UNMOUNTED == 0 {
+            return refuse("a filesystem that was not cleanly unmounted");
+        }
+        if sb.state & super::STATE_ERRORS_SEEN != 0 {
+            return refuse("a filesystem with recorded errors (run e2fsck)");
         }
         Ok(Self::of(sb))
     }
