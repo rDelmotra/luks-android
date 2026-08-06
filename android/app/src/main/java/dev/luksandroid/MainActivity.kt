@@ -2,7 +2,6 @@ package dev.luksandroid
 
 import android.Manifest
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -32,8 +31,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,20 +43,19 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
  * Diagnostic logging — **debug builds only**.
  *
- * It exists because the phone has one USB-C port. Attaching a drive means
- * unplugging the cable that carries `adb`, so nothing can be watched live; the
- * logcat ring buffer survives the disconnect and is the only record of what
- * happened while the drive was attached. (Wireless debugging would fix that,
- * but `adb tcpip` opens an *unauthenticated* port, which is not something to
- * do on a shared or public network.)
+ * The phone has one USB-C port, so attaching a drive means unplugging the
+ * cable that carries `adb`. Wireless debugging (the Android 11+ pairing-code
+ * flow — *not* `adb tcpip`, which opens an unauthenticated port) is set up on
+ * the test Pixel and makes logcat watchable live with the drive attached. This
+ * still earns its place without it: the ring buffer survives a disconnect, so
+ * a dump taken after the drive comes off is a record of what happened while it
+ * was on.
  *
  * ### What is deliberately not logged
  *
@@ -85,37 +81,6 @@ private object Trace {
         if (BuildConfig.DEBUG) Log.e(TAG, msg, t)
     }
 }
-
-/**
- * A plumbing proof for the write path, reached only from outside the app —
- * not a feature, and not a button anyone ships.
- *
- * ```
- * adb shell am start -n dev.luksandroid/.MainActivity --ez debug_write_test true
- * ```
- *
- * run while the app is already open with a volume unlocked. [MainActivity] is
- * `singleTask`, so that second `am start` does not relaunch it — it arrives
- * through `onNewIntent`, which is what lets the trigger reach a screen that is
- * already composed and already holding the unlocked volume this needs.
- *
- * A [StateFlow] rather than a direct call because `onNewIntent` runs on the
- * Activity, not inside Compose, and this is the plain way to hand a signal
- * from one to the other without threading a callback through everything in
- * between. The counter (not a `Boolean`) is so a second `am start` while the
- * first write is still running is not silently indistinguishable from the
- * first — every firing gets a distinct value.
- */
-private object DebugWriteTrigger {
-    private val counter = MutableStateFlow(0L)
-    val signal: StateFlow<Long> = counter
-
-    fun fire() {
-        counter.value += 1
-    }
-}
-
-private const val EXTRA_DEBUG_WRITE_TEST = "dev.luksandroid.extra.DEBUG_WRITE_TEST"
 
 /**
  * Pass 3: unlock and browse.
@@ -153,8 +118,6 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        handleDebugWriteIntent(intent)
-
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -164,19 +127,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        // singleTask means every later `am start` lands here, not in a fresh
-        // onCreate — this is the path the debug write trigger actually uses.
-        handleDebugWriteIntent(intent)
-    }
-
-    private fun handleDebugWriteIntent(intent: Intent?) {
-        if (!BuildConfig.DEBUG) return
-        if (intent?.getBooleanExtra(EXTRA_DEBUG_WRITE_TEST, false) != true) return
-        Trace.i("debug write trigger received")
-        DebugWriteTrigger.fire()
-    }
 }
 
 /** What's shown for one detected [UsbMassStorage.Target]. */
@@ -222,40 +172,24 @@ private fun DiagnosticsScreen() {
     fun keyOf(t: UsbMassStorage.Target) =
         "${t.device.vendorId}:${t.device.productId}:${t.usbInterface.id}"
 
-    // See DebugWriteTrigger's doc: this is the far end of an `adb shell am
-    // start ... --ez debug_write_test true`, not a UI a released app ships
-    // with. Keyed on the signal value, not on Unit, so a second trigger while
-    // the volume is unchanged still re-runs the effect.
-    val debugWriteSignal by DebugWriteTrigger.signal.collectAsState()
-    LaunchedEffect(debugWriteSignal) {
-        if (debugWriteSignal == 0L) return@LaunchedEffect
-        val unlocked = volume as? VolumeState.Unlocked
-        if (unlocked == null) {
-            Trace.e("debug write: no unlocked volume to write to")
-            return@LaunchedEffect
-        }
-        if (!unlocked.volume.canWrite) {
-            Trace.e("debug write: this .so was not built with --write")
-            return@LaunchedEffect
-        }
-        val name = "debug-write-$debugWriteSignal.txt"
-        val content =
-            "written by the debug trigger, signal $debugWriteSignal\n".toByteArray()
-        try {
-            val ino = withContext(Dispatchers.IO) { unlocked.volume.writeFile(name, content) }
-            Trace.i("debug write: ok, inode=$ino, ${content.size} bytes")
-            // Refreshed so the write is visible without also navigating away
-            // and back — the whole point of the trigger is to prove the write
-            // reached the volume, and re-listing is the cheapest proof there
-            // is that it did.
-            val entries = withContext(Dispatchers.IO) { unlocked.volume.listDir("/") }
-            volume = VolumeState.Unlocked(unlocked.volume, entries)
-        } catch (e: LuksException) {
-            Trace.e("debug write: failed [${e.code}] ${e.message}")
-        } catch (e: Exception) {
-            Trace.e("debug write: failed", e)
-        }
-    }
+    // Whether a native call is in flight, for the whole screen rather than for
+    // one composable.
+    //
+    // This is what stands between "Close device" or "Lock" and a
+    // use-after-free. Both free a native handle — `nativeCloseVolume` and
+    // `nativeCloseDevice` reach `Box::from_raw` — and every long operation here
+    // (unlock, benchmark, listing, hashing, export, the debug write) is holding
+    // a `&VolumeHandle` or a `&DeviceHandle` on an IO thread while it runs.
+    // Freeing one underneath the other frees the cached superblock, the group
+    // descriptors and the master key.
+    //
+    // It lives here, not in `UnlockedBody`, because that is the mistake this
+    // replaces: `busy` was a `remember` local of `UnlockedBody`, so it could
+    // gate `Lock` and could not gate `Close device`, which sits a level up in
+    // `OpenDeviceBody` — and additionally closes the file descriptor Rust is
+    // reading through. Reads were exposed to this too, not only the write path;
+    // nothing enforced it at the level where both buttons could see it.
+    var busy by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -359,6 +293,8 @@ private fun DiagnosticsScreen() {
                                 device = state.device,
                                 volume = volume,
                                 onVolumeChange = { volume = it },
+                                busy = busy,
+                                onBusyChange = { busy = it },
                                 onClose = {
                                     (volume as? VolumeState.Unlocked)?.volume?.close()
                                     volume = VolumeState.None
@@ -391,6 +327,8 @@ private fun OpenDeviceBody(
     device: LuksDevice,
     volume: VolumeState,
     onVolumeChange: (VolumeState) -> Unit,
+    busy: Boolean,
+    onBusyChange: (Boolean) -> Unit,
     onClose: () -> Unit,
     scope: kotlinx.coroutines.CoroutineScope,
     context: Context,
@@ -426,11 +364,14 @@ private fun OpenDeviceBody(
     // it against the full-stack SHA-256 rate: if they match, the link is the
     // ceiling and the crypto/filesystem layers are free.
     var benchmark by remember { mutableStateOf<String?>(null) }
-    var benchmarking by remember { mutableStateOf(false) }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(
             onClick = {
-                benchmarking = true
+                // The shared flag, not a local one: this reads through the
+                // device handle for 128 MiB, and "Close device" below frees
+                // that handle. A private `benchmarking` boolean could stop a
+                // second benchmark and could not stop that.
+                onBusyChange(true)
                 benchmark = "reading 128 MiB of raw blocks…"
                 scope.launch {
                     benchmark = try {
@@ -438,10 +379,10 @@ private fun OpenDeviceBody(
                     } catch (e: Exception) {
                         "benchmark failed: ${e.message}"
                     }
-                    benchmarking = false
+                    onBusyChange(false)
                 }
             },
-            enabled = !benchmarking,
+            enabled = !busy,
         ) {
             Text("Benchmark raw read")
         }
@@ -458,8 +399,13 @@ private fun OpenDeviceBody(
             onCancel = { onVolumeChange(VolumeState.None) },
             onSubmit = { password ->
                 onVolumeChange(VolumeState.Unlocking(volume.partition))
+                // Argon2 runs for seconds against the device handle. Closing
+                // the device during it frees what the derivation is reading
+                // through, so this counts as busy like everything else.
+                onBusyChange(true)
                 scope.launch {
                     onVolumeChange(unlock(context, device, volume.partition, password))
+                    onBusyChange(false)
                 }
             },
         )
@@ -477,6 +423,8 @@ private fun OpenDeviceBody(
         is VolumeState.Unlocked -> UnlockedBody(
             state = volume,
             onVolumeChange = onVolumeChange,
+            busy = busy,
+            onBusyChange = onBusyChange,
             scope = scope,
         )
 
@@ -488,7 +436,11 @@ private fun OpenDeviceBody(
         }
     }
 
-    Button(onClick = onClose) { Text("Close device") }
+    // Gated, which it was not before: this closes the volume *and* the device,
+    // and the device close also releases the USB interface and the file
+    // descriptor the Rust side reads through. Tapped during any of the above it
+    // frees a handle an IO thread is still using.
+    Button(onClick = onClose, enabled = !busy) { Text("Close device") }
 }
 
 @Composable
@@ -534,6 +486,8 @@ private fun PasswordPrompt(
 private fun UnlockedBody(
     state: VolumeState.Unlocked,
     onVolumeChange: (VolumeState) -> Unit,
+    busy: Boolean,
+    onBusyChange: (Boolean) -> Unit,
     scope: kotlinx.coroutines.CoroutineScope,
 ) {
     val context = LocalContext.current
@@ -541,7 +495,6 @@ private fun UnlockedBody(
 
     var path by remember { mutableStateOf("/") }
     var entries by remember { mutableStateOf(state.entries) }
-    var busy by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf<String?>(null) }
     // Which file the pending "create document" dialog is for. The launcher
     // callback carries only the destination Uri, not what we were exporting.
@@ -561,7 +514,7 @@ private fun UnlockedBody(
         val source = pendingExport
         pendingExport = null
         if (uri == null || source == null) return@rememberLauncherForActivityResult
-        busy = true
+        onBusyChange(true)
         scope.launch {
             status = exportFile(context, state.volume, source, uri) { done, total ->
                 // Compose snapshot state is safe to write from any thread, so
@@ -570,12 +523,12 @@ private fun UnlockedBody(
                 status = "copying ${source.substringAfterLast('/')} — $pct% " +
                     "(${formatSize(done)} of ${formatSize(total)})"
             }
-            busy = false
+            onBusyChange(false)
         }
     }
 
     fun navigate(to: String) {
-        busy = true
+        onBusyChange(true)
         status = null
         scope.launch {
             try {
@@ -585,7 +538,7 @@ private fun UnlockedBody(
             } catch (e: Exception) {
                 status = "cannot open $to: ${e.message}"
             }
-            busy = false
+            onBusyChange(false)
         }
     }
 
@@ -644,10 +597,10 @@ private fun UnlockedBody(
                     TextButton(
                         onClick = {
                             status = "hashing ${entry.name}…"
-                            busy = true
+                            onBusyChange(true)
                             scope.launch {
                                 status = hashFile(state.volume, full)
-                                busy = false
+                                onBusyChange(false)
                             }
                         },
                         enabled = !busy,
@@ -661,6 +614,66 @@ private fun UnlockedBody(
 
     status?.let {
         Text(it, style = MaterialTheme.typography.bodySmall)
+    }
+
+    // A plumbing proof for the write path — debug builds only, and the only
+    // way a write is reachable from the app at all today.
+    //
+    // It replaces an `adb shell am start --ez` intent trigger, which was the
+    // wrong shape twice over. It never fired: the extra key in the code and
+    // the key in every documented command did not match, and nothing noticed
+    // because no hardware run had happened. And getting the signal from
+    // `onNewIntent` into a composable needed a StateFlow and a LaunchedEffect,
+    // which brought their own bugs — the effect cancelled on re-trigger while
+    // the blocking JNI call underneath carried on regardless, and rapid
+    // triggers conflated into one run. A button has none of that: it is a
+    // click handler in the composable that already holds the volume, and it
+    // sets the same `busy` flag every other operation here sets.
+    //
+    // It also closes the exported-activity question. `exported="true"` is
+    // required for `USB_DEVICE_ATTACHED`, so any installed app could send the
+    // trigger intent once the key was fixed; there is no longer an intent to
+    // send.
+    if (BuildConfig.DEBUG) {
+        TextButton(
+            onClick = {
+                if (!state.volume.canWrite) {
+                    status = "this .so was not built with --write"
+                    Trace.e("debug write: this .so was not built with --write")
+                    return@TextButton
+                }
+                onBusyChange(true)
+                status = "writing a test file…"
+                val name = "debug-write-${System.currentTimeMillis()}.txt"
+                val content = "written by the debug button\n".toByteArray()
+                scope.launch {
+                    try {
+                        val ino = withContext(Dispatchers.IO) {
+                            state.volume.writeFile(name, content)
+                        }
+                        // Shapes, not names — the file is on an encrypted
+                        // drive and this is the system log. Same rule as
+                        // everywhere else in this file.
+                        Trace.i("debug write: ok, inode=$ino, ${content.size} bytes")
+                        // Re-listed so the write is visible without navigating
+                        // away and back. Re-listing is also the cheapest proof
+                        // available that it reached the volume at all.
+                        entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
+                        status = "wrote $name (inode $ino)"
+                    } catch (e: LuksException) {
+                        Trace.e("debug write: failed [${e.code}] ${e.message}")
+                        status = "write failed [${e.code}] ${e.message}"
+                    } catch (e: Exception) {
+                        Trace.e("debug write: failed", e)
+                        status = "write failed: ${e.message}"
+                    }
+                    onBusyChange(false)
+                }
+            },
+            enabled = !busy,
+        ) {
+            Text("Debug: write test file")
+        }
     }
 
     Button(
