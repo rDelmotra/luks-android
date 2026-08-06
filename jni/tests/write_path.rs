@@ -314,6 +314,15 @@ fn a_second_volume_on_one_device_cannot_also_write() {
         err.to_string().contains("already the writer"),
         "the refusal should say why: {err}"
     );
+    // Its own code, not `UNSUPPORTED`. That is what the btrfs refusal below
+    // returns, and the two arriving at the UI as the same number left it
+    // unable to tell "close the other volume" from "this filesystem cannot be
+    // written at all" — two remedies with nothing in common.
+    assert_eq!(
+        error_code(&err),
+        code::WRITER_BUSY,
+        "the writer refusal must be distinguishable from the btrfs one: {err}"
+    );
 
     // The second volume can still read, which is the point of allowing it.
     second.list_dir_json("/").expect("the second volume must still read");
@@ -387,4 +396,108 @@ fn writing_to_btrfs_is_refused_by_name() {
         "the refusal should name the filesystem it refused: {msg}"
     );
     assert_eq!(error_code(&err), code::UNSUPPORTED);
+}
+
+#[test]
+fn two_threads_writing_through_one_volume_are_never_told_another_volume_has_it() {
+    // The writer claim used to be a load followed by a compare_exchange, taken
+    // *before* the filesystem lock. Two threads on the same handle could both
+    // read `holds_writer == false`, both attempt the exchange, and the loser
+    // was told "another unlocked volume on this device is already the writer" —
+    // about itself. Not corrupting, since the `fs` mutex serialised the real
+    // work either way, but a false statement, and the one a caller would act on
+    // by hunting for a volume that does not exist.
+    //
+    // One-sided by nature: it can only ever catch the race by observing it, so
+    // a pass is evidence rather than proof. What it does do reliably is fail if
+    // the claim is ever moved back out from under the lock and the interleaving
+    // happens to land, which is the regression worth guarding.
+    let path = scratch("same-volume-threads");
+    let vol = unlock(&path);
+
+    let results = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..2)
+            .map(|i| {
+                let vol = &vol;
+                s.spawn(move || vol.write_file(&format!("thread-{i}.txt"), b"concurrent\n"))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread did not panic"))
+            .collect::<Vec<_>>()
+    });
+
+    for (i, r) in results.iter().enumerate() {
+        match r {
+            Ok(_) => {}
+            Err(e) => assert_ne!(
+                error_code(e),
+                code::WRITER_BUSY,
+                "thread {i} was told another volume held the writer, but there \
+                 is only one volume — it raced against itself: {e}"
+            ),
+        }
+    }
+    assert!(
+        results.iter().all(|r| r.is_ok()),
+        "both writes through one volume should succeed: {results:?}"
+    );
+}
+
+#[test]
+fn a_write_that_runs_out_of_room_leaves_the_filesystem_clean() {
+    // The failure paths *inside* `write_new_file_runs` — a mid-loop allocation
+    // failure, more than four extents, a failed data write, a failed inode
+    // record — used to unwind through a local closure rather than through
+    // `undo_new_file`, and that closure had the opposite ordering: blocks freed
+    // before the inode that pointed at them, the inode's own free result
+    // discarded, no flush. There is one rollback now, and this is the path that
+    // used to reach the other one; nothing covered it before.
+    //
+    // What this can and cannot show: it proves the rollback frees everything it
+    // took, because `e2fsck` counts. It cannot show the ordering matters — that
+    // argument is about which of two states an *interruption* leaves behind,
+    // and a host test that runs to completion never occupies either.
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("nospace-rollback");
+    {
+        let vol = unlock(&path);
+        let free = {
+            let v: serde_json::Value =
+                serde_json::from_str(&vol.info_json()).expect("volume info");
+            v["sizeBytes"].as_u64().expect("size")
+        };
+        // A perfectly good name, so the refusal comes from the allocator rather
+        // than from validation — the closure's territory, not `create_file`'s.
+        let err = vol
+            .write_file("too-big.txt", &vec![0u8; free as usize])
+            .expect_err("a payload larger than the volume must be refused");
+        assert_eq!(
+            error_code(&err),
+            code::NO_SPACE,
+            "expected the allocator to run out, not something else: {err}"
+        );
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "a rolled-back write left the filesystem dirty:\n{text}"
+    );
 }

@@ -136,6 +136,18 @@ pub enum LuksError {
     #[error("a file with that name already exists here")]
     AlreadyExists(String),
 
+    /// Another unlocked volume on the same device already holds the write
+    /// claim. Only one may allocate at a time: each unlock caches its own copy
+    /// of the superblock counters and group descriptors, and two of those
+    /// allocating against one disk produce overlapping files.
+    ///
+    /// Its own variant rather than a reused `UnsupportedFsFeature` because the
+    /// caller's remedy is specific and actionable — close the other volume —
+    /// and is nothing like the remedy for "this volume is btrfs", which the
+    /// two used to be indistinguishable from at the JNI boundary.
+    #[error("another unlocked volume on this device is already the writer — close it first")]
+    WriterBusy,
+
     /// No group had a free block the allocator could reach. Note that on a
     /// filesystem with uninitialised groups this can mean "full" long before
     /// the drive is — see the note in `fs::ext4::alloc`.

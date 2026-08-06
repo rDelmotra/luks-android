@@ -421,3 +421,98 @@ fn verify_script() -> Option<String> {
         .unwrap_or(false);
     up.then_some(script)
 }
+
+// --- the inode record at allocation time ------------------------------------
+
+fn le16(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+fn le32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+/// Where inode `ino`'s record lives, worked out from the on-disk superblock and
+/// group descriptor **by this test**.
+///
+/// Deliberately not `Ext4::inode_offset`. The claim under test is about what is
+/// on the medium, and asking the code under test where to look would let a
+/// wrong offset agree with itself. These are the field offsets from the ext4
+/// on-disk layout, read from the image the same way `dumpe2fs` would.
+fn inode_record_offset(img: &[u8], ino: u64) -> (u64, usize) {
+    const SB: usize = 1024;
+    let first_data_block = le32(img, SB + 0x14) as u64;
+    let block_size = 1024u64 << le32(img, SB + 0x18);
+    let inodes_per_group = le32(img, SB + 0x28) as u64;
+    let inode_size = le16(img, SB + 0x58) as usize;
+    let incompat = le32(img, SB + 0x60);
+    let desc_size = match le16(img, SB + 0xFE) {
+        0 => 32usize,
+        // 64BIT is what makes the larger descriptor meaningful; without it the
+        // field is present but the high halves are not to be trusted.
+        n if incompat & 0x80 != 0 => n as usize,
+        _ => 32,
+    };
+
+    let g = ((ino - 1) / inodes_per_group) as usize;
+    let index = ((ino - 1) % inodes_per_group) as usize;
+
+    let gdt = (first_data_block + 1) * block_size;
+    let d = gdt as usize + g * desc_size;
+    let mut table = le32(img, d + 0x08) as u64;
+    if desc_size >= 64 {
+        table |= (le32(img, d + 0x28) as u64) << 32;
+    }
+
+    (table * block_size + (index * inode_size) as u64, inode_size)
+}
+
+#[test]
+fn an_allocated_inode_record_is_blanked_before_the_bitmap_claims_it() {
+    // The bitmap bit is set here; the real record is not written until
+    // `write_inode_record`, which on a phone transfer runs only after every
+    // data block has crossed the USB cable — minutes, for a file of any size.
+    // For that whole window the slot reads as "in use" while the record still
+    // describes whatever occupied it before. If that stale record came from a
+    // deleted file, its extents still name blocks, and an interruption leaves
+    // a live-looking inode whose contents are a deleted file's plaintext under
+    // a new name. On a volume that exists for confidentiality that is the
+    // failure that matters, so the record is blanked at allocation time.
+    //
+    // The stale record is synthesised rather than found: this crate's own
+    // `free_inode` zeroes on the way out, so a slot only holds a stale record
+    // when some other implementation — mke2fs, the kernel — left it there.
+    for name in FIXTURES {
+        // Which inode the allocator hands out is deterministic for a given
+        // fixture, so a throwaway copy answers that without spending the
+        // allocation on the copy being tested.
+        let ino = {
+            let probe = scratch(name, "blank-probe");
+            let mut fs = open(&probe);
+            fs.alloc_inode(false).expect("probe alloc")
+        };
+
+        let path = scratch(name, "blank-record");
+        let (offset, inode_size) = inode_record_offset(&bytes(&path), ino);
+
+        // A pattern no real record could be mistaken for, and one that is
+        // still there byte-for-byte if nothing blanks it.
+        let mut img = bytes(&path);
+        img[offset as usize..offset as usize + inode_size].fill(0xAB);
+        std::fs::write(&path, &img).expect("poison the record");
+
+        {
+            let mut fs = open(&path);
+            assert_eq!(fs.alloc_inode(false).expect("alloc"), ino, "{name}");
+            fs.flush().expect("flush");
+        }
+
+        let after = bytes(&path);
+        let record = &after[offset as usize..offset as usize + inode_size];
+        assert!(
+            record.iter().all(|&b| b == 0),
+            "{name}: inode {ino} is marked in use with a record still holding \
+             its previous occupant — {} of {inode_size} bytes left unblanked",
+            record.iter().filter(|&&b| b != 0).count(),
+        );
+    }
+}

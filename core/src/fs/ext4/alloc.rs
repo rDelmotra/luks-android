@@ -316,6 +316,29 @@ impl<D: WriteAt> Ext4<D> {
                 self.groups[g].itable_unused = unused;
             }
 
+            // Erase the record before the bitmap claims the slot — the mirror
+            // of the argument in `free_inode`, and for the same reason.
+            //
+            // The record is not written for real until `write_inode_record`,
+            // which on this path runs only after every data block has crossed
+            // the cable: minutes, on USB, with a file of any size. For that
+            // whole window the bitmap says "in use" while the record still
+            // describes whatever occupied the slot before — typically a
+            // deleted file, with its extents still naming blocks. Interrupted
+            // there, `e2fsck` finds a live-looking inode pointing at blocks
+            // that are now somebody else's, and the file reads back as a
+            // deleted file's plaintext under a new name. On a volume that
+            // exists for confidentiality that is the failure that matters.
+            //
+            // Zeroed first, the same interruption leaves "in use, record
+            // zeroed", which `e2fsck` resolves by marking the inode free. A
+            // repair complaint instead of a disclosure. The reverse order
+            // would reintroduce the window it is meant to close, so the write
+            // goes before the commit, not after.
+            let blank = vec![0u8; self.sb.inode_size as usize];
+            let offset = self.inode_offset(ino)?;
+            self.device.write_at(offset, &blank)?;
+
             self.commit(g, Bitmap::Inode, &bm, &seed)?;
             return Ok(ino);
         }

@@ -170,15 +170,13 @@ impl<D: WriteAt> Ext4<D> {
 
         let ino = self.alloc_inode(false)?;
 
+        // Every failure below unwinds through `undo_new_file`, the same
+        // rollback `create_file` uses. This used to be a local closure with the
+        // opposite ordering — blocks freed first, the inode last with its
+        // result discarded, and no flush — which is exactly the shape
+        // `undo_new_file`'s comment argues against. Two implementations of one
+        // operation meant the fix landed on one of them; there is now one.
         let mut runs: Vec<Run> = Vec::new();
-        let rollback = |fs: &mut Self, runs: &[Run], ino: u64| {
-            for r in runs {
-                for b in 0..r.len {
-                    let _ = fs.free_block(r.physical + b);
-                }
-            }
-            let _ = fs.free_inode(ino, false);
-        };
 
         let mut last_physical: Option<u64> = None;
         for logical in 0..blocks_needed {
@@ -186,7 +184,7 @@ impl<D: WriteAt> Ext4<D> {
             let phys = match self.alloc_block(goal) {
                 Ok(p) => p,
                 Err(e) => {
-                    rollback(self, &runs, ino);
+                    self.undo_new_file(ino, &runs);
                     return Err(e);
                 }
             };
@@ -198,7 +196,7 @@ impl<D: WriteAt> Ext4<D> {
                 _ => {
                     if runs.len() == MAX_INLINE_EXTENTS {
                         self.free_block(phys).ok();
-                        rollback(self, &runs, ino);
+                        self.undo_new_file(ino, &runs);
                         return Err(LuksError::UnsupportedFsFeature(
                             "file needs more than 4 extents — interior extent \
                              nodes are not yet implemented"
@@ -216,7 +214,7 @@ impl<D: WriteAt> Ext4<D> {
         }
 
         if let Err(e) = self.write_file_data(&runs, data) {
-            rollback(self, &runs, ino);
+            self.undo_new_file(ino, &runs);
             return Err(e);
         }
 
@@ -224,12 +222,12 @@ impl<D: WriteAt> Ext4<D> {
         // else's deleted plaintext: the data must be on the medium before the
         // inode that names those blocks is. See `create_file`.
         if let Err(e) = self.flush() {
-            rollback(self, &runs, ino);
+            self.undo_new_file(ino, &runs);
             return Err(e);
         }
 
         if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed) {
-            rollback(self, &runs, ino);
+            self.undo_new_file(ino, &runs);
             return Err(e);
         }
 

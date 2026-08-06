@@ -73,6 +73,11 @@ pub mod code {
     /// twice is ordinary, and the UI's answer is "rename or replace", not
     /// "your filesystem is damaged".
     pub const ALREADY_EXISTS: i32 = 15;
+    /// Another unlocked volume on this device holds the write claim. Split
+    /// from `UNSUPPORTED`, which it used to share with "this volume is
+    /// btrfs" — two refusals whose remedies have nothing in common, arriving
+    /// at the UI as the same number.
+    pub const WRITER_BUSY: i32 = 16;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -96,6 +101,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
         AlreadyExists(_) => code::ALREADY_EXISTS,
+        WriterBusy => code::WRITER_BUSY,
         WrongWriteTarget { .. } => code::WRONG_TARGET,
         UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
@@ -729,19 +735,19 @@ impl VolumeHandle {
         // So the claim is taken here, by the first write, rather than at
         // unlock — refusing a second unlock outright would break a UI that
         // re-prompts for a password without closing the first volume.
-        if !self.holds_writer.load(Ordering::Acquire) {
-            self.device_writer
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| {
-                    LuksError::UnsupportedFsFeature(
-                        "another unlocked volume on this device is already the \
-                         writer — close it before writing through this one"
-                            .into(),
-                    )
-                })?;
-            self.holds_writer.store(true, Ordering::Release);
-        }
-
+        // Taken *under the filesystem lock*, and after the btrfs refusal below.
+        //
+        // Under the lock because the two-step "load, then compare_exchange"
+        // raced with itself otherwise: two threads writing through the *same*
+        // handle could both read `holds_writer == false`, both attempt the
+        // exchange, and the loser would be told another volume held the claim —
+        // a statement that was simply false. The `fs` mutex already serialises
+        // the work these two threads came to do, so it serialises the claim
+        // too, and the second one now sees the flag this one set.
+        //
+        // After the btrfs check because a volume that cannot be written must
+        // not walk away holding the device's only write claim until it is
+        // closed, locking out the ext4 volume that could have used it.
         let mut fs = self.fs();
         let Fs::Ext4(ext4) = &mut *fs else {
             // Refused explicitly rather than by falling through to a missing
@@ -752,6 +758,13 @@ impl VolumeHandle {
                 "writing to btrfs — this volume can be read but not written".into(),
             ));
         };
+
+        if !self.holds_writer.load(Ordering::Acquire) {
+            self.device_writer
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| LuksError::WriterBusy)?;
+            self.holds_writer.store(true, Ordering::Release);
+        }
 
         let ino = ext4.create_file(2, name, data, FileType::Regular)?;
         ext4.flush()?;

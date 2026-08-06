@@ -35,5 +35,13 @@ class LuksException(message: String, val code: Int) : Exception(message) {
         const val UNVERIFIABLE_TARGET = 14
         /** A name already taken in the directory being written to. */
         const val ALREADY_EXISTS = 15
+
+        /**
+         * Another unlocked volume on the same device already holds the write
+         * claim; close it before writing through this one. Distinct from
+         * [UNSUPPORTED] — which it used to arrive as, indistinguishable from
+         * "this volume is btrfs" — because the remedy is specific.
+         */
+        const val WRITER_BUSY = 16
     }
 }
