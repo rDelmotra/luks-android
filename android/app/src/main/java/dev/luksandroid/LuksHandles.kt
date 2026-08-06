@@ -219,6 +219,32 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         )
     }
 
+    /**
+     * Whether this process can write to this volume at all.
+     *
+     * Checks the `.so`, not the volume — a volume on read-only storage or on
+     * an unsupported filesystem still fails at [writeFile] itself, with the
+     * specific reason as a [LuksException]. This only answers "does the code
+     * to try even exist here".
+     */
+    val canWrite: Boolean get() = LuksNative.nativeWriteSupported()
+
+    /**
+     * Creates [name] in the volume's root directory holding [data], returning
+     * its inode number.
+     *
+     * Check [canWrite] first. Calling this when it is false is not a caught
+     * error — the symbol does not exist in a `.so` without the write path,
+     * and the failure is an `UnsatisfiedLinkError`, not a [LuksException].
+     *
+     * Blocking: this is the whole write, including the flush through the USB
+     * bridge. Off the main thread, same as [unlock].
+     */
+    fun writeFile(name: String, data: ByteArray): Long {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeWriteFile(handle, name, data)
+    }
+
     /** Dropping this zeroes the master key held on the Rust side. */
     override fun close() {
         if (handle != 0L) {

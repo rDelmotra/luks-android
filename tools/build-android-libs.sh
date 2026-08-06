@@ -11,9 +11,16 @@
 #   tools/build-android-libs.sh              # arm64 only, release  (the Pixel)
 #   tools/build-android-libs.sh --debug      # unoptimised
 #   tools/build-android-libs.sh --all-abis   # arm64 + armv7 + x86_64
+#   tools/build-android-libs.sh --debug --write   # + the write path — debug only
 #
 # ⚠️  --debug builds AES ~60x slower and Argon2 slower still. Use it to chase a
 #     crash, never to judge performance.
+#
+# ⚠️  --write links `dangerous-write-support` into the .so. It only makes sense
+#     paired with --debug, and this script refuses any other combination —
+#     the whole safety argument of this project is that a release build has no
+#     write code in it at all, and that must hold no matter which tool built
+#     the .so. Never distribute a .so built with --write.
 
 set -euo pipefail
 
@@ -23,15 +30,24 @@ JNILIBS="$ROOT/android/app/src/main/jniLibs"
 
 PROFILE=release
 ABIS=(arm64-v8a)
+WRITE=0
 
 for arg in "$@"; do
     case "$arg" in
         --debug)     PROFILE=debug ;;
         --release)   PROFILE=release ;;
         --all-abis)  ABIS=(arm64-v8a armeabi-v7a x86_64) ;;
+        --write)     WRITE=1 ;;
         *) echo "unknown option: $arg" >&2; exit 2 ;;
     esac
 done
+
+if [[ "$WRITE" == 1 && "$PROFILE" != debug ]]; then
+    echo "refusing: --write only makes sense with --debug." >&2
+    echo "A release .so must never contain the write path — see" >&2
+    echo "tools/verify-no-write-code.sh, which checks exactly this." >&2
+    exit 2
+fi
 
 # Android ABI name -> Rust target triple. These names are not interchangeable
 # and getting them backwards puts an arm64 .so in the armeabi-v7a directory,
@@ -57,10 +73,13 @@ command -v aarch64-linux-android29-clang >/dev/null \
 
 flags=()
 [[ "$PROFILE" == release ]] && flags+=(--release)
+[[ "$WRITE" == 1 ]] && flags+=(--features dangerous-write-support)
 
 for abi in "${ABIS[@]}"; do
     triple="$(target_for "$abi")"
-    echo "==> $abi ($triple, $PROFILE)"
+    tag="$PROFILE"
+    [[ "$WRITE" == 1 ]] && tag="$tag, write-enabled"
+    echo "==> $abi ($triple, $tag)"
     cargo build -p luks_jni --target "$triple" "${flags[@]}"
 
     src="$ROOT/target/$triple/$PROFILE/libluks_jni.so"
@@ -76,6 +95,11 @@ done
 if [[ -f "$JNILIBS/arm64-v8a/libluks_jni.so" ]]; then
     file "$JNILIBS/arm64-v8a/libluks_jni.so" | grep -q 'ARM aarch64' \
         || { echo "arm64-v8a/libluks_jni.so is not an aarch64 ELF" >&2; exit 1; }
+fi
+
+if [[ "$WRITE" == 1 ]]; then
+    echo "⚠️  this .so has the write path linked in — rebuild without --write" >&2
+    echo "    before doing anything except deliberately testing writes." >&2
 fi
 
 echo "==> done. Now: cd android && ./gradlew installDebug"

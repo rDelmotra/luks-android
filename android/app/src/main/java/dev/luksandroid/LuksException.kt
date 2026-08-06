@@ -30,5 +30,10 @@ class LuksException(message: String, val code: Int) : Exception(message) {
         const val IO = 9
         const val BAD_HANDLE = 10
         const val PANIC = 11
+        const val NO_SPACE = 12
+        const val WRONG_TARGET = 13
+        const val UNVERIFIABLE_TARGET = 14
+        /** A name already taken in the directory being written to. */
+        const val ALREADY_EXISTS = 15
     }
 }

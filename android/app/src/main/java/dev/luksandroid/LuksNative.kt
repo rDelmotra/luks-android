@@ -95,4 +95,35 @@ internal object LuksNative {
      * these are the CPU-side ceilings the read pipeline can never exceed.
      */
     external fun nativeSelfTest(mib: Int): String
+
+    // ------------------------------------------------------------ write path
+
+    /**
+     * Whether this `.so` was built with the write path linked in.
+     *
+     * Present in **every** build and answers honestly in each — ask this
+     * rather than assuming the `.so` matches the Gradle build type. It is
+     * built by `tools/build-android-libs.sh`, a separate tool that can be run
+     * with different flags than the APK around it, so the two can disagree.
+     *
+     * Call this before [nativeWriteFile]. A `.so` without the write path does
+     * not export that symbol at all — calling it there is not a caught
+     * [LuksException], it is an `UnsatisfiedLinkError`.
+     */
+    external fun nativeWriteSupported(): Boolean
+
+    /**
+     * Creates a file in the volume's root directory holding [data], returning
+     * its inode number.
+     *
+     * **Only linkable when the loaded `.so` was built with
+     * `dangerous-write-support`** (`tools/build-android-libs.sh --debug
+     * --write`). Every call site must check [nativeWriteSupported] first — see
+     * that doc for what happens if it does not.
+     *
+     * Slow and blocking: it allocates every block, writes them, and flushes
+     * all the way through the USB bridge before returning. Never on the main
+     * thread.
+     */
+    external fun nativeWriteFile(handle: Long, name: String, data: ByteArray): Long
 }

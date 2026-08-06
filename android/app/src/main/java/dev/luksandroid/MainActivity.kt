@@ -2,6 +2,7 @@ package dev.luksandroid
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -31,6 +32,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,6 +46,8 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -82,6 +87,37 @@ private object Trace {
 }
 
 /**
+ * A plumbing proof for the write path, reached only from outside the app —
+ * not a feature, and not a button anyone ships.
+ *
+ * ```
+ * adb shell am start -n dev.luksandroid/.MainActivity --ez debug_write_test true
+ * ```
+ *
+ * run while the app is already open with a volume unlocked. [MainActivity] is
+ * `singleTask`, so that second `am start` does not relaunch it — it arrives
+ * through `onNewIntent`, which is what lets the trigger reach a screen that is
+ * already composed and already holding the unlocked volume this needs.
+ *
+ * A [StateFlow] rather than a direct call because `onNewIntent` runs on the
+ * Activity, not inside Compose, and this is the plain way to hand a signal
+ * from one to the other without threading a callback through everything in
+ * between. The counter (not a `Boolean`) is so a second `am start` while the
+ * first write is still running is not silently indistinguishable from the
+ * first — every firing gets a distinct value.
+ */
+private object DebugWriteTrigger {
+    private val counter = MutableStateFlow(0L)
+    val signal: StateFlow<Long> = counter
+
+    fun fire() {
+        counter.value += 1
+    }
+}
+
+private const val EXTRA_DEBUG_WRITE_TEST = "dev.luksandroid.extra.DEBUG_WRITE_TEST"
+
+/**
  * Pass 3: unlock and browse.
  *
  * Adds password entry, the [UnlockService]-wrapped unlock, and a root
@@ -117,6 +153,8 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        handleDebugWriteIntent(intent)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -124,6 +162,20 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        // singleTask means every later `am start` lands here, not in a fresh
+        // onCreate — this is the path the debug write trigger actually uses.
+        handleDebugWriteIntent(intent)
+    }
+
+    private fun handleDebugWriteIntent(intent: Intent?) {
+        if (!BuildConfig.DEBUG) return
+        if (intent?.getBooleanExtra(EXTRA_DEBUG_WRITE_TEST, false) != true) return
+        Trace.i("debug write trigger received")
+        DebugWriteTrigger.fire()
     }
 }
 
@@ -169,6 +221,41 @@ private fun DiagnosticsScreen() {
 
     fun keyOf(t: UsbMassStorage.Target) =
         "${t.device.vendorId}:${t.device.productId}:${t.usbInterface.id}"
+
+    // See DebugWriteTrigger's doc: this is the far end of an `adb shell am
+    // start ... --ez debug_write_test true`, not a UI a released app ships
+    // with. Keyed on the signal value, not on Unit, so a second trigger while
+    // the volume is unchanged still re-runs the effect.
+    val debugWriteSignal by DebugWriteTrigger.signal.collectAsState()
+    LaunchedEffect(debugWriteSignal) {
+        if (debugWriteSignal == 0L) return@LaunchedEffect
+        val unlocked = volume as? VolumeState.Unlocked
+        if (unlocked == null) {
+            Trace.e("debug write: no unlocked volume to write to")
+            return@LaunchedEffect
+        }
+        if (!unlocked.volume.canWrite) {
+            Trace.e("debug write: this .so was not built with --write")
+            return@LaunchedEffect
+        }
+        val name = "debug-write-$debugWriteSignal.txt"
+        val content =
+            "written by the debug trigger, signal $debugWriteSignal\n".toByteArray()
+        try {
+            val ino = withContext(Dispatchers.IO) { unlocked.volume.writeFile(name, content) }
+            Trace.i("debug write: ok, inode=$ino, ${content.size} bytes")
+            // Refreshed so the write is visible without also navigating away
+            // and back — the whole point of the trigger is to prove the write
+            // reached the volume, and re-listing is the cheapest proof there
+            // is that it did.
+            val entries = withContext(Dispatchers.IO) { unlocked.volume.listDir("/") }
+            volume = VolumeState.Unlocked(unlocked.volume, entries)
+        } catch (e: LuksException) {
+            Trace.e("debug write: failed [${e.code}] ${e.message}")
+        } catch (e: Exception) {
+            Trace.e("debug write: failed", e)
+        }
+    }
 
     Column(
         modifier = Modifier
