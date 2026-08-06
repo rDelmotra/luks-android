@@ -717,6 +717,10 @@ private suspend fun openDevice(
                 "${device.info.partitions.size} partitions, " +
                 "${device.luksPartitions.size} LUKS"
         )
+        // Only present in a write-enabled build. It is the answer to "why did
+        // the drive refuse WRITE(10)", and it has to be captured at open —
+        // asking after a failure is too late once the volume is gone.
+        device.info.writeProbe?.let { Trace.i("write probe: $it") }
         DeviceState.Open(device)
     } catch (e: LuksException) {
         Trace.e("open: failed [${e.code}] ${e.message}")

@@ -40,6 +40,15 @@ data class DeviceInfo(
     val sizeBytes: Long,
     val tableKind: String,
     val partitions: List<PartitionInfo>,
+    /**
+     * What the drive answered when asked which write commands it accepts,
+     * probed once at open. Null in a build without the write path, which is
+     * most of them.
+     *
+     * Carries opcode names, a write-protect bit and sense codes — nothing from
+     * the volume — so unlike almost everything else here it is safe to log.
+     */
+    val writeProbe: String?,
 )
 
 data class VolumeInfo(
@@ -275,6 +284,7 @@ private fun parseDeviceInfo(json: String): DeviceInfo {
         sizeBytes = o.getLong("sizeBytes"),
         tableKind = o.optString("tableKind"),
         partitions = parts,
+        writeProbe = if (o.isNull("writeProbe")) null else o.optString("writeProbe"),
     )
 }
 

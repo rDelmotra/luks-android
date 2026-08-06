@@ -21,6 +21,7 @@ const OP_READ_CAPACITY_10: u8 = 0x25;
 const OP_READ_10: u8 = 0x28;
 const OP_READ_16: u8 = 0x88;
 const OP_READ_CAPACITY_16: u8 = 0x9E;
+const OP_MODE_SENSE_6: u8 = 0x1A;
 /// Write opcodes exist only with `dangerous-write-support`. This is the
 /// literal statement of the safety guarantee: without the feature, the byte
 /// `0x2A` is never assembled into a command block, so no build of this crate
@@ -29,6 +30,10 @@ const OP_READ_CAPACITY_16: u8 = 0x9E;
 const OP_WRITE_10: u8 = 0x2A;
 #[cfg(feature = "dangerous-write-support")]
 const OP_WRITE_16: u8 = 0x8A;
+/// Probed for, never issued for real: some bridges implement only one of the
+/// write forms, and which one is a question only the drive can answer.
+#[cfg(feature = "dangerous-write-support")]
+const OP_WRITE_12: u8 = 0xAA;
 /// SYNCHRONIZE CACHE(10). A USB bridge acknowledges a write once it is in the
 /// bridge's own buffer, not once it is on flash, so without this a "completed"
 /// write can still be lost to a yanked cable.
@@ -447,6 +452,62 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         // borrow it does not need; the copy is the cheaper mistake.
         let mut data = buf[..expected].to_vec();
         self.command(cdb, Direction::Out, &mut data)
+    }
+
+    /// Read the mode parameter header and report the medium's write-protect
+    /// bit — bit 7 of the device-specific parameter, byte 2.
+    ///
+    /// Read-only, and the direct answer to "is this drive refusing writes
+    /// because it considers itself read-only". Not behind the write feature:
+    /// knowing a drive is write-protected is useful precisely to a build that
+    /// cannot write.
+    pub fn is_write_protected(&self) -> Result<bool> {
+        let mut cdb = vec![0u8; 6];
+        cdb[0] = OP_MODE_SENSE_6;
+        cdb[2] = 0x3F; // all pages
+        cdb[4] = 4; // just the header
+        let mut buf = [0u8; 4];
+        self.command(cdb, Direction::In, &mut buf)?;
+        Ok(buf[2] & 0x80 != 0)
+    }
+
+    /// Ask the drive which write opcodes it will accept, **without writing
+    /// anything**.
+    ///
+    /// A `WRITE(10)` refused as "invalid command operation code" is not
+    /// credible on its face — every USB stick implements it — so the useful
+    /// question is what the drive *will* accept. Each opcode here is issued
+    /// with a transfer length of zero blocks, which those commands define as a
+    /// legal no-op: the drive validates the opcode and transfers nothing.
+    ///
+    /// `WRITE(6)` is deliberately absent. Its 5-bit transfer length treats
+    /// zero as **256 blocks**, not none, so the one probe that looks safest
+    /// would be the only destructive one.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn probe_write_support(&self) -> Vec<(&'static str, Result<()>)> {
+        let mut out: Vec<(&'static str, Result<()>)> = Vec::new();
+
+        let zero_length = |name: &'static str, cdb: Vec<u8>| -> (&'static str, Result<()>) {
+            (name, self.command(cdb, Direction::None, &mut []).map(|_| ()))
+        };
+
+        let mut w10 = vec![0u8; 10];
+        w10[0] = OP_WRITE_10;
+        out.push(zero_length("WRITE(10)", w10));
+
+        let mut w12 = vec![0u8; 12];
+        w12[0] = OP_WRITE_12;
+        out.push(zero_length("WRITE(12)", w12));
+
+        let mut w16 = vec![0u8; 16];
+        w16[0] = OP_WRITE_16;
+        out.push(zero_length("WRITE(16)", w16));
+
+        let mut sync = vec![0u8; 10];
+        sync[0] = OP_SYNCHRONIZE_CACHE_10;
+        out.push(zero_length("SYNCHRONIZE CACHE(10)", sync));
+
+        out
     }
 
     /// Tell the drive to commit its write cache to the medium.

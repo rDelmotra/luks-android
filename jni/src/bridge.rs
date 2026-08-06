@@ -258,6 +258,12 @@ pub struct DeviceHandle {
     /// Where the usbfs transfer limit actually settled, once the kernel has had
     /// its say. `None` for a device that is not usbfs-backed (the tests).
     pub max_transfer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    /// What the drive answered when asked which write commands it accepts,
+    /// filled in at open. `None` for a device that was not opened over USB
+    /// (the tests), and the field does not exist at all without the write
+    /// feature.
+    #[cfg(feature = "dangerous-write-support")]
+    pub write_probe: Option<String>,
 }
 
 /// # Why the filesystem is behind a lock
@@ -373,6 +379,8 @@ impl DeviceHandle {
             product,
             table,
             max_transfer: None,
+            #[cfg(feature = "dangerous-write-support")]
+            write_probe: None,
         })
     }
 
@@ -440,6 +448,11 @@ impl DeviceHandle {
             })
             .collect();
 
+        #[cfg(feature = "dangerous-write-support")]
+        let probe = self.write_probe.clone();
+        #[cfg(not(feature = "dangerous-write-support"))]
+        let probe: Option<String> = None;
+
         json!({
             "vendor": self.vendor,
             "product": self.product,
@@ -448,6 +461,10 @@ impl DeviceHandle {
             "sizeBytes": self.block_count * self.block_size as u64,
             "tableKind": match self.table.kind { TableKind::Gpt => "GPT", TableKind::Mbr => "MBR" },
             "partitions": parts,
+            // Null in a read-only build, and in the tests, which open a file
+            // rather than a drive. Carries opcode names and sense codes only —
+            // nothing from the volume — so it is safe to log.
+            "writeProbe": probe,
         })
         .to_string()
     }
@@ -518,6 +535,16 @@ pub unsafe fn open_usb_device(
     let capacity = scsi.capacity();
     let inquiry = scsi.inquiry()?;
 
+    // Asked once, here, while the concrete SCSI type still exists — past
+    // `DeviceHandle::new` it is a `dyn DeviceIo` and this is unreachable.
+    //
+    // Four zero-length commands and a MODE SENSE. Nothing is written: every
+    // probed opcode is issued with a transfer length of zero blocks, which
+    // those commands define as a legal no-op. Only in a write-enabled build,
+    // where the answer can matter.
+    #[cfg(feature = "dangerous-write-support")]
+    let write_probe = Some(describe_write_support(&scsi));
+
     let mut handle = DeviceHandle::new(
         scsi,
         capacity.block_size,
@@ -526,7 +553,46 @@ pub unsafe fn open_usb_device(
         inquiry.product,
     )?;
     handle.max_transfer = Some(limit);
+    #[cfg(feature = "dangerous-write-support")]
+    {
+        handle.write_probe = write_probe;
+    }
     Ok(handle)
+}
+
+/// What the drive says about being written to, as one loggable line.
+///
+/// Exists because a real Pixel 8 run refused every `WRITE(10)` with
+/// "invalid command operation code" — which is not credible on its face, since
+/// macOS had written to the same stick through the same bridge hours earlier
+/// using the same opcode. Either the drive is answering differently for us, or
+/// it accepts a different write form; both are questions only the drive can
+/// settle, and neither is answerable from a log line that says only that
+/// something failed.
+///
+/// Carries no drive content — opcode names, a write-protect bit and sense
+/// codes — so it is safe to log on a device holding an encrypted volume.
+#[cfg(feature = "dangerous-write-support")]
+fn describe_write_support<T: luks_core::usb::BulkTransport>(
+    scsi: &ScsiBlockDevice<T>,
+) -> String {
+    let wp = match scsi.is_write_protected() {
+        Ok(true) => "write-protected: YES".to_string(),
+        Ok(false) => "write-protected: no".to_string(),
+        Err(e) => format!("write-protected: unknown ({e})"),
+    };
+
+    let ops = scsi
+        .probe_write_support()
+        .into_iter()
+        .map(|(name, r)| match r {
+            Ok(()) => format!("{name}: accepted"),
+            Err(e) => format!("{name}: {e}"),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    format!("{wp}; {ops}")
 }
 
 impl VolumeHandle {
