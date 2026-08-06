@@ -62,6 +62,32 @@ fn record_len(name_len: usize) -> usize {
     (DIRENT_HEADER + name_len).div_ceil(4) * 4
 }
 
+/// Whether a name can be a directory entry at all.
+///
+/// A pure function of the name, deliberately: it costs nothing, so anything
+/// about to do expensive work on a caller's behalf can check *first*. That is
+/// not hypothetical tidiness — creating a file writes every one of its blocks
+/// before reaching [`Ext4::link_file`], so without an early check a 40 MiB
+/// upload over USB is spent in full and then rejected for a slash in the name,
+/// with the failure reported as "no space" because the transient allocation is
+/// what ran out.
+pub(crate) fn validate_name(name: &[u8]) -> Result<()> {
+    if name.is_empty() || name.len() > 255 {
+        return Err(LuksError::CorruptFs("directory entry name length"));
+    }
+    // A name containing '/' or NUL cannot be looked up and would make the
+    // filesystem describe a path that cannot exist.
+    if name.contains(&b'/') || name.contains(&0) {
+        return Err(LuksError::CorruptFs("directory entry name characters"));
+    }
+    // "." and ".." already exist in every directory and mean something to the
+    // walker; a second one would be a directory that cannot be traversed.
+    if name == b"." || name == b".." {
+        return Err(LuksError::CorruptFs("directory entry name is . or .."));
+    }
+    Ok(())
+}
+
 fn type_code(t: FileType) -> u8 {
     match t {
         FileType::Regular => 1,
@@ -93,14 +119,7 @@ impl<D: WriteAt> Ext4<D> {
         let seed = Seed::for_writing(&self.sb)?;
 
         let name_bytes = name.as_bytes();
-        if name_bytes.is_empty() || name_bytes.len() > 255 {
-            return Err(LuksError::CorruptFs("directory entry name length"));
-        }
-        // A name containing '/' or NUL cannot be looked up and would make the
-        // filesystem describe a path that cannot exist.
-        if name_bytes.contains(&b'/') || name_bytes.contains(&0) {
-            return Err(LuksError::CorruptFs("directory entry name characters"));
-        }
+        validate_name(name_bytes)?;
 
         let dir = self.read_inode(dir_ino)?;
         if !dir.file_type().is_dir() {
@@ -125,7 +144,7 @@ impl<D: WriteAt> Ext4<D> {
             ));
         }
         if self.find_entry(&dir, name_bytes)?.is_some() {
-            return Err(LuksError::CorruptFs("a directory entry already exists"));
+            return Err(LuksError::AlreadyExists(name.to_string()));
         }
 
         let bs = self.sb.block_size as usize;

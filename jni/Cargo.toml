@@ -11,6 +11,14 @@ name = "luks_jni"
 # `rlib` as well so the crate's own integration tests can call into `bridge`.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Off by default, exactly as in `luks_core`. A release build of the app must
+# not contain the write path at all — not disabled, absent — which is what
+# `tools/verify-no-write-code.sh` checks for the library and the Android build
+# checks for the `.so`. Turning this on changes what `SharedDevice` can do, so
+# it is not a switch that can be flipped without the write code coming along.
+dangerous-write-support = ["luks_core/dangerous-write-support"]
+
 [dependencies]
 luks_core = { path = "../core" }
 luks_usbfs = { path = "../usbfs" }

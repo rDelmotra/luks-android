@@ -339,6 +339,16 @@ impl<D: WriteAt> Ext4<D> {
         let g = ((ino - 1) / per) as usize;
         let bit = ((ino - 1) % per) as usize;
 
+        // `s_inodes_count` is not proof that the group exists: `groups` is
+        // sized from the block count, and nothing on disk guarantees the two
+        // agree. A superblock claiming more inodes than its groups can hold
+        // would otherwise index past the end and panic — in a library whose
+        // whole input is attacker- or failure-controlled metadata.
+        // `inode_offset` has always got this right; this did not.
+        if g >= self.groups.len() {
+            return Err(LuksError::BadInode(ino));
+        }
+
         // Same refusal as `free_block`'s: an uninitialised group's bitmap was
         // never written, so reading it yields noise — and if a noise bit
         // happened to be set, the "freed" bitmap written back would be noise
@@ -355,6 +365,28 @@ impl<D: WriteAt> Ext4<D> {
         if !test_bit(&bm, bit) {
             return Err(LuksError::CorruptFs("double free of an inode"));
         }
+
+        // Clearing the bitmap bit does not, on its own, make an inode free.
+        // `e2fsck` walks the inode *table* independently of the bitmap, and a
+        // record still carrying a mode and a link count is reported as an
+        // unattached inode however the bitmap reads — which is precisely what
+        // a rolled-back `create_file` used to leave behind, with the freed
+        // block showing up as a bitmap difference alongside it.
+        //
+        // Erased before the bitmap is committed, not after. Neither order has
+        // a clean crash window, so this is the lesser of two: interrupted
+        // here, the slot reads as "in use, record zeroed", which `e2fsck`
+        // resolves by marking it free — it is losing an inode that was
+        // already being discarded. The other order leaves a live-looking file
+        // in a slot the bitmap has already offered to the next allocation.
+        //
+        // This is deliberately *not* conditional on how the inode was written.
+        // The slot may hold a stale record from an earlier deletion by some
+        // other implementation, and an allocation that rolls back must not
+        // resurrect it.
+        let blank = vec![0u8; self.sb.inode_size as usize];
+        let offset = self.inode_offset(ino)?;
+        self.device.write_at(offset, &blank)?;
 
         clear_bit(&mut bm, bit);
         self.groups[g].free_inodes_count += 1;

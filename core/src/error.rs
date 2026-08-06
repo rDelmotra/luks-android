@@ -121,6 +121,21 @@ pub enum LuksError {
     #[error("corrupt filesystem structure: {0}")]
     CorruptFs(&'static str),
 
+    /// A name already taken in the directory being written to.
+    ///
+    /// Distinct from [`LuksError::CorruptFs`] on purpose: a caller creating a
+    /// file whose name is already there has done something ordinary and
+    /// recoverable — pick another name — and telling the user their filesystem
+    /// is corrupt would be both alarming and false.
+    ///
+    /// The name is carried for a caller that wants it but deliberately kept
+    /// **out of the message**. This text crosses into a Java exception and is
+    /// a strong candidate for a log; filenames on an encrypted volume are
+    /// among the things that volume exists to conceal, and the caller that
+    /// chose the name already knows it.
+    #[error("a file with that name already exists here")]
+    AlreadyExists(String),
+
     /// No group had a free block the allocator could reach. Note that on a
     /// filesystem with uninitialised groups this can mean "full" long before
     /// the drive is — see the note in `fs::ext4::alloc`.

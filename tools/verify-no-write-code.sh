@@ -70,4 +70,44 @@ if [ "$DEFAULT_HITS" -ne 0 ]; then
     exit 1
 fi
 
+# --- the JNI entry point ----------------------------------------------------
+#
+# Stronger than the rlib check above, and worth having separately: the library
+# the app actually loads is a cdylib, and a JNI entry point is `#[no_mangle]`
+# and non-generic, so it is either an exported symbol or it does not exist.
+# There is no "compiled but unreachable" middle state to argue about — which
+# makes this the one artifact-level check that proves what it claims.
+DYLIB_HITS() {
+    # cdylib extension differs by host; the Android build produces the .so.
+    for f in target/debug/libluks_jni.dylib target/debug/libluks_jni.so; do
+        [ -f "$f" ] && { nm -gU "$f" 2>/dev/null | grep -cE 'nativeWriteFile' || true; return; }
+    done
+    echo "MISSING"
+}
+
+cargo build -p luks_jni >/dev/null 2>&1 || { echo "jni default build failed" >&2; exit 2; }
+JNI_DEFAULT="$(DYLIB_HITS)"
+cargo build -p luks_jni --features dangerous-write-support >/dev/null 2>&1 || {
+    echo "jni control build failed" >&2; exit 2; }
+JNI_CONTROL="$(DYLIB_HITS)"
+
+cargo build -p luks_jni >/dev/null 2>&1 || true
+
+echo "jni default: ${JNI_DEFAULT} nativeWriteFile exports"
+echo "jni control: ${JNI_CONTROL} nativeWriteFile exports"
+
+if [ "$JNI_DEFAULT" = "MISSING" ] || [ "$JNI_CONTROL" = "MISSING" ]; then
+    echo "VACUOUS: no cdylib was found to inspect — the check proved nothing." >&2
+    exit 1
+fi
+if [ "$JNI_CONTROL" -eq 0 ]; then
+    echo "VACUOUS: the control build exports no nativeWriteFile either, so this" >&2
+    echo "check is not measuring anything. Fix the check before trusting it." >&2
+    exit 1
+fi
+if [ "$JNI_DEFAULT" -ne 0 ]; then
+    echo "FAIL: a default JNI build exports nativeWriteFile — the app could write" >&2
+    exit 1
+fi
+
 echo "VERDICT: clean — the control can see write code, and the default build has none"

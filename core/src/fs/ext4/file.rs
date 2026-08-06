@@ -1,13 +1,18 @@
 //! Writing a file's inode, data blocks and extent tree.
 //!
-//! What this produces is deliberately incomplete: an inode with content, not a
-//! file anyone can open by name. No directory entry is written here — that is
-//! a separate pass, once this one is proven. Until then, the inode this
-//! module creates is an **orphan**: allocated, holding real data, but reachable
-//! by nothing. `e2fsck` will say so — "Unattached inode N", "ref count is 1,
+//! [`Ext4::write_new_file`] deliberately produces something incomplete: an
+//! inode with content, not a file anyone can open by name. The inode it
+//! creates is an **orphan** — allocated, holding real data, reachable by
+//! nothing. `e2fsck` will say so — "Unattached inode N", "ref count is 1,
 //! should be 0" — and that complaint is *expected*, not a sign of corruption.
-//! The oracle test for this module asserts exactly that distinction: those two
-//! complaints and nothing else.
+//! The oracle test for that function asserts exactly those two complaints and
+//! nothing else.
+//!
+//! [`Ext4::create_file`] is the one callers should reach for: it pairs that
+//! write with the directory link from [`super::dirent`], and undoes the write
+//! if the link fails, so it either produces a named file or leaves nothing
+//! behind. The two-call sequence remains available for the oracle test that
+//! needs to observe the orphan state on purpose.
 //!
 //! # Extent placement
 //!
@@ -69,6 +74,96 @@ impl<D: WriteAt> Ext4<D> {
     /// On any failure every block and the inode allocated so far are freed
     /// before returning, so a failed write cannot leak space.
     pub fn write_new_file(&mut self, data: &[u8]) -> Result<u64> {
+        self.write_new_file_runs(data).map(|(ino, _)| ino)
+    }
+
+    /// Create a file *and* give it a name, or leave the filesystem as it was.
+    ///
+    /// # Why this exists rather than two calls
+    ///
+    /// [`write_new_file`](Self::write_new_file) rolls back its own failures,
+    /// and [`link_file`](Self::link_file) refuses cleanly, so each is safe
+    /// alone. The gap is *between* them: once the data is written and the link
+    /// then fails — a name already taken, an htree directory, an I/O error —
+    /// the inode is allocated, holds real data, and nothing references it.
+    /// `e2fsck` calls that an unattached inode, and every caller sequencing the
+    /// two calls by hand had to remember to undo the first. Callers do not
+    /// remember; that is what this is for.
+    ///
+    /// A duplicate name is the realistic trigger, not an exotic one — it is
+    /// what happens the second time someone sends the same file.
+    ///
+    /// # Ordering
+    ///
+    /// Two barriers, and both are load-bearing rather than caution:
+    ///
+    /// * **Data before the inode that points at it.** Without this, metadata
+    ///   can reach the medium while the data behind it does not, and the file
+    ///   then reads back whatever those blocks held before — on a drive that
+    ///   has seen deletions, a previously deleted file's plaintext, under a
+    ///   new name. On a volume whose whole purpose is confidentiality that is
+    ///   the worst of the failure modes, not the mildest.
+    /// * **The inode before the name that reaches it.** A dirent pointing at
+    ///   an inode that never landed is a directory entry for a file that
+    ///   cannot be read.
+    ///
+    /// Both cost a flush, which on USB is a `SYNCHRONIZE CACHE` round trip.
+    /// Three per file, counting the caller's final one. That is the price of
+    /// the guarantee and it is not adjustable from here.
+    pub fn create_file(
+        &mut self,
+        dir_ino: u64,
+        name: &str,
+        data: &[u8],
+        file_type: crate::fs::FileType,
+    ) -> Result<u64> {
+        // Before anything is allocated. A name that cannot be linked is worth
+        // discovering now rather than after every block of the file has
+        // crossed a USB cable — and the error then names the real problem
+        // instead of surfacing as "no space" when the transient allocation is
+        // what ran out.
+        super::dirent::validate_name(name.as_bytes())?;
+
+        let (ino, runs) = self.write_new_file_runs(data)?;
+        self.flush()?;
+
+        if let Err(e) = self.link_file(dir_ino, name, ino, file_type) {
+            self.undo_new_file(ino, &runs);
+            return Err(e);
+        }
+
+        Ok(ino)
+    }
+
+    /// Undo a file that was written but never named.
+    ///
+    /// Order matters more than it looks. The inode goes first — [`free_inode`]
+    /// zeroes its record, so after that step nothing on disk points at these
+    /// blocks. Freeing the blocks first would leave, for the width of the
+    /// window, an inode still marked in use whose extents name blocks the
+    /// bitmap has already offered to the next allocation: two files, same
+    /// blocks. That is the one outcome `e2fsck` cannot repair without losing
+    /// something.
+    ///
+    /// Flushed at the end because a rollback that only reaches the bridge's
+    /// write cache is not a rollback — and the failure that got us here is
+    /// disproportionately likely to be a link that is about to disappear.
+    /// Errors are swallowed deliberately: the caller is owed the reason the
+    /// write failed, not the reason the cleanup did.
+    fn undo_new_file(&mut self, ino: u64, runs: &[Run]) {
+        let _ = self.free_inode(ino, false);
+        for r in runs {
+            for b in 0..r.len {
+                let _ = self.free_block(r.physical + b);
+            }
+        }
+        let _ = self.flush();
+    }
+
+    /// The body of [`write_new_file`], keeping the block runs so a caller that
+    /// needs to undo the whole thing can free exactly what was allocated
+    /// without re-parsing the extent tree it just wrote.
+    fn write_new_file_runs(&mut self, data: &[u8]) -> Result<(u64, Vec<Run>)> {
         let seed = Seed::for_writing(&self.sb)?;
         let bs = self.sb.block_size as u64;
         let blocks_needed = (data.len() as u64).div_ceil(bs.max(1));
@@ -125,12 +220,20 @@ impl<D: WriteAt> Ext4<D> {
             return Err(e);
         }
 
+        // The barrier that keeps a file from ever reading back as somebody
+        // else's deleted plaintext: the data must be on the medium before the
+        // inode that names those blocks is. See `create_file`.
+        if let Err(e) = self.flush() {
+            rollback(self, &runs, ino);
+            return Err(e);
+        }
+
         if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed) {
             rollback(self, &runs, ino);
             return Err(e);
         }
 
-        Ok(ino)
+        Ok((ino, runs))
     }
 
     fn write_file_data(&mut self, runs: &[Run], data: &[u8]) -> Result<()> {

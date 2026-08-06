@@ -19,7 +19,7 @@
 //! of a 3 MiB one with a single group, and most of those groups flagged
 //! BLOCK_UNINIT so the allocator has to skip them.
 
-use luks_core::device::{FileDevice, WriteAt};
+use luks_core::device::FileDevice;
 use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
 use luks_core::luks::{self, LuksVolume};
@@ -104,8 +104,11 @@ fn run(
         fs.superblock().free_blocks_count
     );
 
-    let ino = fs.write_new_file(content)?;
-    fs.link_file(2, dest, ino, FileType::Regular)?;
+    // One call, not `write_new_file` then `link_file`: the two-call sequence
+    // leaves an allocated, unreferenced inode behind if the link fails — most
+    // often because the name is already taken, which is what happens the
+    // second time this is run with the same arguments.
+    let ino = fs.create_file(2, dest, content, FileType::Regular)?;
 
     // Without this the write can still be sitting in a cache when the cable
     // comes out, which is the normal way a person ends a transfer.

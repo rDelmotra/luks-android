@@ -434,3 +434,55 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSelfTest<'l>(
         out_string(env, &json)
     })
 }
+
+// ---------------------------------------------------------------------- write
+
+/// Whether this library was built with the write path in it.
+///
+/// Present in **both** builds, and answering honestly in each. It exists so
+/// Kotlin can ask rather than assume its own build flavour matches the `.so`
+/// it happened to load — those are produced by different tools and can
+/// disagree. Without it the only way to find out is to call `nativeWriteFile`
+/// and catch `UnsatisfiedLinkError`, which is a poor way to learn a static
+/// fact.
+///
+/// Nothing declares this on the Kotlin side yet; wiring it into `LuksNative`
+/// is part of the Android pass, not this one.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteSupported<'l>(
+    _env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jni::sys::jboolean {
+    u8::from(cfg!(feature = "dangerous-write-support"))
+}
+
+/// Create a file in the volume's root directory. Returns its inode number.
+///
+/// **This symbol does not exist in a default build.** That is the point: a
+/// release `.so` cannot be made to write by any argument, because there is
+/// nothing in it to call. `nativeWriteSupported` above is how Kotlin finds
+/// that out before trying.
+///
+/// Slow and blocking — it allocates, writes every block, and then flushes all
+/// the way through the USB bridge. Same rule as `nativeUnlock`: never on the
+/// UI thread.
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    name: JString<'l>,
+    data: JByteArray<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        // SAFETY: validated against the volume magic tag.
+        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let name = jstr(env, &name)?;
+        let bytes = env.convert_byte_array(&data).map_err(|e| {
+            Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}"))
+        })?;
+        let ino = vol.write_file(&name, &bytes)?;
+        Ok(ino as jlong)
+    })
+}

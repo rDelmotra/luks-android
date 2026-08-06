@@ -68,6 +68,11 @@ pub mod code {
     /// byte count does not match this device", 14 means "this path cannot be
     /// checked — is it present and readable?".
     pub const UNVERIFIABLE_TARGET: i32 = 14;
+    /// The name is already taken in that directory. Emphatically not
+    /// `CORRUPT`, which is what this used to surface as: sending the same file
+    /// twice is ordinary, and the UI's answer is "rename or replace", not
+    /// "your filesystem is damaged".
+    pub const ALREADY_EXISTS: i32 = 15;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -90,6 +95,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
+        AlreadyExists(_) => code::ALREADY_EXISTS,
         WrongWriteTarget { .. } => code::WRONG_TARGET,
         UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
@@ -121,12 +127,52 @@ pub fn error_code(e: &LuksError) -> i32 {
 /// Cloning shares; it does not reopen. That is what lets a wrong password leave
 /// the device handle usable for another attempt instead of forcing the app back
 /// through USB permission.
+///
+/// # Why the trait object changes with the feature
+///
+/// With `dangerous-write-support` this holds a `dyn WriteAt`, not a
+/// `dyn ReadAt`. Since `WriteAt: ReadAt`, every read path is unchanged and
+/// keeps working through the same object. The alternative considered was a
+/// second write-capable constructor beside this one, and rejected: a safety
+/// property that holds only when the caller picks the right one of two doors
+/// is decoration. Here a build either has the write path everywhere or does
+/// not have it at all.
+///
+/// What this does **not** do is make "writable" a type-level fact.
+/// `impl WriteAt for FileDevice` is unconditional and checks its own
+/// `writable` flag at runtime, so a read-only `FileDevice` still satisfies the
+/// bound and fails at the syscall instead of at compile time. The real gate on
+/// writing a device is `FileDevice::open_writable` and its size confirmation;
+/// this bound only decides whether the write path exists in the build.
 #[derive(Clone)]
-pub struct SharedDevice(Arc<Mutex<dyn ReadAt + Send>>);
+pub struct SharedDevice {
+    inner: Arc<Mutex<dyn DeviceIo + Send>>,
+    /// Whether some volume on this device has claimed the right to write.
+    ///
+    /// Shared by every clone, which is what makes it mean "this device"
+    /// rather than "this handle". See [`VolumeHandle::write_file`] for why a
+    /// device may have only one writer.
+    writer: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What a device must be able to do for this build: read only by default,
+/// read *and* write when the write path is compiled in.
+#[cfg(not(feature = "dangerous-write-support"))]
+pub trait DeviceIo: ReadAt {}
+#[cfg(not(feature = "dangerous-write-support"))]
+impl<T: ReadAt + ?Sized> DeviceIo for T {}
+
+#[cfg(feature = "dangerous-write-support")]
+pub trait DeviceIo: luks_core::device::WriteAt {}
+#[cfg(feature = "dangerous-write-support")]
+impl<T: luks_core::device::WriteAt + ?Sized> DeviceIo for T {}
 
 impl SharedDevice {
-    pub fn new<D: ReadAt + Send + 'static>(device: D) -> Self {
-        SharedDevice(Arc::new(Mutex::new(device)))
+    pub fn new<D: DeviceIo + Send + 'static>(device: D) -> Self {
+        SharedDevice {
+            inner: Arc::new(Mutex::new(device)),
+            writer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     /// A poisoned lock means some earlier call panicked mid-read. The device
@@ -137,8 +183,10 @@ impl SharedDevice {
     // object lifetime defaults to 'static, but in a `MutexGuard<'_, dyn ..>`
     // return type it defaults to the guard's own lifetime. Spelling it out keeps
     // the two the same type.
-    fn lock(&self) -> std::sync::MutexGuard<'_, dyn ReadAt + Send + 'static> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock(&self) -> std::sync::MutexGuard<'_, dyn DeviceIo + Send + 'static> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -149,6 +197,19 @@ impl ReadAt for SharedDevice {
 
     fn len(&self) -> Option<u64> {
         self.lock().len()
+    }
+}
+
+/// Writes go through the same single lock the reads do, for the same reason:
+/// two Java threads interleaving on one bulk pipe desynchronise the device.
+#[cfg(feature = "dangerous-write-support")]
+impl luks_core::device::WriteAt for SharedDevice {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        self.lock().write_at(offset, buf)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.lock().flush()
     }
 }
 
@@ -193,9 +254,58 @@ pub struct DeviceHandle {
     pub max_transfer: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
+/// # Why the filesystem is behind a lock
+///
+/// Writing needs `&mut` — `write_new_file` mutates the in-memory superblock
+/// counters and group descriptors before they reach the disk. Java holds an
+/// opaque `long` and nothing stops it calling from two threads, so handing out
+/// `&mut` from a shared handle would be undefined behaviour in the one crate
+/// where `unsafe` is allowed at all.
+///
+/// A lock here rather than an `unsafe` accessor also buys a correctness
+/// property the device-level lock cannot: `SharedDevice` serialises individual
+/// reads and writes, but an allocation is *several* of them — read the bitmap,
+/// set a bit, write it back — and a read interleaved mid-sequence sees ext4
+/// state that never existed on disk. This makes each filesystem operation
+/// whole.
 pub struct VolumeHandle {
-    pub fs: MountedFs,
+    fs: Mutex<MountedFs>,
     pub partition_offset: u64,
+    /// The device's writer flag, shared with every other volume on it.
+    /// See [`VolumeHandle::write_file`].
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path claims it")
+    )]
+    device_writer: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether *this* volume is the one holding that flag, so dropping it
+    /// releases the claim only if it made it.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path claims it")
+    )]
+    holds_writer: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for VolumeHandle {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.holds_writer.load(Ordering::Acquire) {
+            self.device_writer.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl VolumeHandle {
+    /// A poisoned lock means an earlier call panicked partway through a
+    /// filesystem operation. Unlike the device, this *does* have invariants a
+    /// panic could have broken, so recovering the guard is a considered
+    /// trade: the alternative is a permanently dead volume handle for the rest
+    /// of the session, and the filesystem's real state is on the disk to be
+    /// re-checked either way.
+    fn fs(&self) -> std::sync::MutexGuard<'_, MountedFs> {
+        self.fs.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// The filesystem inside an unlocked volume.
@@ -240,7 +350,7 @@ impl SubvolumesJson for MountedFs {
 impl DeviceHandle {
     /// Build from anything readable. The USB path goes through
     /// [`open_usb_device`]; tests hand in an in-memory image.
-    pub fn new<D: ReadAt + Send + 'static>(
+    pub fn new<D: DeviceIo + Send + 'static>(
         device: D,
         block_size: u32,
         block_count: u64,
@@ -365,8 +475,10 @@ impl DeviceHandle {
         )?;
         let fs = MountedFs::mount(volume)?;
         Ok(VolumeHandle {
-            fs,
+            fs: Mutex::new(fs),
             partition_offset,
+            device_writer: Arc::clone(&self.dev.writer),
+            holds_writer: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -421,20 +533,25 @@ impl VolumeHandle {
     /// empty string would make "unnamed" indistinguishable from "named with an
     /// empty string".
     pub fn info_json(&self) -> String {
+        let fs = self.fs();
         json!({
             "partitionOffset": self.partition_offset,
-            "fsType": self.fs.kind().name(),
-            "label": self.fs.label(),
-            "uuid": format_uuid(&self.fs.uuid()),
-            "blockSize": self.fs.block_size(),
-            "sizeBytes": self.fs.size_bytes(),
-            "subvolumes": self.fs.subvolumes_json(),
+            "fsType": fs.kind().name(),
+            "label": fs.label(),
+            "uuid": format_uuid(&fs.uuid()),
+            "blockSize": fs.block_size(),
+            "sizeBytes": fs.size_bytes(),
+            "subvolumes": fs.subvolumes_json(),
+            // Absent from a read-only build rather than false: the UI should
+            // find out what this library can do by asking it, not by assuming
+            // its own build flavour matches.
+            "canWrite": cfg!(feature = "dangerous-write-support"),
         })
         .to_string()
     }
 
     pub fn list_dir_json(&self, path: &str) -> Result<String> {
-        let mut entries = self.fs.list_dir(path)?;
+        let mut entries = self.fs().list_dir(path)?;
         // "." and ".." are real dirents; the UI never wants them, and filtering
         // here keeps every future shell from re-deciding it.
         entries.retain(|e| e.name != "." && e.name != "..");
@@ -467,7 +584,7 @@ impl VolumeHandle {
     }
 
     pub fn file_info_json(&self, path: &str) -> Result<String> {
-        let info = self.fs.file_info(path)?;
+        let info = self.fs().file_info(path)?;
         Ok(json!({
             "path": path,
             "size": info.size,
@@ -489,7 +606,7 @@ impl VolumeHandle {
     /// gigabyte file would blow the app heap long before the read finished.
     /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
     pub fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let info = self.fs.file_info(path)?;
+        let info = self.fs().file_info(path)?;
         if info.size > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
@@ -497,17 +614,17 @@ impl VolumeHandle {
                 info.size, max_bytes
             )));
         }
-        self.fs.read_file(path)
+        self.fs().read_file(path)
     }
 
     /// Fill `buf` from `offset`, returning how many bytes were written.
     /// A short return means end of file.
     pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let file = self.fs.open(path)?;
+        let file = self.fs().open(path)?;
         if !file.file_type().is_file() {
             return Err(LuksError::IsADirectory(path.to_string()));
         }
-        self.fs.read_open(&file, offset, buf)
+        self.fs().read_open(&file, offset, buf)
     }
 
     /// Hash a file without ever holding it in memory.
@@ -519,7 +636,7 @@ impl VolumeHandle {
     pub fn sha256_json(&self, path: &str, chunk_bytes: usize) -> Result<String> {
         use sha2::{Digest, Sha256};
 
-        let file = self.fs.open(path)?;
+        let file = self.fs().open(path)?;
         let size = file.size();
         // 0 means "pick something sensible". An explicit value is honoured down
         // to 8 bytes so the streaming loop can be tested against the small
@@ -538,7 +655,10 @@ impl VolumeHandle {
 
         while done < size {
             let want = std::cmp::min(chunk as u64, size - done) as usize;
-            let got = self.fs.read_open(&file, done, &mut buf[..want])?;
+            // Re-locked each iteration rather than held across the whole hash: a
+            // 1 GiB file is minutes of USB, and holding it would stall every
+            // other call on the volume for that long.
+            let got = self.fs().read_open(&file, done, &mut buf[..want])?;
             if got == 0 {
                 break;
             }
@@ -560,6 +680,82 @@ impl VolumeHandle {
             } else { 0 },
         })
         .to_string())
+    }
+}
+
+/// Writing, which exists only when the write path was compiled in.
+///
+/// This is a separate `impl` block rather than a method with a runtime check,
+/// so that a read-only build does not merely refuse to write — it has nothing
+/// to refuse *with*.
+#[cfg(feature = "dangerous-write-support")]
+impl VolumeHandle {
+    /// Create `name` in the volume's root directory holding `data`, returning
+    /// the new inode number.
+    ///
+    /// # Scope
+    ///
+    /// Root directory only, one whole file at a time, held in memory. That is
+    /// what the phone needs to prove the path end to end; subdirectories and
+    /// streaming are the next thing, not this thing. The size ceiling is real
+    /// and comes from below: a new inode's extent tree is four inline extents,
+    /// so a file too fragmented to describe in four runs is refused rather
+    /// than truncated.
+    ///
+    /// # Ordering
+    ///
+    /// The flush is not optional and not the caller's to skip. A USB bridge
+    /// acknowledges a write into its own buffer, so without it a "written"
+    /// file is one yanked cable away from never having existed — and pulling
+    /// the cable is how a phone transfer normally ends.
+    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<u64> {
+        use luks_core::fs::MountedFs as Fs;
+        use std::sync::atomic::Ordering;
+
+        // One writer per *device*, not per volume.
+        //
+        // `nativeUnlock` can be called twice on one device handle, and nothing
+        // on the Kotlin side prevents it. Each call mounts its own `Ext4`,
+        // which caches the superblock's free counters and every group
+        // descriptor in memory. Two of those allocating against one disk do
+        // not see each other's bitmap updates: measured, two volumes each
+        // writing one small file left `e2fsck` reporting wrong free counts,
+        // and racing them produced two files owning the same ten blocks —
+        // the one kind of damage `e2fsck` cannot repair without deleting
+        // something.
+        //
+        // A second *reader* is harmless and stays allowed: reads resolve
+        // through the disk, and only allocation depends on the cached state.
+        // So the claim is taken here, by the first write, rather than at
+        // unlock — refusing a second unlock outright would break a UI that
+        // re-prompts for a password without closing the first volume.
+        if !self.holds_writer.load(Ordering::Acquire) {
+            self.device_writer
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| {
+                    LuksError::UnsupportedFsFeature(
+                        "another unlocked volume on this device is already the \
+                         writer — close it before writing through this one"
+                            .into(),
+                    )
+                })?;
+            self.holds_writer.store(true, Ordering::Release);
+        }
+
+        let mut fs = self.fs();
+        let Fs::Ext4(ext4) = &mut *fs else {
+            // Refused explicitly rather than by falling through to a missing
+            // method: btrfs on this volume is a live filesystem we can read
+            // and must not touch, and the caller deserves to be told which of
+            // the two it got.
+            return Err(LuksError::UnsupportedFsFeature(
+                "writing to btrfs — this volume can be read but not written".into(),
+            ));
+        };
+
+        let ino = ext4.create_file(2, name, data, FileType::Regular)?;
+        ext4.flush()?;
+        Ok(ino)
     }
 }
 
@@ -738,9 +934,16 @@ mod tests {
     /// cryptsetup and mke2fs — see tools/README-fixtures.md.
     const PASSWORD: &[u8] = b"test";
 
-    fn disk_image() -> Vec<u8> {
+    /// Read through a `FileDevice` rather than slurped into a `Vec<u8>`.
+    ///
+    /// A `Vec` cannot satisfy `DeviceIo` in a write-enabled build — `write_at`
+    /// takes `&self`, and an in-memory buffer has no interior mutability to
+    /// write through. That is not a limitation to work around: the device
+    /// under a handle is a real device in every build, and the fixture should
+    /// be one too.
+    fn disk_image() -> luks_core::device::FileDevice {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/disks/gpt-luks.img");
-        std::fs::read(path).unwrap_or_else(|e| panic!("{path}: {e}"))
+        luks_core::device::FileDevice::open(path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
     /// The same stack with btrfs inside: GPT, one LUKS2 partition, password
@@ -771,7 +974,7 @@ mod tests {
 
     fn open() -> DeviceHandle {
         let img = disk_image();
-        let blocks = img.len() as u64 / 512;
+        let blocks = img.len().expect("fixture size") / 512;
         DeviceHandle::new(img, 512, blocks, "TEST".into(), "IMAGE".into()).expect("scan")
     }
 
