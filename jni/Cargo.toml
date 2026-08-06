@@ -26,3 +26,10 @@ jni = "0.21"
 serde_json = "1"
 # Streaming verification of a file on the drive without materialising it.
 sha2 = "0.10"
+
+[lints.rust]
+# `aes_armv8` is a custom cfg set in ../.cargo/config.toml — see the long note
+# there. Declared here for the same reason `core` declares it: without it this
+# crate warns on every build, and a build that always prints a warning is a
+# build where a new one goes unnoticed.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aes_armv8)'] }
