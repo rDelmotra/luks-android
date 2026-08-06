@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::MockUsbDrive;
+use common::{fixture, MockUsbDrive};
 use luks_core::device::{ReadAt, WriteAt};
 use luks_core::usb::scsi::ScsiBlockDevice;
 
@@ -177,4 +177,77 @@ fn the_write_path_reaches_a_luks_volume_through_scsi() {
     let fs = MountedFs::mount(&volume).expect("the filesystem must still mount");
     assert_eq!(fs.kind().name(), "ext4");
     fs.list_dir("/").expect("root must still list");
+}
+
+// --- why a drive said no ----------------------------------------------------
+
+#[test]
+fn a_refused_write_carries_the_drive_s_reason() {
+    // The failure this reproduces happened on hardware: a Pixel 8 refused
+    // every WRITE(10) with CSW status 1 while reads kept working perfectly,
+    // and the error reaching the UI was the bare text "SCSI command failed" —
+    // equally consistent with a write-protected drive, a CDB the drive would
+    // not accept, and failing media. The reason exists, but only in response
+    // to a REQUEST SENSE issued before anything else touches the bus.
+    //
+    // 0x27/0x00 is WRITE PROTECTED, under sense key 7 (DATA PROTECT).
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x2A, [0x7, 0x27, 0x00]);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    let err = dev
+        .write_at(0, &[0u8; 512])
+        .expect_err("the mock refuses WRITE(10)");
+
+    let Err(luks_core::error::LuksError::ScsiCommandFailed(Some(sense))) = Err::<(), _>(err) else {
+        panic!("a refusal should carry sense data");
+    };
+    assert_eq!(sense.key, 0x7, "sense key");
+    assert_eq!((sense.asc, sense.ascq), (0x27, 0x00), "ASC/ASCQ");
+
+    let text = luks_core::error::LuksError::ScsiCommandFailed(Some(sense)).to_string();
+    assert!(
+        text.contains("data protect"),
+        "the message should say what happened, not just that it did: {text}"
+    );
+}
+
+#[test]
+fn reads_still_work_while_writes_are_refused() {
+    // Exactly the shape of the hardware failure, and worth pinning: if a
+    // refused write left the bus desynchronised, the next read would fail too
+    // and the diagnosis would point at the wrong layer. On the Pixel a 26-byte
+    // export succeeded after three refused writes.
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x2A, [0x7, 0x27, 0x00]);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert!(dev.write_at(0, &[0u8; 512]).is_err());
+
+    let mut buf = [0u8; 512];
+    dev.read_at(0, &mut buf).expect("reads must survive a refusal");
+    assert_eq!(&buf[510..], &[0x55, 0xAA], "the MBR signature should be there");
+}
+
+#[test]
+fn asking_why_a_failure_happened_does_not_ask_why_that_failed() {
+    // The obvious way to write the sense fetch recurses forever: a failure
+    // triggers REQUEST SENSE, and if REQUEST SENSE is itself refused it
+    // triggers another. A drive that refuses everything is unusual but a
+    // wedged bridge is not, and a stack overflow is a poor way to report one.
+    //
+    // Reaching the assertion at all is the test; `None` says the fetch was
+    // attempted and failed, which is worth distinguishing from a drive that
+    // answered with no sense data.
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+    // Refuse everything only *after* open(), which needs INQUIRY and friends.
+    dev.transport().fail_opcodes.borrow_mut().extend(0u8..=0xFF);
+
+    let err = dev.write_at(0, &[0u8; 512]).expect_err("everything is refused");
+    assert!(
+        matches!(
+            err,
+            luks_core::error::LuksError::ScsiCommandFailed(None)
+        ),
+        "expected a refusal with no obtainable reason, got: {err}"
+    );
 }

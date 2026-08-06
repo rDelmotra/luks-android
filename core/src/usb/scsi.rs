@@ -85,6 +85,70 @@ impl Capacity {
     }
 }
 
+/// Why a drive refused a command, as it reported when asked.
+///
+/// A CSW status of 1 says only "that failed". Every actual reason — write
+/// protected, bad LBA, a field this drive does not accept, a dying medium —
+/// arrives only in response to a REQUEST SENSE issued afterwards, and is lost
+/// the moment any other command is sent. Before this existed, a real
+/// `WRITE(10)` refusal on a Pixel 8 surfaced as the bare text "SCSI command
+/// failed", which is compatible with every one of those causes and identifies
+/// none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sense {
+    /// Sense key: the coarse category, low nibble of byte 2.
+    pub key: u8,
+    /// Additional sense code, and its qualifier — the specific reason.
+    pub asc: u8,
+    pub ascq: u8,
+}
+
+impl Sense {
+    /// Parse a fixed-format sense buffer (response code 0x70/0x71).
+    pub fn parse(b: &[u8; 18]) -> Self {
+        Self {
+            key: b[2] & 0x0F,
+            asc: b[12],
+            ascq: b[13],
+        }
+    }
+
+    /// The sense key in words. Deliberately only the key: the ASC/ASCQ table
+    /// runs to hundreds of entries, most of them irrelevant to a USB stick,
+    /// and a partial table that silently reports the wrong thing is worse than
+    /// printing the numbers and letting them be looked up.
+    pub fn key_text(&self) -> &'static str {
+        match self.key {
+            0x0 => "no sense",
+            0x1 => "recovered error",
+            0x2 => "not ready",
+            0x3 => "medium error",
+            0x4 => "hardware error",
+            0x5 => "illegal request — the drive rejected the command itself",
+            0x6 => "unit attention",
+            0x7 => "data protect — the drive is refusing to be written",
+            0x8 => "blank check",
+            0xB => "aborted command",
+            0xD => "volume overflow",
+            0xE => "miscompare",
+            _ => "unknown sense key",
+        }
+    }
+}
+
+impl std::fmt::Display for Sense {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} (key {:#x}, asc {:#04x}/{:#04x})",
+            self.key_text(),
+            self.key,
+            self.asc,
+            self.ascq
+        )
+    }
+}
+
 /// A USB mass storage device presented as random-access bytes.
 pub struct ScsiBlockDevice<T: BulkTransport> {
     transport: T,
@@ -136,8 +200,21 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.tag.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Run one CBW / data / CSW exchange.
+    /// Run one CBW / data / CSW exchange, asking the drive why on a failure.
     fn command(&self, cdb: Vec<u8>, direction: Direction, data: &mut [u8]) -> Result<usize> {
+        self.command_inner(cdb, direction, data, true)
+    }
+
+    /// `ask_why` exists only to stop the REQUEST SENSE issued after a failure
+    /// from recursing when it is itself the command that failed. Every other
+    /// caller wants it true.
+    fn command_inner(
+        &self,
+        cdb: Vec<u8>,
+        direction: Direction,
+        data: &mut [u8],
+        ask_why: bool,
+    ) -> Result<usize> {
         let tag = self.next_tag();
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
@@ -212,7 +289,20 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 Ok(transferred)
             }
-            CswStatus::Failed => Err(LuksError::ScsiCommandFailed),
+            CswStatus::Failed => {
+                // Immediately, and before anything else touches the bus: sense
+                // data describes the *last* command that failed and a drive is
+                // free to discard it once another command arrives. Fetched
+                // here rather than left to the caller, because by the time an
+                // error has travelled up through ext4, LUKS and JNI there is
+                // no bus left to ask.
+                let sense = if ask_why {
+                    self.request_sense().ok().map(|b| Sense::parse(&b))
+                } else {
+                    None
+                };
+                Err(LuksError::ScsiCommandFailed(sense))
+            }
             CswStatus::PhaseError => {
                 self.transport.reset()?;
                 Err(LuksError::ScsiProtocol("phase error"))
@@ -241,7 +331,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         cdb[0] = OP_REQUEST_SENSE;
         cdb[4] = 18;
         let mut buf = [0u8; 18];
-        self.command(cdb, Direction::In, &mut buf)?;
+        self.command_inner(cdb, Direction::In, &mut buf, false)?;
         Ok(buf)
     }
 

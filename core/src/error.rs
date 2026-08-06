@@ -180,9 +180,17 @@ pub enum LuksError {
     #[error("SCSI protocol error: {0}")]
     ScsiProtocol(&'static str),
 
-    /// The device returned CSW status 1. Call REQUEST SENSE for the reason.
-    #[error("SCSI command failed")]
-    ScsiCommandFailed,
+    /// The device returned CSW status 1, carrying the sense data it gave when
+    /// asked why. `None` means the REQUEST SENSE that follows a failure itself
+    /// failed, which is worth distinguishing from a drive that stayed silent.
+    ///
+    /// This used to be a bare unit variant whose doc said "call REQUEST SENSE
+    /// for the reason" — and nothing ever did. A real `WRITE(10)` refusal on
+    /// hardware therefore reached the UI as the text "SCSI command failed",
+    /// which is equally consistent with a write-protected drive, a CDB the
+    /// drive would not accept, and failing media.
+    #[error("SCSI command failed{}", .0.map(|s| format!(": {s}")).unwrap_or_default())]
+    ScsiCommandFailed(Option<crate::usb::scsi::Sense>),
 
     #[error("USB transfer failed: {0}")]
     UsbTransfer(String),

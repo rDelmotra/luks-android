@@ -57,6 +57,21 @@ pub struct MockUsbDrive {
     pub stats: RefCell<Stats>,
     /// Report capacity via the 0xFFFFFFFF escape, forcing READ CAPACITY(16).
     pub force_rc16: bool,
+    /// Opcodes to answer with CSW status 1 — "that failed" — instead of doing
+    /// them. A real Pixel 8 refused every `WRITE(10)` this way while reads kept
+    /// working, and nothing here could reproduce that: the mock had no way to
+    /// say no.
+    pub fail_opcodes: RefCell<Vec<u8>>,
+    /// The sense key / ASC / ASCQ REQUEST SENSE reports. Zeroes mean "no
+    /// sense", which is what this mock used to answer unconditionally.
+    pub sense: [u8; 3],
+    /// Set when a refused command still has an OUT data phase owed to it: the
+    /// host has already promised those bytes and will send them regardless, so
+    /// they are accepted and dropped rather than written. Reporting the
+    /// failure without draining the phase leaves the host's payload arriving
+    /// where the mock expects the next CBW, which reads as a bad signature —
+    /// a mock artefact that looks nothing like the failure being modelled.
+    pending_fail: std::cell::Cell<bool>,
 }
 
 impl MockUsbDrive {
@@ -69,7 +84,24 @@ impl MockUsbDrive {
             csw: RefCell::new([0u8; CSW_LEN]),
             stats: RefCell::new(Stats::default()),
             force_rc16: false,
+            fail_opcodes: RefCell::new(Vec::new()),
+            sense: [0, 0, 0],
+            pending_fail: std::cell::Cell::new(false),
         }
+    }
+
+    /// Refuse `opcode` with CSW status 1, reporting `sense` when asked why.
+    pub fn failing(mut self, opcode: u8, sense: [u8; 3]) -> Self {
+        self.fail_opcodes.borrow_mut().push(opcode);
+        self.sense = sense;
+        self
+    }
+
+    /// Refuse everything, REQUEST SENSE included. The point is the recursion
+    /// guard: asking why a failure happened must not itself ask why.
+    pub fn failing_everything(mut self) -> Self {
+        self.fail_opcodes = RefCell::new((0u8..=0xFF).collect());
+        self
     }
 
     pub fn with_block_size(mut self, block_size: u32) -> Self {
@@ -124,6 +156,38 @@ impl MockUsbDrive {
             return Ok(());
         }
 
+        if self.fail_opcodes.borrow().contains(&cdb[0]) {
+            self.set_csw(tag, expected_len, 1); // 1 = command failed
+            if expected_len > 0 && wants_out {
+                // Drain what the host is about to send, then fail. A real
+                // bridge may stall the endpoint instead; accepting and
+                // discarding is the other legal answer and is the one that
+                // keeps this mock's phase machine honest.
+                self.pending_fail.set(true);
+                *self.phase.borrow_mut() = Phase::DataOut {
+                    at: 0,
+                    want: expected_len as usize,
+                    got: Vec::new(),
+                    blocks: 0,
+                };
+            } else if expected_len > 0 && wants_in {
+                // Serve the data phase, then fail. A drive that stalls instead
+                // would let the host's recovery path unwind the exchange by
+                // itself — which is what this mock used to do by accident, and
+                // it made a test of the sense-fetch recursion guard pass with
+                // the guard removed. This is the adversarial answer: a clean,
+                // well-formed exchange that ends in "failed", so a host that
+                // asks why after every failure asks forever.
+                *self.phase.borrow_mut() = Phase::DataIn {
+                    data: vec![0u8; expected_len as usize],
+                    pos: 0,
+                };
+            } else {
+                *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
+            }
+            return Ok(());
+        }
+
         let data: Vec<u8> = match cdb[0] {
             // INQUIRY
             0x12 => {
@@ -143,7 +207,10 @@ impl MockUsbDrive {
             0x03 => {
                 let mut d = vec![0u8; 18];
                 d[0] = 0x70; // current error
+                d[2] = self.sense[0]; // sense key, low nibble
                 d[7] = 10;
+                d[12] = self.sense[1]; // ASC
+                d[13] = self.sense[2]; // ASCQ
                 d
             }
             // READ CAPACITY(10)
@@ -284,6 +351,14 @@ impl BulkTransport for MockUsbDrive {
                     let (at, got, blocks) = (*at, std::mem::take(got), *blocks);
                     *phase = Phase::Csw { pos: 0 };
                     drop(phase);
+                    if self.pending_fail.replace(false) {
+                        // Refused: the bytes are dropped, the image is
+                        // untouched, and the CSW set at command time already
+                        // says so. Not counted as a write, because none
+                        // happened — a `bytes_written` assertion must not be
+                        // satisfiable by a command the drive rejected.
+                        return Ok(n);
+                    }
                     self.image.borrow_mut()[at..at + got.len()].copy_from_slice(&got);
                     // Counted here, from the payload that actually arrived —
                     // a `bytes_written` assertion should prove a data phase

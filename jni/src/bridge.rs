@@ -105,7 +105,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         WrongWriteTarget { .. } => code::WRONG_TARGET,
         UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
-        ScsiProtocol(_) | ScsiCommandFailed | UsbTransfer(_) => code::TRANSPORT,
+        ScsiProtocol(_) | ScsiCommandFailed(_) | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,
         ChecksumMismatch
         | Truncated { .. }
@@ -1281,7 +1281,7 @@ mod tests {
     fn error_codes_are_distinct_per_category() {
         assert_eq!(error_code(&LuksError::WrongPassword), code::WRONG_PASSWORD);
         assert_eq!(error_code(&LuksError::NotFound("x".into())), code::NOT_FOUND);
-        assert_eq!(error_code(&LuksError::ScsiCommandFailed), code::TRANSPORT);
+        assert_eq!(error_code(&LuksError::ScsiCommandFailed(None)), code::TRANSPORT);
         assert_eq!(error_code(&LuksError::FsNeedsRecovery), code::NEEDS_FSCK);
         assert_eq!(error_code(&LuksError::BadMagic { found: [0; 6] }), code::NOT_LUKS);
     }
