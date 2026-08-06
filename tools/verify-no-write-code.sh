@@ -110,4 +110,33 @@ if [ "$JNI_DEFAULT" -ne 0 ]; then
     exit 1
 fi
 
+# --- the artifact that actually ships --------------------------------------
+#
+# Everything above inspects target/debug, which is what `cargo build` produces
+# on this Mac. The APK does not contain that file. It contains whatever is in
+# android/app/src/main/jniLibs, put there by tools/build-android-libs.sh, and
+# until this section existed nothing here ever looked at it — so a green run of
+# this script said nothing about the binary a phone would load.
+#
+# This reports rather than fails. A debug .so built with --write is the point
+# of that flag, and a developer mid-write-test should not be told their tree is
+# broken. The gate that *does* fail is `checkNoWriteCodeInRelease` in
+# app/build.gradle.kts, which runs on every release build and cannot be
+# forgotten, because the release build depends on it.
+JNILIB="android/app/src/main/jniLibs/arm64-v8a/libluks_jni.so"
+if [ -f "$JNILIB" ]; then
+    if grep -qa 'nativeWriteFile' "$JNILIB"; then
+        echo
+        echo "⚠️  WARNING: $JNILIB has the write path linked in." >&2
+        echo "    A debug APK built from this tree can write to a drive. That is" >&2
+        echo "    fine while testing writes and wrong the rest of the time." >&2
+        echo "    Rebuild without it:  tools/build-android-libs.sh --debug" >&2
+        echo "    A release build refuses this outright — see checkNoWriteCodeInRelease." >&2
+    else
+        echo "jniLibs .so: no nativeWriteFile — a debug APK from this tree cannot write"
+    fi
+else
+    echo "jniLibs .so: not built (nothing to inspect)"
+fi
+
 echo "VERDICT: clean — the control can see write code, and the default build has none"

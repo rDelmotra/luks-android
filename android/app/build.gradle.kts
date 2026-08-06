@@ -92,6 +92,61 @@ val checkNativeLibs by tasks.registering {
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }
     .configureEach { dependsOn(checkNativeLibs) }
 
+// The claim this project makes about safety is that a release build cannot
+// corrupt a drive because the instruction is not in the binary. Until this
+// task existed that claim was unchecked at the only place it matters: the .so
+// in jniLibs is packaged into *both* variants, checkNativeLibs above asserted
+// only that the file exists, and tools/verify-no-write-code.sh inspects
+// target/debug — never jniLibs. So the one artifact that actually ships was
+// the one nothing looked at, and a release APK built after any
+// `build-android-libs.sh --debug --write` shipped the write path.
+//
+// A JNI entry point is #[no_mangle] and non-generic, so its name is in the
+// .so's dynamic symbol table as literal ASCII or the function does not exist.
+// A byte search finds it without needing llvm-nm on PATH — which matters,
+// because a check that silently skips when a tool is missing is how the last
+// symbol check came to prove nothing for months.
+//
+// Deliberately release-only. A debug .so built with --write is the entire
+// point of that flag, and failing there would make write testing impossible.
+val checkNoWriteCodeInRelease by tasks.registering {
+    val soFile = layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libluks_jni.so")
+    doLast {
+        val needle = "nativeWriteFile".toByteArray(Charsets.US_ASCII)
+        val hay = soFile.asFile.readBytes()
+
+        var found = false
+        outer@ for (i in 0..hay.size - needle.size) {
+            for (j in needle.indices) {
+                if (hay[i + j] != needle[j]) continue@outer
+            }
+            found = true
+            break
+        }
+
+        if (found) {
+            throw GradleException(
+                """
+                ${soFile.asFile.relativeTo(rootDir)} exports nativeWriteFile.
+
+                This is a release build, and a release build must not contain
+                the write path at all. The .so currently in jniLibs was built
+                with --write. Rebuild it without, from the repo root:
+
+                    tools/build-android-libs.sh
+
+                (--write is debug-only and the script already refuses to pair
+                it with --release; this catches the other order — a leftover
+                debug .so being packaged into a release APK.)
+                """.trimIndent()
+            )
+        }
+    }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("ReleaseJniLibFolders") }
+    .configureEach { dependsOn(checkNoWriteCodeInRelease) }
+
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

@@ -80,7 +80,13 @@ for abi in "${ABIS[@]}"; do
     tag="$PROFILE"
     [[ "$WRITE" == 1 ]] && tag="$tag, write-enabled"
     echo "==> $abi ($triple, $tag)"
-    cargo build -p luks_jni --target "$triple" "${flags[@]}"
+    # `${flags[@]+...}` rather than `"${flags[@]}"`: macOS ships bash 3.2,
+    # where expanding an *empty* array under `set -u` is an unbound-variable
+    # error. `flags` is empty for exactly one invocation — a plain `--debug`,
+    # with neither --release nor --write to put an element in it — so that was
+    # the one combination this script could not run, and every prior use
+    # happened to pass one or the other.
+    cargo build -p luks_jni --target "$triple" ${flags[@]+"${flags[@]}"}
 
     src="$ROOT/target/$triple/$PROFILE/libluks_jni.so"
     [[ -f "$src" ]] || { echo "expected $src to exist" >&2; exit 1; }
