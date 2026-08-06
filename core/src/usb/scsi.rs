@@ -39,6 +39,9 @@ const OP_WRITE_12: u8 = 0xAA;
 /// write can still be lost to a yanked cable.
 #[cfg(feature = "dangerous-write-support")]
 const OP_SYNCHRONIZE_CACHE_10: u8 = 0x35;
+/// The 16-byte form, tried when a bridge does not know the 10-byte one.
+#[cfg(feature = "dangerous-write-support")]
+const OP_SYNCHRONIZE_CACHE_16: u8 = 0x91;
 const SA_READ_CAPACITY_16: u8 = 0x10;
 
 /// READ(10) carries a 16-bit block count and a 32-bit LBA.
@@ -88,6 +91,30 @@ impl Capacity {
     pub fn bytes(&self) -> u64 {
         self.blocks * self.block_size as u64
     }
+}
+
+/// A SCSI opcode in words, for error messages.
+///
+/// Only the opcodes this crate issues. Anything else prints as its number,
+/// which is more honest than a guess.
+pub fn opcode_name(op: u8) -> String {
+    let name = match op {
+        0x00 => "TEST UNIT READY",
+        0x03 => "REQUEST SENSE",
+        0x12 => "INQUIRY",
+        0x1A => "MODE SENSE(6)",
+        0x25 => "READ CAPACITY(10)",
+        0x28 => "READ(10)",
+        0x2A => "WRITE(10)",
+        0x35 => "SYNCHRONIZE CACHE(10)",
+        0x88 => "READ(16)",
+        0x8A => "WRITE(16)",
+        0x91 => "SYNCHRONIZE CACHE(16)",
+        0x9E => "READ CAPACITY(16)",
+        0xAA => "WRITE(12)",
+        _ => return format!("command {op:#04x}"),
+    };
+    format!("{name} ({op:#04x})")
 }
 
 /// Why a drive refused a command, as it reported when asked.
@@ -159,6 +186,10 @@ pub struct ScsiBlockDevice<T: BulkTransport> {
     transport: T,
     capacity: Capacity,
     tag: AtomicU32,
+    /// Set once a drive has told us it implements neither form of
+    /// SYNCHRONIZE CACHE. See [`ScsiBlockDevice::synchronize_cache`].
+    #[cfg(feature = "dangerous-write-support")]
+    no_flush_command: std::sync::atomic::AtomicBool,
 }
 
 impl<T: BulkTransport> ScsiBlockDevice<T> {
@@ -171,6 +202,8 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 block_size: 512,
             },
             tag: AtomicU32::new(1),
+            #[cfg(feature = "dangerous-write-support")]
+            no_flush_command: std::sync::atomic::AtomicBool::new(false),
         };
 
         let inquiry = dev.inquiry()?;
@@ -220,6 +253,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         data: &mut [u8],
         ask_why: bool,
     ) -> Result<usize> {
+        let opcode = cdb[0];
         let tag = self.next_tag();
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
@@ -306,7 +340,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 } else {
                     None
                 };
-                Err(LuksError::ScsiCommandFailed(sense))
+                Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
                 self.transport.reset()?;
@@ -507,17 +541,83 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         sync[0] = OP_SYNCHRONIZE_CACHE_10;
         out.push(zero_length("SYNCHRONIZE CACHE(10)", sync));
 
+        let mut sync16 = vec![0u8; 16];
+        sync16[0] = OP_SYNCHRONIZE_CACHE_16;
+        out.push(zero_length("SYNCHRONIZE CACHE(16)", sync16));
+
         out
     }
 
     /// Tell the drive to commit its write cache to the medium.
+    ///
+    /// # When the drive does not have this command
+    ///
+    /// A SanDisk bridge (0781:5591) answers `SYNCHRONIZE CACHE(10)` with
+    /// INVALID COMMAND OPERATION CODE — and because every write ends in a
+    /// flush, that turned every write on that hardware into a failure, with
+    /// the refusal misread as coming from `WRITE(10)`. The 16-byte form is
+    /// tried next, since some bridges implement only one of the two.
+    ///
+    /// If neither exists, this returns `Ok` and stops asking. That is a real
+    /// weakening of a guarantee this crate argues for elsewhere, so it is
+    /// stated plainly rather than buried: **on such a drive a completed write
+    /// is not known to be on the medium.** The reasoning for proceeding
+    /// anyway is that SBC requires a device with no write cache to reject the
+    /// command exactly this way, so "refuses to flush" is the same answer as
+    /// "has nothing to flush" — and the alternative is refusing to write at
+    /// all to hardware the kernel writes to happily. [`flush_is_a_no_op`]
+    /// exposes which case a caller is in.
+    ///
+    /// Only an *invalid opcode* is treated this way. A flush that fails for
+    /// any other reason is still an error: "this drive cannot flush" and "this
+    /// flush did not work" are different facts.
     #[cfg(feature = "dangerous-write-support")]
     pub fn synchronize_cache(&self) -> Result<()> {
+        use std::sync::atomic::Ordering as O;
+
+        if self.no_flush_command.load(O::Acquire) {
+            return Ok(());
+        }
+
+        let unsupported = |e: &LuksError| {
+            matches!(
+                e,
+                LuksError::ScsiCommandFailed {
+                    sense: Some(s),
+                    ..
+                } if s.key == 0x5 && s.asc == 0x20
+            )
+        };
+
         let mut cdb = vec![0u8; 10];
         cdb[0] = OP_SYNCHRONIZE_CACHE_10;
         // LBA 0, count 0 means "everything", which is what a flush wants.
-        self.command(cdb, Direction::None, &mut [])?;
+        match self.command(cdb, Direction::None, &mut []) {
+            Ok(_) => return Ok(()),
+            Err(e) if !unsupported(&e) => return Err(e),
+            Err(_) => {}
+        }
+
+        let mut cdb = vec![0u8; 16];
+        cdb[0] = OP_SYNCHRONIZE_CACHE_16;
+        match self.command(cdb, Direction::None, &mut []) {
+            Ok(_) => return Ok(()),
+            Err(e) if !unsupported(&e) => return Err(e),
+            Err(_) => {}
+        }
+
+        self.no_flush_command.store(true, O::Release);
         Ok(())
+    }
+
+    /// Whether this drive rejected both forms of SYNCHRONIZE CACHE, so a
+    /// flush does nothing and durability rests on the bridge writing through.
+    ///
+    /// `false` until a flush has actually been attempted — it reports what the
+    /// drive has said, not a prediction.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn flush_is_a_no_op(&self) -> bool {
+        self.no_flush_command.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

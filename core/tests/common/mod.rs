@@ -137,7 +137,7 @@ impl MockUsbDrive {
         self.stats.borrow_mut().commands += 1;
 
         let host_expects_in = flags & 0x80 != 0;
-        let mut phase_error = |why: &str| {
+        let phase_error = |why: &str| {
             let _ = why; // named for the reader; the CSW carries only a status
             self.set_csw(tag, expected_len, 2); // 2 = phase error
             *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
@@ -311,7 +311,12 @@ impl MockUsbDrive {
             }
             // SYNCHRONIZE CACHE(10): nothing is cached here, but the command
             // must succeed or a flush looks like a device error.
-            0x35 => {
+            // Both forms of SYNCHRONIZE CACHE. The 16-byte one is here
+            // because a drive that implements only one of the two is exactly
+            // the case the fallback exists for, and a mock that answered the
+            // 16-byte form from its unknown-opcode arm made that fallback
+            // untestable — it looked like a drive with no flush at all.
+            0x35 | 0x91 => {
                 self.stats.borrow_mut().sync_commands += 1;
                 Vec::new()
             }

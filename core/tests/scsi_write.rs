@@ -198,15 +198,24 @@ fn a_refused_write_carries_the_drive_s_reason() {
         .write_at(0, &[0u8; 512])
         .expect_err("the mock refuses WRITE(10)");
 
-    let Err(luks_core::error::LuksError::ScsiCommandFailed(Some(sense))) = Err::<(), _>(err) else {
+    let luks_core::error::LuksError::ScsiCommandFailed {
+        opcode,
+        sense: Some(sense),
+    } = err
+    else {
         panic!("a refusal should carry sense data");
     };
+    assert_eq!(opcode, 0x2A, "the error should name WRITE(10) as the command");
     assert_eq!(sense.key, 0x7, "sense key");
     assert_eq!((sense.asc, sense.ascq), (0x27, 0x00), "ASC/ASCQ");
 
-    let text = luks_core::error::LuksError::ScsiCommandFailed(Some(sense)).to_string();
+    let text = luks_core::error::LuksError::ScsiCommandFailed {
+        opcode,
+        sense: Some(sense),
+    }
+    .to_string();
     assert!(
-        text.contains("data protect"),
+        text.contains("WRITE(10)") && text.contains("data protect"),
         "the message should say what happened, not just that it did: {text}"
     );
 }
@@ -246,8 +255,63 @@ fn asking_why_a_failure_happened_does_not_ask_why_that_failed() {
     assert!(
         matches!(
             err,
-            luks_core::error::LuksError::ScsiCommandFailed(None)
+            luks_core::error::LuksError::ScsiCommandFailed { sense: None, .. }
         ),
         "expected a refusal with no obtainable reason, got: {err}"
+    );
+}
+
+// --- a drive with no flush command ------------------------------------------
+
+/// INVALID COMMAND OPERATION CODE: key 5, ASC 0x20/0x00.
+const NO_SUCH_OPCODE: [u8; 3] = [0x5, 0x20, 0x00];
+
+#[test]
+fn a_flush_falls_back_to_the_16_byte_form() {
+    // Some bridges implement one form and not the other, so a drive refusing
+    // SYNCHRONIZE CACHE(10) is not a drive that cannot flush.
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x35, NO_SUCH_OPCODE);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    dev.flush().expect("the 16-byte form should carry the flush");
+    assert!(
+        !dev.flush_is_a_no_op(),
+        "a drive that answered the 16-byte form can still flush"
+    );
+}
+
+#[test]
+fn a_drive_with_neither_flush_command_does_not_fail_every_write() {
+    // The hardware failure this comes from: a SanDisk bridge refuses
+    // SYNCHRONIZE CACHE(10) as an unknown opcode, and because every write ends
+    // in a flush, every write on that drive failed. The refusal was also read
+    // as coming from WRITE(10), which sent the investigation to the CDB
+    // encoder — hence the opcode now being carried in the error.
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img"))
+        .failing(0x35, NO_SUCH_OPCODE)
+        .failing(0x91, NO_SUCH_OPCODE);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    dev.write_at(0, &[0u8; 512]).expect("the write itself is fine");
+    dev.flush().expect("a drive with no flush command must not fail the write");
+    assert!(
+        dev.flush_is_a_no_op(),
+        "the caller has to be able to find out that durability is not confirmed"
+    );
+}
+
+#[test]
+fn a_flush_that_fails_for_any_other_reason_is_still_an_error() {
+    // "This drive cannot flush" and "this flush did not work" are different
+    // facts, and only the first is safe to carry on from. 0x03/0x00 is a
+    // peripheral device write fault under sense key 4, hardware error.
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x35, [0x4, 0x03, 0x00]);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    let err = dev.flush().expect_err("a real flush failure must surface");
+    assert!(!dev.flush_is_a_no_op(), "one bad flush is not a missing command");
+    assert!(
+        err.to_string().contains("SYNCHRONIZE CACHE(10)"),
+        "the error should name the command that failed: {err}"
     );
 }

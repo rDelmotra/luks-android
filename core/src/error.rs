@@ -189,8 +189,19 @@ pub enum LuksError {
     /// hardware therefore reached the UI as the text "SCSI command failed",
     /// which is equally consistent with a write-protected drive, a CDB the
     /// drive would not accept, and failing media.
-    #[error("SCSI command failed{}", .0.map(|s| format!(": {s}")).unwrap_or_default())]
-    ScsiCommandFailed(Option<crate::usb::scsi::Sense>),
+    #[error(
+        "SCSI {} failed{}",
+        crate::usb::scsi::opcode_name(*opcode),
+        sense.map(|s| format!(": {s}")).unwrap_or_default()
+    )]
+    ScsiCommandFailed {
+        /// The CDB's opcode byte. Carried because inferring which command
+        /// failed from context got it wrong once already: a refused
+        /// `SYNCHRONIZE CACHE` was read as a refused `WRITE(10)`, which sent
+        /// the investigation at the CDB encoder instead of at the flush.
+        opcode: u8,
+        sense: Option<crate::usb::scsi::Sense>,
+    },
 
     #[error("USB transfer failed: {0}")]
     UsbTransfer(String),
