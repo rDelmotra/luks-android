@@ -270,6 +270,21 @@ private fun DiagnosticsScreen() {
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                             )
+                            // Set before Open, because the transport's limit is
+                            // fixed when the device is opened and cannot move
+                            // afterwards. Blank or 0 leaves the built-in 128 KiB.
+                            var maxKib by remember { mutableStateOf("") }
+                            OutlinedTextField(
+                                value = maxKib,
+                                onValueChange = {
+                                    maxKib = it
+                                    DebugTuning.maxTransferBytes =
+                                        (it.toIntOrNull() ?: 0).coerceIn(0, 8192) * 1024
+                                },
+                                label = { Text("Max transfer (KiB, blank = default)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                modifier = Modifier.padding(vertical = 4.dp),
+                            )
                             Button(onClick = {
                                 states = states + (key to DeviceState.Opening)
                                 scope.launch {
@@ -736,6 +751,18 @@ private fun testPayload(sizeBytes: Int): ByteArray {
  * suspends on user input, and `UsbMassStorage.open` blocks on real USB
  * transfers (INQUIRY, READ CAPACITY, the LUKS-magic probe of every partition).
  */
+/**
+ * Transport settings a debug session needs to vary between runs.
+ *
+ * A plain object rather than state threaded through the screen: it is read
+ * once, at open, and nothing recomposes on it. Debug-only — nothing in the
+ * normal path sets it, so it stays 0 and the transport keeps its default.
+ */
+private object DebugTuning {
+    /** Bytes per bulk transfer, or 0 for the built-in 128 KiB. */
+    var maxTransferBytes: Int = 0
+}
+
 private suspend fun openDevice(
     context: Context,
     target: UsbMassStorage.Target,
@@ -748,7 +775,11 @@ private suspend fun openDevice(
     }
     return try {
         val started = System.currentTimeMillis()
-        val device = withContext(Dispatchers.IO) { UsbMassStorage.open(context, target) }
+        val requested = DebugTuning.maxTransferBytes
+        if (requested > 0) Trace.i("open: requesting max transfer $requested bytes")
+        val device = withContext(Dispatchers.IO) {
+            UsbMassStorage.open(context, target, requested)
+        }
         Trace.i(
             "open: ok in ${System.currentTimeMillis() - started} ms, " +
                 "${device.info.partitions.size} partitions, " +
