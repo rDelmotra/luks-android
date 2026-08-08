@@ -8,7 +8,7 @@
 # Idempotent: safe to re-run. Non-destructive: never uninstalls anything.
 #
 # Corrections to environment_setup_guide.md baked in here:
-#   - Does NOT `brew uninstall rust`         (DEC-021)
+#   - Does NOT `brew uninstall rust`         (DEC-026)
 #   - Does NOT install CMake                 (DEC-011-R dropped lwext4)
 #   - Uses API 29 linkers, not 21            (DEC-012 sets minSdk 29)
 #   - Verifies with --examples, not a bare rlib build (see VERIFY below)
