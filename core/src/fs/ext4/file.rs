@@ -31,6 +31,7 @@
 
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
+use crate::fs::ext4::alloc::Extent;
 use crate::fs::ext4::csum::Seed;
 use crate::fs::ext4::Ext4;
 
@@ -59,6 +60,42 @@ struct Run {
     logical: u64,
     physical: u64,
     len: u64,
+}
+
+/// `ee_len` is 16 bits, and values above 32768 mean "uninitialised extent" —
+/// so a run longer than that is not merely unrepresentable, it would be read
+/// back as a hole.
+const MAX_EXTENT_LEN: u64 = 32768;
+
+/// Lay the allocator's physical runs out as logical file extents.
+///
+/// The allocator has no reason to respect `ee_len`'s ceiling — it hands back
+/// whatever contiguity it found — so a long run is cut here, at the layer that
+/// knows why the ceiling exists.
+fn runs_from(extents: &[Extent]) -> Result<Vec<Run>> {
+    let mut runs = Vec::new();
+    let mut logical = 0u64;
+    for e in extents {
+        let mut offset = 0u64;
+        while offset < e.len {
+            let len = (e.len - offset).min(MAX_EXTENT_LEN);
+            runs.push(Run {
+                logical,
+                physical: e.physical + offset,
+                len,
+            });
+            logical += len;
+            offset += len;
+        }
+    }
+    if runs.len() > MAX_INLINE_EXTENTS {
+        return Err(LuksError::UnsupportedFsFeature(
+            "file needs more than 4 extents — interior extent \
+             nodes are not yet implemented"
+                .into(),
+        ));
+    }
+    Ok(runs)
 }
 
 impl<D: WriteAt> Ext4<D> {
@@ -124,11 +161,11 @@ impl<D: WriteAt> Ext4<D> {
         // what ran out.
         super::dirent::validate_name(name.as_bytes())?;
 
-        let (ino, runs) = self.write_new_file_runs(data)?;
+        let (ino, extents) = self.write_new_file_runs(data)?;
         self.flush()?;
 
         if let Err(e) = self.link_file(dir_ino, name, ino, file_type) {
-            self.undo_new_file(ino, &runs);
+            self.undo_new_file(ino, &extents);
             return Err(e);
         }
 
@@ -150,20 +187,21 @@ impl<D: WriteAt> Ext4<D> {
     /// disproportionately likely to be a link that is about to disappear.
     /// Errors are swallowed deliberately: the caller is owed the reason the
     /// write failed, not the reason the cleanup did.
-    fn undo_new_file(&mut self, ino: u64, runs: &[Run]) {
+    ///
+    /// The whole batch is freed in one call. Undoing a 50 MB file used to mean
+    /// three device writes per 4 KiB block — a rollback that cost more round
+    /// trips than the write it was undoing, on a path taken precisely when
+    /// something has already gone wrong.
+    fn undo_new_file(&mut self, ino: u64, extents: &[Extent]) {
         let _ = self.free_inode(ino, false);
-        for r in runs {
-            for b in 0..r.len {
-                let _ = self.free_block(r.physical + b);
-            }
-        }
+        let _ = self.free_blocks(extents);
         let _ = self.flush();
     }
 
     /// The body of [`write_new_file`], keeping the block runs so a caller that
     /// needs to undo the whole thing can free exactly what was allocated
     /// without re-parsing the extent tree it just wrote.
-    fn write_new_file_runs(&mut self, data: &[u8]) -> Result<(u64, Vec<Run>)> {
+    fn write_new_file_runs(&mut self, data: &[u8]) -> Result<(u64, Vec<Extent>)> {
         let seed = Seed::for_writing(&self.sb)?;
         let bs = self.sb.block_size as u64;
         let blocks_needed = (data.len() as u64).div_ceil(bs.max(1));
@@ -176,45 +214,33 @@ impl<D: WriteAt> Ext4<D> {
         // result discarded, and no flush — which is exactly the shape
         // `undo_new_file`'s comment argues against. Two implementations of one
         // operation meant the fix landed on one of them; there is now one.
-        let mut runs: Vec<Run> = Vec::new();
-
-        let mut last_physical: Option<u64> = None;
-        for logical in 0..blocks_needed {
-            let goal = last_physical.map(|p| p + 1).unwrap_or(0);
-            let phys = match self.alloc_block(goal) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.undo_new_file(ino, &runs);
-                    return Err(e);
-                }
-            };
-
-            match runs.last_mut() {
-                Some(r) if r.physical + r.len == phys && r.len < 32768 => {
-                    r.len += 1;
-                }
-                _ => {
-                    if runs.len() == MAX_INLINE_EXTENTS {
-                        self.free_block(phys).ok();
-                        self.undo_new_file(ino, &runs);
-                        return Err(LuksError::UnsupportedFsFeature(
-                            "file needs more than 4 extents — interior extent \
-                             nodes are not yet implemented"
-                                .into(),
-                        ));
-                    }
-                    runs.push(Run {
-                        logical,
-                        physical: phys,
-                        len: 1,
-                    });
-                }
+        //
+        // One call, not one per block. The allocator commits its bookkeeping
+        // once per group it touches instead of once per block, which is the
+        // difference between a 50 MB file costing ~85,000 SCSI commands and
+        // costing a few hundred.
+        let extents = match self.alloc_blocks(0, blocks_needed) {
+            Ok(e) => e,
+            Err(e) => {
+                self.undo_new_file(ino, &[]);
+                return Err(e);
             }
-            last_physical = Some(phys);
-        }
+        };
+
+        // The four-extent ceiling is checked here, after the allocation rather
+        // than during it. Nothing is wasted by that: a batch that turns out
+        // too fragmented is handed straight back to `free_blocks`, which
+        // releases it in the same one-commit-per-group way it was taken.
+        let runs = match runs_from(&extents) {
+            Ok(r) => r,
+            Err(e) => {
+                self.undo_new_file(ino, &extents);
+                return Err(e);
+            }
+        };
 
         if let Err(e) = self.write_file_data(&runs, data) {
-            self.undo_new_file(ino, &runs);
+            self.undo_new_file(ino, &extents);
             return Err(e);
         }
 
@@ -222,16 +248,16 @@ impl<D: WriteAt> Ext4<D> {
         // else's deleted plaintext: the data must be on the medium before the
         // inode that names those blocks is. See `create_file`.
         if let Err(e) = self.flush() {
-            self.undo_new_file(ino, &runs);
+            self.undo_new_file(ino, &extents);
             return Err(e);
         }
 
         if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed) {
-            self.undo_new_file(ino, &runs);
+            self.undo_new_file(ino, &extents);
             return Err(e);
         }
 
-        Ok((ino, runs))
+        Ok((ino, extents))
     }
 
     fn write_file_data(&mut self, runs: &[Run], data: &[u8]) -> Result<()> {

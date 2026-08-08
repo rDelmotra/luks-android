@@ -31,6 +31,33 @@
 //! counter adjustment. The reverse — a counter claiming a block is taken while
 //! the bitmap says free — invites the next allocation to hand out a block that
 //! is already in use, which loses data.
+//!
+//! # Batching
+//!
+//! Blocks are claimed a *batch* at a time, not one at a time. The difference is
+//! not a micro-optimisation: every allocation ends in a commit, and a commit is
+//! three device writes — bitmap, group descriptor, superblock — none of which
+//! is block-aligned, so each costs a read-modify-write on top. Measured through
+//! the SCSI layer that came to **7.0 commands per 4 KiB block**, which for a
+//! 50 MB file is over 85,000 round trips: on the phone's USB host that is the
+//! five-minute hang that motivated this, spent entirely in bookkeeping while
+//! the data itself needs a few hundred commands.
+//!
+//! [`alloc_blocks`](Ext4::alloc_blocks) reads each group's bitmap **once**,
+//! claims every block it needs from it in memory, and commits **once per group
+//! touched**, with a single superblock write closing the whole batch. A 50 MB
+//! file fits in one group, so its bookkeeping is three writes rather than
+//! 36,000. This is the same conclusion ext4 itself reached: ext3 allocated per
+//! block at `write_begin` time, and ext4 replaced it with delayed allocation
+//! plus a multi-block allocator for these exact reasons.
+//!
+//! The work is split into a **plan** phase that only reads, and a **commit**
+//! phase that only writes. Nothing reaches the device until every block is
+//! decided, so running out of space now costs a discarded `Vec` rather than an
+//! unwind of already-committed bitmaps. The ordering above is unchanged —
+//! bitmap before counters, per group — so an interruption still leaks blocks
+//! and still cannot double-allocate. There are simply far fewer moments at
+//! which it can be interrupted.
 
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
@@ -42,6 +69,17 @@ use crate::fs::ext4::{Ext4, GroupDesc};
 enum Bitmap {
     Block,
     Inode,
+}
+
+/// A contiguous run of physical blocks, as handed out by
+/// [`alloc_blocks`](Ext4::alloc_blocks).
+///
+/// Deliberately without a logical offset: where a run sits inside a *file* is
+/// the file layer's business, and the allocator has no opinion about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Extent {
+    pub physical: u64,
+    pub len: u64,
 }
 
 impl<D: WriteAt> Ext4<D> {
@@ -181,83 +219,194 @@ impl<D: WriteAt> Ext4<D> {
 
     // --- blocks ------------------------------------------------------------
 
-    /// Claim one free block, preferring one near `goal`.
+    /// Claim `count` free blocks, preferring blocks near `goal`, and return
+    /// them as contiguous runs.
     ///
     /// Locality is not cosmetic: a file whose blocks are scattered across the
     /// disk costs one SCSI round trip per fragment, and on this transport a
     /// round trip measured at 1.15 ms. Starting the search in `goal`'s own
     /// group is what keeps a file's extents contiguous.
-    pub fn alloc_block(&mut self, goal: u64) -> Result<u64> {
+    ///
+    /// # Two phases
+    ///
+    /// The loop below only *reads*. Each group's bitmap is fetched once, the
+    /// bits are claimed in the in-memory copy, and the dirty copy is parked in
+    /// `plan`. Not one byte reaches the device until the whole request is
+    /// satisfied, so the out-of-space path returns having changed nothing —
+    /// where the per-block predecessor had to unwind every block it had
+    /// already committed, at three device writes each.
+    ///
+    /// A group is never asked for more than its descriptor says it has free.
+    /// Trusting the bitmap past that point would hand out blocks while the
+    /// counter went its own way, and the counter is what `e2fsck` checks.
+    ///
+    /// The memory this holds is one bitmap per group *touched* — 4 KiB each on
+    /// the test stick. A 50 MB file touches one; a 4 GiB file touches 33, so
+    /// 132 KiB. Worth stating, not worth engineering around at these sizes.
+    pub fn alloc_blocks(&mut self, goal: u64, count: u64) -> Result<Vec<Extent>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let seed = Seed::for_writing(&self.sb)?;
         let per = self.sb.blocks_per_group as u64;
         let first = self.sb.first_data_block as u64;
-        let count = self.groups.len();
+        let ngroups = self.groups.len();
 
         let start = if goal >= first {
-            (((goal - first) / per) as usize).min(count.saturating_sub(1))
+            (((goal - first) / per) as usize).min(ngroups.saturating_sub(1))
         } else {
             0
         };
 
-        for n in 0..count {
-            let g = (start + n) % count;
+        // --- plan: reads only ---------------------------------------------
+        let mut plan: Vec<(usize, Vec<u8>, u64)> = Vec::new();
+        let mut out: Vec<Extent> = Vec::new();
+        let mut remaining = count;
+
+        for n in 0..ngroups {
+            if remaining == 0 {
+                break;
+            }
+            let g = (start + n) % ngroups;
             if self.groups[g].block_bitmap_uninit() || self.groups[g].free_blocks_count == 0 {
                 continue;
             }
 
             let mut bm = self.read_bitmap(g, Bitmap::Block)?;
             let limit = self.blocks_in_group(g);
-            let Some(bit) = find_free_bit(&bm, limit) else {
-                // The descriptor claimed free blocks the bitmap does not have.
-                // Skipping is the safe reading: trusting the counter here would
-                // hand out a block that is already in use.
-                continue;
-            };
+            let allowance = (self.groups[g].free_blocks_count as u64).min(remaining);
 
-            set_bit(&mut bm, bit);
-            self.groups[g].free_blocks_count -= 1;
+            let mut taken = 0u64;
+            let mut cursor = 0usize;
+            while taken < allowance {
+                // The descriptor may claim free blocks the bitmap does not
+                // have. Stopping here is the safe reading: trusting the
+                // counter would hand out a block that is already in use.
+                let Some(bit) = find_free_bit_from(&bm, cursor, limit) else {
+                    break;
+                };
+                set_bit(&mut bm, bit);
+                cursor = bit + 1;
+
+                let block = first + g as u64 * per + bit as u64;
+                match out.last_mut() {
+                    Some(e) if e.physical + e.len == block => e.len += 1,
+                    _ => out.push(Extent {
+                        physical: block,
+                        len: 1,
+                    }),
+                }
+                taken += 1;
+                remaining -= 1;
+            }
+
+            if taken > 0 {
+                plan.push((g, bm, taken));
+            }
+        }
+
+        if remaining > 0 {
+            return Err(LuksError::FilesystemFull);
+        }
+
+        // --- commit: bitmap → descriptor, per group; superblock once ------
+        //
+        // An I/O error partway through leaves the groups already written
+        // holding blocks nothing references — a leak, which is the same
+        // failure the per-block version had and the one `e2fsck` repairs with
+        // a counter adjustment. The direction that loses data, a counter
+        // ahead of its bitmap, is still impossible.
+        for (g, bm, taken) in &plan {
+            self.groups[*g].free_blocks_count -= *taken as u32;
             // Saturating: the superblock counter can already be stale-low on a
             // filesystem that saw an unclean unmount. Wrapping it to 2^64-1
             // and re-checksumming would *sign* the nonsense; sticking at 0
             // leaves an off-by-some counter, which is exactly what e2fsck
             // knows how to fix.
-            self.sb.free_blocks_count = self.sb.free_blocks_count.saturating_sub(1);
-            self.commit(g, Bitmap::Block, &bm, &seed)?;
-
-            return Ok(first + g as u64 * per + bit as u64);
+            self.sb.free_blocks_count = self.sb.free_blocks_count.saturating_sub(*taken);
+            self.write_bitmap(*g, Bitmap::Block, bm, &seed)?;
+            self.write_group_desc(*g, &seed)?;
         }
-        Err(LuksError::FilesystemFull)
+        self.write_superblock(&seed)?;
+
+        Ok(out)
     }
 
-    /// Release a block previously allocated. Freeing a block that is already
-    /// free is refused rather than silently accepted — it means the caller has
-    /// lost track, and double-freeing is how two files come to share a block.
-    pub fn free_block(&mut self, block: u64) -> Result<()> {
+    /// Claim one free block, preferring one near `goal`.
+    pub fn alloc_block(&mut self, goal: u64) -> Result<u64> {
+        let runs = self.alloc_blocks(goal, 1)?;
+        runs.first()
+            .map(|e| e.physical)
+            .ok_or(LuksError::FilesystemFull)
+    }
+
+    /// Release a batch of previously allocated runs.
+    ///
+    /// Freeing a block that is already free is refused rather than silently
+    /// accepted — it means the caller has lost track, and double-freeing is how
+    /// two files come to share a block. Because the batch is planned in memory
+    /// first, that check also catches a batch that names the same block twice,
+    /// which the per-block version could not see.
+    ///
+    /// Like [`alloc_blocks`](Self::alloc_blocks), nothing is written until the
+    /// whole batch validates.
+    pub fn free_blocks(&mut self, extents: &[Extent]) -> Result<()> {
+        if extents.is_empty() {
+            return Ok(());
+        }
         let seed = Seed::for_writing(&self.sb)?;
         let per = self.sb.blocks_per_group as u64;
         let first = self.sb.first_data_block as u64;
 
-        if block < first || block >= self.sb.blocks_count {
-            return Err(LuksError::CorruptFs("free of a block outside the filesystem"));
-        }
-        let g = ((block - first) / per) as usize;
-        let bit = ((block - first) % per) as usize;
+        // group index, dirty bitmap, how many bits were cleared in it
+        let mut plan: Vec<(usize, Vec<u8>, u32)> = Vec::new();
 
-        if self.groups[g].block_bitmap_uninit() {
-            return Err(LuksError::CorruptFs(
-                "free of a block in an uninitialised group",
-            ));
+        for e in extents {
+            for block in e.physical..e.physical + e.len {
+                if block < first || block >= self.sb.blocks_count {
+                    return Err(LuksError::CorruptFs("free of a block outside the filesystem"));
+                }
+                let g = ((block - first) / per) as usize;
+                let bit = ((block - first) % per) as usize;
+
+                if self.groups[g].block_bitmap_uninit() {
+                    return Err(LuksError::CorruptFs(
+                        "free of a block in an uninitialised group",
+                    ));
+                }
+
+                let slot = match plan.iter().position(|(gi, _, _)| *gi == g) {
+                    Some(i) => i,
+                    None => {
+                        let bm = self.read_bitmap(g, Bitmap::Block)?;
+                        plan.push((g, bm, 0));
+                        plan.len() - 1
+                    }
+                };
+
+                if !test_bit(&plan[slot].1, bit) {
+                    return Err(LuksError::CorruptFs("double free of a block"));
+                }
+                clear_bit(&mut plan[slot].1, bit);
+                plan[slot].2 += 1;
+            }
         }
 
-        let mut bm = self.read_bitmap(g, Bitmap::Block)?;
-        if !test_bit(&bm, bit) {
-            return Err(LuksError::CorruptFs("double free of a block"));
+        for (g, bm, freed) in &plan {
+            self.groups[*g].free_blocks_count += *freed;
+            self.sb.free_blocks_count += *freed as u64;
+            self.write_bitmap(*g, Bitmap::Block, bm, &seed)?;
+            self.write_group_desc(*g, &seed)?;
         }
+        self.write_superblock(&seed)
+    }
 
-        clear_bit(&mut bm, bit);
-        self.groups[g].free_blocks_count += 1;
-        self.sb.free_blocks_count += 1;
-        self.commit(g, Bitmap::Block, &bm, &seed)
+    /// Release a single block previously allocated.
+    pub fn free_block(&mut self, block: u64) -> Result<()> {
+        self.free_blocks(&[Extent {
+            physical: block,
+            len: 1,
+        }])
     }
 
     /// How many blocks this group actually contains. The last group is usually
@@ -454,18 +603,30 @@ fn clear_bit(bm: &mut [u8], bit: usize) {
 
 /// Index of the first zero bit below `limit`, or `None`.
 fn find_free_bit(bm: &[u8], limit: usize) -> Option<usize> {
-    for (i, &byte) in bm.iter().enumerate() {
-        if byte == 0xFF {
-            continue;
-        }
-        let bit = byte.trailing_ones() as usize;
-        let index = i * 8 + bit;
-        if index >= limit {
-            return None;
-        }
-        return Some(index);
+    find_free_bit_from(bm, 0, limit)
+}
+
+/// Index of the first zero bit at or after `from` and below `limit`.
+///
+/// Resuming from a cursor is what makes claiming N blocks from one bitmap an
+/// O(bitmap) scan rather than N scans from byte zero: the caller has just set
+/// every bit it found below `from`, so re-examining them can only find them
+/// taken. Bits below `from` inside the first byte are masked to 1 for exactly
+/// that reason — they are taken *for this search*, whatever they are on disk.
+fn find_free_bit_from(bm: &[u8], from: usize, limit: usize) -> Option<usize> {
+    if from >= limit {
+        return None;
     }
-    None
+    let mut i = from / 8;
+    let mut byte = *bm.get(i)? | (((1u16 << (from % 8)) - 1) as u8);
+    loop {
+        if byte != 0xFF {
+            let index = i * 8 + byte.trailing_ones() as usize;
+            return if index >= limit { None } else { Some(index) };
+        }
+        i += 1;
+        byte = *bm.get(i)?;
+    }
 }
 
 fn put16(b: &mut [u8], o: usize, v: u16) {
@@ -495,6 +656,34 @@ mod tests {
         // though the bitmap byte says they are free.
         assert_eq!(find_free_bit(&[0b0000_1111], 4), None);
         assert_eq!(find_free_bit(&[0b0000_0111], 4), Some(3));
+    }
+
+    #[test]
+    fn the_cursor_resumes_without_re_finding_what_it_already_took() {
+        // Claiming N blocks from one bitmap walks it once with a cursor rather
+        // than restarting at byte zero N times. Bits below the cursor are
+        // masked to "taken" for the search — get that mask wrong and the batch
+        // hands out the same block repeatedly, each one passing every
+        // single-block test.
+        let bm = [0b0000_0000u8, 0b0000_0000];
+
+        assert_eq!(find_free_bit_from(&bm, 0, 16), Some(0));
+        assert_eq!(find_free_bit_from(&bm, 1, 16), Some(1));
+        assert_eq!(find_free_bit_from(&bm, 7, 16), Some(7));
+        // Crossing a byte boundary: the mask applies to the first byte only.
+        assert_eq!(find_free_bit_from(&bm, 8, 16), Some(8));
+
+        // A cursor past a fully taken byte must skip it, not stall on it.
+        let bm = [0xFF, 0b0000_0010];
+        assert_eq!(find_free_bit_from(&bm, 0, 16), Some(8));
+        assert_eq!(find_free_bit_from(&bm, 9, 16), Some(10));
+
+        // The limit still binds when resuming, not only from zero.
+        assert_eq!(find_free_bit_from(&[0u8], 4, 6), Some(4));
+        assert_eq!(find_free_bit_from(&[0b0011_1111u8], 4, 6), None);
+
+        // A cursor at or past the limit has nothing left to find.
+        assert_eq!(find_free_bit_from(&[0u8], 8, 8), None);
     }
 
     #[test]

@@ -200,3 +200,78 @@ fn verify_script() -> Option<String> {
         .unwrap_or(false);
     up.then_some(script)
 }
+
+/// The check the batched allocator was written for: a file of a size where
+/// per-block bookkeeping was the whole cost, graded by the kernel rather than
+/// by us.
+///
+/// Two oracles, because they answer different questions. `e2fsck` says the
+/// structures are well-formed — and unlike the orphan test above, a *named*
+/// file must leave it completely clean, with no complaint of any kind. Then
+/// the kernel mounts the image and hands the bytes back, which is the only
+/// statement that actually matters: "e2fsck is happy" and "Linux can open your
+/// file by name and read what you wrote" are not the same claim.
+///
+/// A megabyte is 256 blocks. Under the per-block allocator that was 256
+/// bitmap-descriptor-superblock commits; it is now one.
+#[test]
+fn a_multi_megabyte_named_file_is_clean_and_reads_back_byte_for_byte() {
+    let Some(script) = verify_script() else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    const SIZE: usize = 4 * 1024 * 1024;
+    // A pattern, not zeros: a run of zeros would read back correctly even from
+    // blocks that were never written.
+    let content: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+
+    let path = scratch("big-4k.img", "e2fsck-bigfile");
+    {
+        let mut fs = open(&path);
+        fs.create_file(2, "batched.bin", &content, luks_core::fs::FileType::Regular)
+            .expect("create a multi-megabyte file");
+        fs.flush().expect("flush");
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .output()
+        .expect("run verifier");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success(),
+        "e2fsck rejected an image holding one 4 MB named file:\n{text}"
+    );
+
+    let cat = format!("{}/../tools/cat-in-image.sh", env!("CARGO_MANIFEST_DIR"));
+    let got = Command::new("bash")
+        .arg(&cat)
+        .arg(&path)
+        .arg("/batched.bin")
+        .output()
+        .expect("run cat-in-image");
+    assert!(
+        got.status.success(),
+        "the kernel could not read /batched.bin back:\n{}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert_eq!(
+        got.stdout.len(),
+        content.len(),
+        "the kernel read back {} bytes, not {}",
+        got.stdout.len(),
+        content.len()
+    );
+    assert!(
+        got.stdout == content,
+        "the kernel read /batched.bin back with different contents — first \
+         differing byte at {:?}",
+        got.stdout.iter().zip(&content).position(|(a, b)| a != b)
+    );
+}

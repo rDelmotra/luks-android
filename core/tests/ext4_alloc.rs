@@ -516,3 +516,214 @@ fn an_allocated_inode_record_is_blanked_before_the_bitmap_claims_it() {
         );
     }
 }
+
+// --- batched allocation ----------------------------------------------------
+//
+// Blocks are claimed a batch at a time so that the bitmap, descriptor and
+// superblock are committed once per group touched rather than once per block —
+// measured at 7.0 SCSI commands per 4 KiB block before, 0.03 after
+// (`core/tests/write_cost.rs`, 2026-08-08). Speed is not the risk; the risk is
+// that a batch updates the bitmap and the counters by different amounts, which
+// nothing but e2fsck or a byte comparison would notice.
+
+#[test]
+fn allocating_a_batch_then_freeing_it_restores_every_byte() {
+    // The same oracle as the single-block round trip, and for the same reason:
+    // a field the batch path decrements N times but restores once shows up
+    // here as a differing byte, against the bytes mke2fs wrote.
+    for name in FIXTURES {
+        let path = scratch(name, "batch-roundtrip");
+        let before = bytes(&path);
+
+        let extents = {
+            let mut fs = open(&path);
+            let e = fs.alloc_blocks(0, 40).expect("allocate a batch");
+            fs.flush().expect("flush");
+            e
+        };
+        assert_eq!(
+            extents.iter().map(|e| e.len).sum::<u64>(),
+            40,
+            "{name}: batch returned the wrong number of blocks"
+        );
+
+        // A separate mount, so the free path reads state from disk rather than
+        // from an in-memory copy that might be masking a missing write.
+        {
+            let mut fs = open(&path);
+            fs.free_blocks(&extents).expect("free the batch");
+            fs.flush().expect("flush");
+        }
+
+        let after = bytes(&path);
+        let d = diff(&before, &after);
+        assert!(
+            d.is_empty(),
+            "{name}: allocating 40 blocks as a batch and freeing them left {} \
+             bytes changed, at offsets {d:?}",
+            d.len()
+        );
+    }
+}
+
+#[test]
+fn a_batch_moves_the_counters_by_exactly_what_it_handed_out() {
+    // The per-block path decremented by one N times; the batch path subtracts
+    // N once. That is precisely the arithmetic that can drift, and a drifted
+    // counter is invisible until e2fsck runs.
+    let path = scratch("many-groups-1k.img", "batch-counters");
+    let mut fs = open(&path);
+
+    let sb_before = fs.superblock().free_blocks_count;
+    let group_before: u32 = fs.groups().iter().map(|g| g.free_blocks_count).sum();
+
+    let extents = fs.alloc_blocks(0, 40).expect("allocate a batch");
+
+    assert_eq!(
+        sb_before - fs.superblock().free_blocks_count,
+        40,
+        "superblock free count"
+    );
+    assert_eq!(
+        group_before - fs.groups().iter().map(|g| g.free_blocks_count).sum::<u32>(),
+        40,
+        "summed group free counts"
+    );
+
+    // And 40 distinct blocks, not one block claimed forty times. The cursor
+    // that lets the search resume mid-bitmap is what could break this.
+    let mut blocks: Vec<u64> = extents
+        .iter()
+        .flat_map(|e| e.physical..e.physical + e.len)
+        .collect();
+    assert_eq!(blocks.len(), 40);
+    blocks.sort_unstable();
+    blocks.dedup();
+    assert_eq!(blocks.len(), 40, "the batch returned a block more than once");
+}
+
+#[test]
+fn a_batch_that_cannot_be_satisfied_writes_nothing() {
+    // The property the two-phase split exists for. The per-block predecessor
+    // had to unwind every block it had already committed; this must simply
+    // never have touched the device.
+    for name in FIXTURES {
+        let path = scratch(name, "batch-nospace");
+        let before = bytes(&path);
+
+        {
+            let mut fs = open(&path);
+            let impossible = fs.superblock().free_blocks_count + 1_000;
+            let r = fs.alloc_blocks(0, impossible);
+            assert!(
+                r.is_err(),
+                "{name}: allocator claimed to satisfy {impossible} blocks"
+            );
+            fs.flush().expect("flush");
+        }
+
+        let after = bytes(&path);
+        let d = diff(&before, &after);
+        assert!(
+            d.is_empty(),
+            "{name}: a batch that ran out of space still wrote {} bytes, at \
+             offsets {d:?} — the plan phase reached the device",
+            d.len()
+        );
+    }
+}
+
+#[test]
+fn a_batch_can_span_more_than_one_group() {
+    // A single group's bitmap is one read and one commit. Crossing into a
+    // second must commit that group too — a batch that silently stopped at a
+    // group boundary, or that committed only the first group's descriptor,
+    // would pass every single-group test above.
+    let path = scratch("many-groups-1k.img", "batch-crossgroup");
+    let before = bytes(&path);
+
+    let per = {
+        let fs = open(&path);
+        fs.superblock().blocks_per_group as u64
+    };
+    let first = {
+        let fs = open(&path);
+        fs.superblock().first_data_block as u64
+    };
+
+    let extents = {
+        let mut fs = open(&path);
+        let largest = fs
+            .groups()
+            .iter()
+            .filter(|g| !g.block_bitmap_uninit())
+            .map(|g| g.free_blocks_count as u64)
+            .max()
+            .expect("an initialised group");
+        let total: u64 = fs
+            .groups()
+            .iter()
+            .filter(|g| !g.block_bitmap_uninit())
+            .map(|g| g.free_blocks_count as u64)
+            .sum();
+        assert!(
+            total > largest,
+            "fixture cannot exercise a cross-group batch"
+        );
+
+        let e = fs.alloc_blocks(0, largest + 1).expect("cross-group batch");
+        fs.flush().expect("flush");
+        e
+    };
+
+    let groups: std::collections::BTreeSet<u64> = extents
+        .iter()
+        .flat_map(|e| e.physical..e.physical + e.len)
+        .map(|b| (b - first) / per)
+        .collect();
+    assert!(
+        groups.len() > 1,
+        "batch stayed inside one group: {groups:?}"
+    );
+
+    {
+        let mut fs = open(&path);
+        fs.free_blocks(&extents).expect("free the batch");
+        fs.flush().expect("flush");
+    }
+
+    let d = diff(&before, &bytes(&path));
+    assert!(
+        d.is_empty(),
+        "a cross-group batch left {} bytes changed after being freed, at \
+         offsets {d:?}",
+        d.len()
+    );
+}
+
+#[test]
+fn a_batch_that_names_the_same_block_twice_is_refused() {
+    // Planning the free in memory before writing any of it makes this
+    // visible; the per-block path cleared the bit and moved on, so the second
+    // mention silently inflated the free counters.
+    use luks_core::fs::ext4::alloc::Extent;
+
+    let path = scratch("big-4k.img", "batch-double-free");
+    let mut fs = open(&path);
+
+    let block = fs.alloc_block(0).expect("allocate");
+    let dup = [
+        Extent {
+            physical: block,
+            len: 1,
+        },
+        Extent {
+            physical: block,
+            len: 1,
+        },
+    ];
+    assert!(
+        fs.free_blocks(&dup).is_err(),
+        "a batch freeing the same block twice was accepted"
+    );
+}
