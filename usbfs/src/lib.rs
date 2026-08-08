@@ -116,13 +116,35 @@ fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+/// A bulk transfer failure, naming **how much it was moving**.
+///
+/// The size is the diagnostic, not decoration. This bridge (0781:5591) is
+/// fine at 128 KiB and times out after the full 5 s at 1 MiB — the kernel
+/// raises no objection, because its own cap is 16 MB, so the refusal comes
+/// from the device and arrives as `ETIMEDOUT`. Without the number in the
+/// message that reads as "the drive stopped answering", which sends the search
+/// at the cable and the drive instead of at the one setting that caused it.
+///
+/// The same mistake as the `SYNCHRONIZE CACHE` incident, in a different
+/// place: an error that does not name what it was doing gets the gap filled
+/// in by whoever reads it.
+fn bulk_err(len: usize, limit: usize, e: i32) -> LuksError {
+    match transfer_err("USBDEVFS_BULK", e) {
+        LuksError::UsbTransfer(m) => LuksError::UsbTransfer(format!(
+            "{m} while moving {len} bytes (max_transfer is {limit})"
+        )),
+        other => other,
+    }
+}
+
 fn transfer_err(what: &str, e: i32) -> LuksError {
     let hint = match e {
         libc::EPIPE => " (endpoint stalled — clear_halt required before the next command)",
         libc::ETIMEDOUT => " (timed out)",
         libc::ENODEV => " (device disconnected)",
         libc::EBADF => " (bad file descriptor — was the UsbDeviceConnection closed?)",
-        libc::EINVAL => " (invalid argument — check the endpoint address)",
+        libc::EINVAL => " (invalid argument — the endpoint address, or a buffer \
+                          the kernel considers too large)",
         libc::EAGAIN => " (would block)",
         _ => "",
     };
@@ -315,7 +337,7 @@ impl UsbFsTransport {
                 continue;
             }
 
-            return Err(transfer_err("USBDEVFS_BULK", e));
+            return Err(bulk_err(len, limit, e));
         }
     }
 }
@@ -471,6 +493,24 @@ mod tests {
     /// `MIN_MAX_TRANSFER / 2`, or if the floor were ever zero, a device that
     /// answers `EINVAL` for another reason would spin forever inside an ioctl
     /// loop with no way out.
+    /// The size has to be in the message, because the size is the answer.
+    ///
+    /// A 1 MiB transfer to a bridge that is fine at 128 KiB times out, and an
+    /// error saying only "timed out" is indistinguishable from a dead drive.
+    #[test]
+    fn a_bulk_failure_names_how_much_it_was_moving() {
+        let e = bulk_err(1_048_576, 1_048_576, libc::ETIMEDOUT);
+        let text = e.to_string();
+        assert!(text.contains("1048576"), "no transfer size in: {text}");
+        assert!(text.contains("max_transfer"), "no limit in: {text}");
+        assert!(text.contains("timed out"), "lost the errno hint: {text}");
+
+        // The control: the generic form has none of it, which is what made the
+        // 1 MiB timeout read as a dead device.
+        let plain = transfer_err("USBDEVFS_BULK", libc::ETIMEDOUT).to_string();
+        assert!(!plain.contains("1048576"), "control is not a control: {plain}");
+    }
+
     #[test]
     fn the_transfer_limit_has_a_floor_so_the_retry_loop_ends() {
         assert!(UsbFsTransport::MIN_MAX_TRANSFER > 0);
