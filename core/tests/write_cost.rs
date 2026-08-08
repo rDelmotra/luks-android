@@ -200,3 +200,64 @@ fn a_large_write_is_issued_in_max_transfer_sized_commands() {
          something below the filesystem is fragmenting it"
     );
 }
+
+/// What the write path costs in **CPU alone**, with no real device under it.
+///
+/// The write path copies every payload byte seven times and allocates ~6x the
+/// file (`file.rs` a whole run, `volume.rs` a whole ciphertext buffer, then two
+/// `to_vec`s per SCSI command). That is obviously wasteful, and the tempting
+/// conclusion is that it explains the hardware gap — the phone writes at
+/// 7.4 MB/s where it reads at 31.
+///
+/// It is only an explanation if the copying is actually slow, and this is the
+/// measurement that says. The mock drive is memory-backed, so what is left is
+/// exactly the allocation, the memcpys and AES-XTS. If this reports hundreds of
+/// MiB/s then the copies cost microseconds per command and cannot account for
+/// the 12 ms per command the phone is losing — the cause is below this code,
+/// and rewriting the buffer handling would be an optimisation, not a fix.
+#[test]
+fn the_write_path_costs_this_much_cpu_with_no_device_latency() {
+    const SIZE: usize = 4 * 1024 * 1024;
+
+    let dev = ScsiBlockDevice::open(MockUsbDrive::new(fixture("disks/gpt-luks.img")))
+        .expect("open the mock drive");
+    let table = partition::scan(&dev, 512).expect("gpt");
+    let part = table.luks_partitions().next().expect("a LUKS partition");
+    let header = luks::read_from(&dev, part.offset_bytes()).expect("header");
+    let volume = LuksVolume::open(
+        &dev,
+        part.offset_bytes(),
+        Some(part.size_bytes()),
+        &header,
+        PASSWORD,
+    )
+    .expect("unlock");
+    let mut fs = Ext4::mount(&volume).expect("mount");
+
+    let data = vec![0x5Au8; SIZE];
+    let started = std::time::Instant::now();
+    fs.create_file(2, "cpu.bin", &data, luks_core::fs::FileType::Regular)
+        .expect("write the file");
+    let elapsed = started.elapsed();
+
+    let mibs = (SIZE as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+    println!(
+        "write cpu: {} MiB through the full stack in {:.1} ms = {mibs:.0} MiB/s \
+         (no device latency: allocation + memcpy + AES-XTS only)",
+        SIZE / (1024 * 1024),
+        elapsed.as_secs_f64() * 1000.0,
+    );
+    println!(
+        "write cpu: at this rate the copying alone would cost {:.2} s for 100 MB, \
+         against the 13.5 s the phone took",
+        95.4 / mibs
+    );
+
+    // Not a performance assertion — a floor far below anything plausible, so it
+    // fails only if the write path has become pathologically slow rather than
+    // merely wasteful.
+    assert!(
+        mibs > 20.0,
+        "the write path manages only {mibs:.0} MiB/s of pure CPU"
+    );
+}

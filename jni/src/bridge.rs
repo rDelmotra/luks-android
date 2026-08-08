@@ -429,6 +429,89 @@ impl DeviceHandle {
         .to_string())
     }
 
+    /// Write raw sectors and time them — no encryption, no filesystem, no
+    /// payload crossing the JNI boundary.
+    ///
+    /// The mirror of [`benchmark_json`](Self::benchmark_json), and it exists to
+    /// end an argument three hypotheses have already lost. The phone reads at
+    /// 31 MB/s and writes at 7.4 through the same Bulk-Only Transport, the same
+    /// 128 KiB commands, the same three ioctls per command. Command size was
+    /// ruled out by sweeping it — 128 KiB and 256 KiB give the same 7 MiB/s.
+    /// Encryption was ruled out by measurement: AES-XTS runs at 1931 MiB/s on
+    /// this phone, 0.4% of the time. The write path's seven payload memcpys
+    /// were ruled out on the host, where the whole thing costs 0.10 s per
+    /// 100 MB against the 13.5 s the phone spends.
+    ///
+    /// What is left is everything below this line and nothing above it. This
+    /// isolates exactly that: one buffer allocated once, no LUKS, no ext4, no
+    /// Java array. If it also reports ~7 MB/s the write path is innocent and
+    /// the cost is the device, the bus or the kernel. If it reports ~22 — what
+    /// the same drive does from a Mac at the same command size — the gap is
+    /// ours after all, and lives somewhere this bypasses.
+    ///
+    /// # Where it writes
+    ///
+    /// Past the end of every partition, and never within the last mebibyte,
+    /// where a GPT keeps its backup header. Computed from the partition table
+    /// rather than hardcoded, so it cannot land on a filesystem if this is ever
+    /// pointed at a different drive.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn benchmark_write_json(&self, bytes: u64, chunk_bytes: usize) -> Result<String> {
+        use luks_core::device::WriteAt;
+
+        let bs = self.block_size as u64;
+        let chunk = (chunk_bytes.clamp(4096, 8 * 1024 * 1024) as u64 / bs * bs) as usize;
+        let capacity = self.block_count * bs;
+
+        // The first byte past every partition, block-aligned. A `max` over the
+        // whole table rather than "the last entry": GPT entry order is not
+        // required to match on-disk order.
+        let past_partitions = self
+            .table
+            .partitions
+            .iter()
+            .map(|p| p.offset_bytes() + p.size_bytes())
+            .max()
+            .unwrap_or(0);
+        let start = past_partitions.div_ceil(bs) * bs;
+        const BACKUP_GPT_GUARD: u64 = 1024 * 1024;
+
+        let room = capacity
+            .saturating_sub(start)
+            .saturating_sub(BACKUP_GPT_GUARD);
+        if room < chunk as u64 {
+            return Err(luks_core::error::LuksError::OutOfBounds);
+        }
+        let total = bytes.min(room).max(chunk as u64) / bs * bs;
+
+        // Not zeros: a controller may special-case an all-zero block, and a
+        // benchmark that measures a shortcut measures nothing.
+        let buf: Vec<u8> = (0..chunk).map(|i| (i % 251) as u8).collect();
+
+        let mut done = 0u64;
+        let started = std::time::Instant::now();
+        while done < total {
+            let want = std::cmp::min(chunk as u64, total - done) as usize;
+            self.dev.write_at(start + done, &buf[..want])?;
+            done += want as u64;
+        }
+        let elapsed = started.elapsed();
+        let secs = elapsed.as_secs_f64();
+
+        Ok(json!({
+            "bytes": done,
+            "elapsedMs": elapsed.as_millis() as u64,
+            "bytesPerSec": if secs > 0.0 { (done as f64 / secs) as u64 } else { 0 },
+            "chunkBytes": chunk,
+            "offsetBytes": start,
+            "maxTransfer": self
+                .max_transfer
+                .as_ref()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
+        })
+        .to_string())
+    }
+
     pub fn info_json(&self) -> String {
         let parts: Vec<Value> = self
             .table

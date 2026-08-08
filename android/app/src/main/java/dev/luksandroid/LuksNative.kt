@@ -91,6 +91,15 @@ internal object LuksNative {
     external fun nativeBenchmarkRead(handle: Long, bytes: Long, chunkBytes: Int): String
 
     /**
+     * Times a raw block write — no encryption, no filesystem, no ByteArray.
+     * Writes past the end of every partition, never into the backup GPT.
+     *
+     * Only present in a write-enabled build; throws UnsatisfiedLinkError
+     * otherwise, which is why the caller checks [LuksDevice.canWrite] first.
+     */
+    external fun nativeBenchmarkWrite(handle: Long, bytes: Long, chunkBytes: Int): String
+
+    /**
      * Measures AES-XTS and SHA-256 throughput in memory. No USB, no drive —
      * these are the CPU-side ceilings the read pipeline can never exceed.
      */

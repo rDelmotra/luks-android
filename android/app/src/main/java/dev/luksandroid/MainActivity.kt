@@ -413,6 +413,30 @@ private fun OpenDeviceBody(
         ) {
             Text("Benchmark raw read")
         }
+
+        // The other half of the comparison. Read and write go through the same
+        // Bulk-Only Transport, the same command size and the same three ioctls,
+        // so a gap between these two numbers is above the transport and a gap
+        // that is *not* here is the drive's or the bus's.
+        if (LuksNative.nativeWriteSupported()) {
+            TextButton(
+                onClick = {
+                    onBusyChange(true)
+                    benchmark = "writing 64 MiB of raw blocks past the partitions…"
+                    scope.launch {
+                        benchmark = try {
+                            withContext(Dispatchers.IO) { device.benchmarkWrite().summary }
+                        } catch (e: Exception) {
+                            "write benchmark failed: ${e.message}"
+                        }
+                        onBusyChange(false)
+                    }
+                },
+                enabled = !busy,
+            ) {
+                Text("Benchmark raw write")
+            }
+        }
     }
     benchmark?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
 

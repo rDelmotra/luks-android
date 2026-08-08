@@ -140,6 +140,22 @@ class LuksDevice internal constructor(
         )
     }
 
+    /**
+     * The write counterpart, for separating "our write path is slow" from
+     * "this drive writes slowly". Lands past every partition, so it destroys
+     * nothing that is addressable through a filesystem.
+     */
+    fun benchmarkWrite(bytes: Long = 64L shl 20, chunkBytes: Int = 1 shl 20): Benchmark {
+        check(handle != 0L) { "device is closed" }
+        val j = JSONObject(LuksNative.nativeBenchmarkWrite(handle, bytes, chunkBytes))
+        return Benchmark(
+            bytes = j.getLong("bytes"),
+            elapsedMs = j.getLong("elapsedMs"),
+            bytesPerSec = j.getLong("bytesPerSec"),
+            maxTransfer = if (j.isNull("maxTransfer")) null else j.getInt("maxTransfer"),
+        )
+    }
+
     override fun close() {
         // Native first: it reads through the connection's file descriptor, and
         // releasing the interface or closing the connection first would leave

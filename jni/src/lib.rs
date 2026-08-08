@@ -419,6 +419,28 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkRead<'l>(
     })
 }
 
+/// Time a raw block write: no encryption, no filesystem, no Java array.
+///
+/// The mirror of `nativeBenchmarkRead`, and the only remaining way to tell
+/// whether the read/write gap on this phone is ours or the hardware's. Writes
+/// past the end of every partition — see `benchmark_write_json`.
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkWrite<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    bytes: jlong,
+    chunk_bytes: jint,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        // SAFETY: validated against the device magic tag.
+        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let json = dev.benchmark_write_json(bytes.max(0) as u64, chunk_bytes.max(0) as usize)?;
+        out_string(env, &json)
+    })
+}
+
 /// Measure AES-XTS and SHA-256 throughput in memory, with no USB involved.
 ///
 /// Attributes the gap between the raw-read benchmark and the full-stack figure
