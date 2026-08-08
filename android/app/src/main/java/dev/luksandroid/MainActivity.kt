@@ -635,44 +635,68 @@ private fun UnlockedBody(
     // trigger intent once the key was fixed; there is no longer an intent to
     // send.
     if (BuildConfig.DEBUG) {
-        TextButton(
-            onClick = {
-                if (!state.volume.canWrite) {
-                    status = "this .so was not built with --write"
-                    Trace.e("debug write: this .so was not built with --write")
-                    return@TextButton
-                }
-                onBusyChange(true)
-                status = "writing a test file…"
-                val name = "debug-write-${System.currentTimeMillis()}.txt"
-                val content = "written by the debug button\n".toByteArray()
-                scope.launch {
-                    try {
-                        val ino = withContext(Dispatchers.IO) {
-                            state.volume.writeFile(name, content)
-                        }
-                        // Shapes, not names — the file is on an encrypted
-                        // drive and this is the system log. Same rule as
-                        // everywhere else in this file.
-                        Trace.i("debug write: ok, inode=$ino, ${content.size} bytes")
-                        // Re-listed so the write is visible without navigating
-                        // away and back. Re-listing is also the cheapest proof
-                        // available that it reached the volume at all.
-                        entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
-                        status = "wrote $name (inode $ino)"
-                    } catch (e: LuksException) {
-                        Trace.e("debug write: failed [${e.code}] ${e.message}")
-                        status = "write failed [${e.code}] ${e.message}"
-                    } catch (e: Exception) {
-                        Trace.e("debug write: failed", e)
-                        status = "write failed: ${e.message}"
+        // Size is configurable (1-100 MB) rather than the fixed 28 bytes this
+        // proved the plumbing with on 2026-08-07: three limits sit between
+        // that and a real file (memory residency, the 4-extent ceiling on a
+        // new inode, BLOCK_UNINIT capacity) and nothing measures which binds
+        // first. This is how that gets measured, on hardware.
+        var debugWriteSizeMb by remember { mutableStateOf("10") }
+        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = debugWriteSizeMb,
+                onValueChange = { debugWriteSizeMb = it },
+                label = { Text("Size (MB)") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                enabled = !busy,
+                modifier = Modifier.padding(end = 8.dp),
+            )
+            TextButton(
+                onClick = {
+                    if (!state.volume.canWrite) {
+                        status = "this .so was not built with --write"
+                        Trace.e("debug write: this .so was not built with --write")
+                        return@TextButton
                     }
-                    onBusyChange(false)
-                }
-            },
-            enabled = !busy,
-        ) {
-            Text("Debug: write test file")
+                    val sizeMb = debugWriteSizeMb.toIntOrNull()?.coerceIn(1, 100) ?: 10
+                    val sizeBytes = sizeMb * 1_000_000
+                    onBusyChange(true)
+                    status = "writing ${sizeMb}MB…"
+                    val name = "debug-write-${sizeMb}mb-${System.currentTimeMillis()}.txt"
+                    scope.launch {
+                        try {
+                            val content = withContext(Dispatchers.Default) { testPayload(sizeBytes) }
+                            val startMs = System.currentTimeMillis()
+                            val ino = withContext(Dispatchers.IO) {
+                                state.volume.writeFile(name, content)
+                            }
+                            val elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1)
+                            val mibPerSec = (content.size / 1_048_576.0) / (elapsedMs / 1000.0)
+                            // Shapes, not names — the file is on an encrypted
+                            // drive and this is the system log. Same rule as
+                            // everywhere else in this file.
+                            Trace.i(
+                                "debug write: ok, inode=$ino, ${content.size} bytes " +
+                                    "in ${elapsedMs}ms (${"%.2f".format(mibPerSec)} MiB/s)"
+                            )
+                            // Re-listed so the write is visible without navigating
+                            // away and back. Re-listing is also the cheapest proof
+                            // available that it reached the volume at all.
+                            entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
+                            status = "wrote $name (inode $ino) — ${"%.2f".format(mibPerSec)} MiB/s"
+                        } catch (e: LuksException) {
+                            Trace.e("debug write: failed [${e.code}] ${e.message}")
+                            status = "write failed [${e.code}] ${e.message}"
+                        } catch (e: Exception) {
+                            Trace.e("debug write: failed", e)
+                            status = "write failed: ${e.message}"
+                        }
+                        onBusyChange(false)
+                    }
+                },
+                enabled = !busy,
+            ) {
+                Text("Debug: write test file")
+            }
         }
     }
 
@@ -692,6 +716,19 @@ private fun joinPath(dir: String, name: String): String =
 
 private fun parentOf(path: String): String =
     path.trimEnd('/').substringBeforeLast('/').ifEmpty { "/" }
+
+/** A repeating, non-zero pattern of [sizeBytes] — content only needs a size for this test. */
+private fun testPayload(sizeBytes: Int): ByteArray {
+    val pattern = ByteArray(4096) { (it % 256).toByte() }
+    val data = ByteArray(sizeBytes)
+    var offset = 0
+    while (offset < sizeBytes) {
+        val chunk = minOf(pattern.size, sizeBytes - offset)
+        System.arraycopy(pattern, 0, data, offset, chunk)
+        offset += chunk
+    }
+    return data
+}
 
 /**
  * Requests permission if needed, then opens the device and reads its
