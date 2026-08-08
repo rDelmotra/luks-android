@@ -273,7 +273,19 @@ private fun DiagnosticsScreen() {
                             // Set before Open, because the transport's limit is
                             // fixed when the device is opened and cannot move
                             // afterwards. Blank or 0 leaves the built-in 128 KiB.
-                            var maxKib by remember { mutableStateOf("") }
+                            // Seeded from the object, never from "". The field
+                            // is recreated whenever this screen recomposes, and
+                            // `DebugTuning` is not — so a blank default made the
+                            // display disagree with what Open actually used, and
+                            // a run at 1 MiB looked like a run at the default.
+                            var maxKib by remember {
+                                mutableStateOf(
+                                    DebugTuning.maxTransferBytes
+                                        .takeIf { it > 0 }
+                                        ?.let { (it / 1024).toString() }
+                                        ?: ""
+                                )
+                            }
                             OutlinedTextField(
                                 value = maxKib,
                                 onValueChange = {
@@ -776,7 +788,13 @@ private suspend fun openDevice(
     return try {
         val started = System.currentTimeMillis()
         val requested = DebugTuning.maxTransferBytes
-        if (requested > 0) Trace.i("open: requesting max transfer $requested bytes")
+        // Logged unconditionally. "No line" would be ambiguous between "ran at
+        // the default" and "the log was not reached", and a run whose settings
+        // are inferred rather than recorded is not a measurement.
+        Trace.i(
+            "open: max transfer = " +
+                if (requested > 0) "$requested bytes (requested)" else "built-in default"
+        )
         val device = withContext(Dispatchers.IO) {
             UsbMassStorage.open(context, target, requested)
         }
