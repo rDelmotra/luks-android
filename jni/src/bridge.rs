@@ -251,6 +251,15 @@ pub struct Handle {
 pub enum Payload {
     Device(DeviceHandle),
     Volume(VolumeHandle),
+    #[cfg(feature = "dangerous-write-support")]
+    Writer(WriterHandle),
+}
+
+/// Opaque streaming state. It deliberately owns neither a device nor a volume.
+#[cfg(feature = "dangerous-write-support")]
+pub struct WriterHandle {
+    pub volume_handle: i64,
+    pub writer: Mutex<Option<luks_core::fs::ext4::file::FileWriter>>,
 }
 
 pub struct DeviceHandle {
@@ -948,6 +957,8 @@ pub unsafe fn device_ref<'a>(handle: i64) -> std::result::Result<&'a DeviceHandl
     match &handle_ref(handle)?.payload {
         Payload::Device(d) => Ok(d),
         Payload::Volume(_) => Err("handle is a volume, not a device"),
+        #[cfg(feature = "dangerous-write-support")]
+        Payload::Writer(_) => Err("handle is a file writer, not a device"),
     }
 }
 
@@ -957,6 +968,16 @@ pub unsafe fn volume_ref<'a>(handle: i64) -> std::result::Result<&'a VolumeHandl
     match &handle_ref(handle)?.payload {
         Payload::Volume(v) => Ok(v),
         Payload::Device(_) => Err("handle is a device, not a volume"),
+        #[cfg(feature = "dangerous-write-support")]
+        Payload::Writer(_) => Err("handle is a file writer, not a volume"),
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+pub unsafe fn writer_ref<'a>(handle: i64) -> std::result::Result<&'a WriterHandle, &'static str> {
+    match &handle_ref(handle)?.payload {
+        Payload::Writer(w) => Ok(w),
+        _ => Err("handle is not a file writer"),
     }
 }
 
@@ -970,7 +991,7 @@ pub unsafe fn volume_ref<'a>(handle: i64) -> std::result::Result<&'a VolumeHandl
 ///
 /// # Safety
 /// See [`handle_ref`].
-unsafe fn drop_handle(handle: i64, want_volume: bool) {
+unsafe fn drop_handle(handle: i64, want: HandleKind) {
     if handle == 0 {
         return;
     }
@@ -978,24 +999,42 @@ unsafe fn drop_handle(handle: i64, want_volume: bool) {
     if (*p).magic != MAGIC {
         return;
     }
-    let is_volume = matches!((*p).payload, Payload::Volume(_));
-    if is_volume != want_volume {
+    let kind = match &(*p).payload {
+        Payload::Device(_) => HandleKind::Device,
+        Payload::Volume(_) => HandleKind::Volume,
+        #[cfg(feature = "dangerous-write-support")]
+        Payload::Writer(_) => HandleKind::Writer,
+    };
+    if kind != want {
         return;
     }
     (*p).magic = 0;
     drop(Box::from_raw(p));
 }
 
+#[derive(PartialEq, Eq)]
+enum HandleKind {
+    Device,
+    Volume,
+    #[cfg(feature = "dangerous-write-support")]
+    Writer,
+}
+
 /// # Safety
 /// See [`handle_ref`].
 pub unsafe fn drop_device(handle: i64) {
-    drop_handle(handle, false)
+    drop_handle(handle, HandleKind::Device)
 }
 
 /// # Safety
 /// See [`handle_ref`]. Dropping a volume zeroes the master key it holds.
 pub unsafe fn drop_volume(handle: i64) {
-    drop_handle(handle, true)
+    drop_handle(handle, HandleKind::Volume)
+}
+
+#[cfg(feature = "dangerous-write-support")]
+pub unsafe fn drop_writer(handle: i64) {
+    drop_handle(handle, HandleKind::Writer)
 }
 
 /// Zeroising owner for a password copied out of a Java `byte[]`.

@@ -7,6 +7,7 @@
 //! a volume is closed.
 
 use luks_core::error::{LuksError, Result};
+use luks_core::fs::ext4::file::FileWriter;
 use luks_core::fs::{FileType, MountedFs as Fs};
 use std::sync::atomic::Ordering;
 
@@ -17,6 +18,47 @@ use super::VolumeHandle;
 /// This separate implementation means a read-only build does not merely
 /// refuse to write — it has nothing to refuse *with*.
 impl VolumeHandle {
+    /// Begin a bounded-memory file transfer. The returned state has no volume
+    /// reference, so storing it in a JNI handle cannot prolong key lifetime.
+    pub fn begin_file(&self, size: u64) -> Result<FileWriter> {
+        let mut fs = self.fs();
+        let Fs::Ext4(ext4) = &mut *fs else {
+            return Err(LuksError::UnsupportedFsFeature(
+                "writing to btrfs — this volume can be read but not written".into(),
+            ));
+        };
+        self.claim_writer()?;
+        ext4.begin_file(size)
+    }
+
+    /// Feed one chunk to a stream begun on this volume.
+    pub fn write_file_chunk(&self, writer: &mut FileWriter, data: &[u8]) -> Result<()> {
+        let mut fs = self.fs();
+        let Fs::Ext4(ext4) = &mut *fs else {
+            unreachable!("writer began on ext4")
+        };
+        ext4.write_chunk(writer, data)
+    }
+
+    /// Publish a complete streamed file.
+    pub fn finish_file(&self, writer: FileWriter, name: &str) -> Result<u64> {
+        let mut fs = self.fs();
+        let Fs::Ext4(ext4) = &mut *fs else {
+            unreachable!("writer began on ext4")
+        };
+        let ino = ext4.finish_file(writer, 2, name, FileType::Regular)?;
+        ext4.flush()?;
+        Ok(ino)
+    }
+
+    /// Explicitly discard an interrupted stream.
+    pub fn abandon_file(&self, writer: FileWriter) {
+        let mut fs = self.fs();
+        if let Fs::Ext4(ext4) = &mut *fs {
+            ext4.abandon_file(writer);
+        }
+    }
+
     /// Create `name` in the volume's root directory holding `data`, returning
     /// the new inode number.
     ///
@@ -77,15 +119,20 @@ impl VolumeHandle {
             ));
         };
 
+        self.claim_writer()?;
+
+        let ino = ext4.create_file(2, name, data, FileType::Regular)?;
+        ext4.flush()?;
+        Ok(ino)
+    }
+
+    fn claim_writer(&self) -> Result<()> {
         if !self.holds_writer.load(Ordering::Acquire) {
             self.device_writer
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .map_err(|_| LuksError::WriterBusy)?;
             self.holds_writer.store(true, Ordering::Release);
         }
-
-        let ino = ext4.create_file(2, name, data, FileType::Regular)?;
-        ext4.flush()?;
-        Ok(ino)
+        Ok(())
     }
 }

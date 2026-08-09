@@ -135,4 +135,9 @@ internal object LuksNative {
      * thread.
      */
     external fun nativeWriteFile(handle: Long, name: String, data: ByteArray): Long
+
+    external fun nativeBeginFile(handle: Long, sizeBytes: Long): Long
+    external fun nativeWriteChunk(handle: Long, writer: Long, data: ByteArray, len: Int)
+    external fun nativeFinishFile(handle: Long, writer: Long, name: String): Long
+    external fun nativeCloseWriter(handle: Long, writer: Long)
 }

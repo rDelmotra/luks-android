@@ -123,9 +123,12 @@ fn jstr(env: &mut JNIEnv, s: &JString) -> R<String> {
 }
 
 fn out_string(env: &mut JNIEnv, s: &str) -> R<jstring> {
-    env.new_string(s)
-        .map(|v| v.into_raw())
-        .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot allocate string: {e}")))
+    env.new_string(s).map(|v| v.into_raw()).map_err(|e| {
+        Fail::Msg(
+            bridge::code::GENERIC,
+            format!("cannot allocate string: {e}"),
+        )
+    })
 }
 
 fn out_bytes(env: &mut JNIEnv, b: &[u8]) -> R<jbyteArray> {
@@ -180,7 +183,10 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenDevice<'l>(
         let ep_in = u8::try_from(ep_in)
             .map_err(|_| Fail::Msg(bridge::code::TRANSPORT, format!("bad IN endpoint {ep_in}")))?;
         let ep_out = u8::try_from(ep_out).map_err(|_| {
-            Fail::Msg(bridge::code::TRANSPORT, format!("bad OUT endpoint {ep_out}"))
+            Fail::Msg(
+                bridge::code::TRANSPORT,
+                format!("bad OUT endpoint {ep_out}"),
+            )
         })?;
         let interface = u8::try_from(interface).map_err(|_| {
             Fail::Msg(
@@ -265,9 +271,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
 
         // Copied out of the Java array, then owned by a Secret so it is zeroed
         // when this scope ends — including on the error path.
-        let raw = env.convert_byte_array(&password).map_err(|e| {
-            Fail::Msg(bridge::code::GENERIC, format!("cannot read password: {e}"))
-        })?;
+        let raw = env
+            .convert_byte_array(&password)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read password: {e}")))?;
         let secret = bridge::password_secret(raw);
 
         let volume = dev.unlock(offset, secret.expose())?;
@@ -501,10 +507,117 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteFile<'l>(
         // SAFETY: validated against the volume magic tag.
         let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
         let name = jstr(env, &name)?;
-        let bytes = env.convert_byte_array(&data).map_err(|e| {
-            Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}"))
-        })?;
+        let bytes = env
+            .convert_byte_array(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
         let ino = vol.write_file(&name, &bytes)?;
         Ok(ino as jlong)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    size: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
+        let size = u64::try_from(size)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative file size".into()))?;
+        let writer = vol.begin_file(size)?;
+        Ok(bridge::into_raw(bridge::Payload::Writer(
+            bridge::WriterHandle {
+                volume_handle: volume,
+                writer: std::sync::Mutex::new(Some(writer)),
+            },
+        )))
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    writer: jlong,
+    data: JByteArray<'l>,
+    len: jint,
+) {
+    guard(&mut env, (), |env| {
+        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
+        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        if wh.volume_handle != volume {
+            return Err(bad_handle("writer belongs to another volume"));
+        }
+        let bytes = env
+            .convert_byte_array(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+        if len > bytes.len() {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                "chunk length exceeds buffer".into(),
+            ));
+        }
+        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let state = slot
+            .as_mut()
+            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        Ok(vol.write_file_chunk(state, &bytes[..len])?)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    writer: jlong,
+    name: JString<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
+        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        if wh.volume_handle != volume {
+            return Err(bad_handle("writer belongs to another volume"));
+        }
+        let name = jstr(env, &name)?;
+        let state = wh
+            .writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        let result = vol.finish_file(state, &name);
+        unsafe { bridge::drop_writer(writer) };
+        Ok(result? as jlong)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    writer: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
+        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        if wh.volume_handle != volume {
+            return Err(bad_handle("writer belongs to another volume"));
+        }
+        if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            vol.abandon_file(state);
+        }
+        unsafe { bridge::drop_writer(writer) };
+        Ok(())
     })
 }

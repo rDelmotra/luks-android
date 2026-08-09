@@ -171,6 +171,7 @@ class LuksDevice internal constructor(
 
 /** An unlocked volume with a mounted filesystem. */
 class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
+    private val activeWriters = mutableSetOf<FileWriter>()
 
     val info: VolumeInfo = JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
         val subvols = it.optJSONArray("subvolumes")
@@ -270,9 +271,45 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         return LuksNative.nativeWriteFile(handle, name, data)
     }
 
+    /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
+    fun beginFile(sizeBytes: Long): FileWriter {
+        check(handle != 0L) { "volume is closed" }
+        check(sizeBytes >= 0) { "negative file size" }
+        val writer = FileWriter(LuksNative.nativeBeginFile(handle, sizeBytes))
+        activeWriters += writer
+        return writer
+    }
+
+    inner class FileWriter internal constructor(private var writerHandle: Long) : AutoCloseable {
+        fun write(data: ByteArray, len: Int = data.size) {
+            check(writerHandle != 0L) { "writer is closed" }
+            check(handle != 0L) { "volume is closed" }
+            require(len in 0..data.size) { "chunk length exceeds buffer" }
+            LuksNative.nativeWriteChunk(handle, writerHandle, data, len)
+        }
+
+        fun finish(name: String): Long {
+            check(writerHandle != 0L) { "writer is closed" }
+            check(handle != 0L) { "volume is closed" }
+            val result = LuksNative.nativeFinishFile(handle, writerHandle, name)
+            writerHandle = 0
+            activeWriters -= this
+            return result
+        }
+
+        override fun close() {
+            if (writerHandle != 0L && handle != 0L) {
+                LuksNative.nativeCloseWriter(handle, writerHandle)
+            }
+            writerHandle = 0
+            activeWriters -= this
+        }
+    }
+
     /** Dropping this zeroes the master key held on the Rust side. */
     override fun close() {
         if (handle != 0L) {
+            activeWriters.toList().forEach { it.close() }
             LuksNative.nativeCloseVolume(handle)
             handle = 0
         }
