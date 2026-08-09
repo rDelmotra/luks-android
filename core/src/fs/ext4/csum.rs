@@ -239,4 +239,17 @@ impl Seed {
         let crc = crc32c_seed(crc, &dir_generation.to_le_bytes());
         Some(crc32c_seed(crc, &block[..block.len() - DIR_TAIL_SIZE]))
     }
+
+    /// An extent tree block's checksum, carried in an `ext4_extent_tail` struct
+    /// at the very end of the block.
+    ///
+    /// The checksum covers the entire block up to the start of the 4-byte tail.
+    pub fn extent_block(&self, ino: u64, generation: u32, block: &[u8]) -> Option<u32> {
+        if !self.enabled || block.len() < 4 {
+            return None;
+        }
+        let crc = crc32c_seed(self.seed, &(ino as u32).to_le_bytes());
+        let crc = crc32c_seed(crc, &generation.to_le_bytes());
+        Some(crc32c_seed(crc, &block[..block.len() - 4]))
+    }
 }

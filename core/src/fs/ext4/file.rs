@@ -75,6 +75,7 @@ pub struct FileWriter {
     size: u64,
     written: u64,
     blocks_needed: u64,
+    leaf_block: Option<u64>,
     /// At most one filesystem block. A caller may give arbitrary chunk sizes;
     /// holding this tail until it is complete avoids writing zero padding that
     /// a later chunk would need to overwrite.
@@ -91,7 +92,7 @@ const MAX_EXTENT_LEN: u64 = 32768;
 /// The allocator has no reason to respect `ee_len`'s ceiling — it hands back
 /// whatever contiguity it found — so a long run is cut here, at the layer that
 /// knows why the ceiling exists.
-fn runs_from(extents: &[Extent]) -> Result<Vec<Run>> {
+fn runs_from(extents: &[Extent], max_runs: usize) -> Result<Vec<Run>> {
     let mut runs = Vec::new();
     let mut logical = 0u64;
     for e in extents {
@@ -107,10 +108,10 @@ fn runs_from(extents: &[Extent]) -> Result<Vec<Run>> {
             offset += len;
         }
     }
-    if runs.len() > MAX_INLINE_EXTENTS {
+    if runs.len() > max_runs {
         return Err(LuksError::UnsupportedFsFeature(
-            "file needs more than 4 extents — interior extent \
-             nodes are not yet implemented"
+            "file needs more extents than the max leaf node size — multi-leaf \
+             extent trees are not yet implemented"
                 .into(),
         ));
     }
@@ -126,20 +127,34 @@ impl<D: WriteAt> Ext4<D> {
         let bs = self.sb.block_size as u64;
         let blocks_needed = size.div_ceil(bs.max(1));
         let ino = self.alloc_inode(false)?;
-        let extents = match self.alloc_blocks(0, blocks_needed) {
+        let mut extents = match self.alloc_blocks(0, blocks_needed) {
             Ok(extents) => extents,
             Err(e) => {
                 self.undo_new_file(ino, &[]);
                 return Err(e);
             }
         };
-        let runs = match runs_from(&extents) {
+        let max_runs = (bs as usize - 12 - 4) / 12;
+        let runs = match runs_from(&extents, max_runs) {
             Ok(runs) => runs,
             Err(e) => {
                 self.undo_new_file(ino, &extents);
                 return Err(e);
             }
         };
+        let mut leaf_block = None;
+        if runs.len() > MAX_INLINE_EXTENTS {
+            match self.alloc_blocks(0, 1) {
+                Ok(mut e) => {
+                    leaf_block = Some(e[0].physical);
+                    extents.append(&mut e);
+                }
+                Err(e) => {
+                    self.undo_new_file(ino, &extents);
+                    return Err(e);
+                }
+            }
+        }
         Ok(FileWriter {
             ino,
             extents,
@@ -148,6 +163,7 @@ impl<D: WriteAt> Ext4<D> {
             size,
             written: 0,
             blocks_needed,
+            leaf_block,
             tail: Vec::new(),
         })
     }
@@ -231,12 +247,16 @@ impl<D: WriteAt> Ext4<D> {
             self.write_full_blocks(&writer.runs, at, &padded)?;
             writer.tail.clear();
         }
+        if let Some(lb) = writer.leaf_block {
+            self.write_extent_leaf_block(lb, writer.ino, &writer.runs, &writer.seed)?;
+        }
         self.flush()?;
         self.write_inode_record(
             writer.ino,
             writer.size,
             writer.blocks_needed,
             &writer.runs,
+            writer.leaf_block,
             &writer.seed,
         )?;
         Ok(writer.ino)
@@ -384,7 +404,7 @@ impl<D: WriteAt> Ext4<D> {
         // once per group it touches instead of once per block, which is the
         // difference between a 50 MB file costing ~85,000 SCSI commands and
         // costing a few hundred.
-        let extents = match self.alloc_blocks(0, blocks_needed) {
+        let mut extents = match self.alloc_blocks(0, blocks_needed) {
             Ok(e) => e,
             Err(e) => {
                 self.undo_new_file(ino, &[]);
@@ -392,11 +412,8 @@ impl<D: WriteAt> Ext4<D> {
             }
         };
 
-        // The four-extent ceiling is checked here, after the allocation rather
-        // than during it. Nothing is wasted by that: a batch that turns out
-        // too fragmented is handed straight back to `free_blocks`, which
-        // releases it in the same one-commit-per-group way it was taken.
-        let runs = match runs_from(&extents) {
+        let max_runs = (bs as usize - 12 - 4) / 12;
+        let runs = match runs_from(&extents, max_runs) {
             Ok(r) => r,
             Err(e) => {
                 self.undo_new_file(ino, &extents);
@@ -404,9 +421,29 @@ impl<D: WriteAt> Ext4<D> {
             }
         };
 
+        let mut leaf_block = None;
+        if runs.len() > MAX_INLINE_EXTENTS {
+            match self.alloc_blocks(0, 1) {
+                Ok(mut e) => {
+                    leaf_block = Some(e[0].physical);
+                    extents.append(&mut e);
+                }
+                Err(e) => {
+                    self.undo_new_file(ino, &extents);
+                    return Err(e);
+                }
+            }
+        }
+
         if let Err(e) = self.write_file_data(&runs, data) {
             self.undo_new_file(ino, &extents);
             return Err(e);
+        }
+        if let Some(lb) = leaf_block {
+            if let Err(e) = self.write_extent_leaf_block(lb, ino, &runs, &seed) {
+                self.undo_new_file(ino, &extents);
+                return Err(e);
+            }
         }
 
         // The barrier that keeps a file from ever reading back as somebody
@@ -417,7 +454,7 @@ impl<D: WriteAt> Ext4<D> {
             return Err(e);
         }
 
-        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed)
+        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, leaf_block, &seed)
         {
             self.undo_new_file(ino, &extents);
             return Err(e);
@@ -451,6 +488,39 @@ impl<D: WriteAt> Ext4<D> {
         }
         Ok(())
     }
+    fn write_extent_leaf_block(
+        &mut self,
+        leaf_block: u64,
+        ino: u64,
+        runs: &[Run],
+        seed: &Seed,
+    ) -> Result<()> {
+        let bs = self.sb.block_size as usize;
+        let mut block = vec![0u8; bs];
+
+        put16(&mut block, 0, EXTENT_MAGIC); // eh_magic
+        put16(&mut block, 2, runs.len() as u16); // eh_entries
+        let max = (bs - 12 - 4) / 12;
+        put16(&mut block, 4, max as u16); // eh_max
+        put16(&mut block, 6, 0); // eh_depth — leaf node
+        put32(&mut block, 8, 0); // eh_generation
+
+        for (i, r) in runs.iter().enumerate() {
+            let e = &mut block[12 + i * 12..24 + i * 12];
+            put32(e, 0, r.logical as u32);
+            put16(e, 4, r.len as u16);
+            put16(e, 6, (r.physical >> 32) as u16);
+            put32(e, 8, r.physical as u32);
+        }
+
+        if let Some(csum) = seed.extent_block(ino, 0, &block) {
+            let tail = &mut block[bs - 4..bs];
+            put32(tail, 0, csum);
+        }
+
+        self.device.write_at(leaf_block * bs as u64, &block)?;
+        Ok(())
+    }
 
     fn write_inode_record(
         &mut self,
@@ -458,6 +528,7 @@ impl<D: WriteAt> Ext4<D> {
         size: u64,
         blocks_needed: u64,
         runs: &[Run],
+        leaf_block: Option<u64>,
         seed: &Seed,
     ) -> Result<()> {
         let isize_ = self.sb.inode_size as usize;
@@ -477,7 +548,7 @@ impl<D: WriteAt> Ext4<D> {
         put32(&mut raw, 0x1C, blocks_needed as u32 * sectors_per_block); // i_blocks_lo
         put32(&mut raw, 0x20, FL_EXTENTS); // i_flags
 
-        write_extent_tree(&mut raw[0x28..0x28 + 60], runs)?;
+        write_extent_tree(&mut raw[0x28..0x28 + 60], runs, leaf_block)?;
 
         if isize_ > 128 {
             // Clamped to the room that actually exists past the base inode,
@@ -508,9 +579,25 @@ impl<D: WriteAt> Ext4<D> {
 }
 
 /// Serialise up to [`MAX_INLINE_EXTENTS`] runs into the 60-byte `i_block`
-/// extent tree. `area` must be exactly 60 bytes.
-fn write_extent_tree(area: &mut [u8], runs: &[Run]) -> Result<()> {
+/// extent tree, or write an interior node if `leaf_block` is provided. `area` must be exactly 60 bytes.
+fn write_extent_tree(area: &mut [u8], runs: &[Run], leaf_block: Option<u64>) -> Result<()> {
     debug_assert_eq!(area.len(), 60);
+
+    if let Some(lb) = leaf_block {
+        put16(area, 0, EXTENT_MAGIC); // eh_magic
+        put16(area, 2, 1); // eh_entries
+        put16(area, 4, MAX_INLINE_EXTENTS as u16); // eh_max
+        put16(area, 6, 1); // eh_depth — 1: this node points to leaves
+        put32(area, 8, 0); // eh_generation
+
+        let e = &mut area[12..24];
+        put32(e, 0, runs[0].logical as u32); // ei_block
+        put32(e, 4, lb as u32); // ei_leaf_lo
+        put16(e, 8, (lb >> 32) as u16); // ei_leaf_hi
+        put16(e, 10, 0); // ei_unused
+        return Ok(());
+    }
+
     if runs.len() > MAX_INLINE_EXTENTS {
         return Err(LuksError::UnsupportedFsFeature(
             "more extents than fit inline".into(),

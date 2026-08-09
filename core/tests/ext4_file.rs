@@ -135,12 +135,11 @@ fn an_empty_file_has_no_blocks_and_still_reads_back() {
 }
 
 #[test]
-fn a_file_needing_a_fifth_extent_is_refused_not_corrupted() {
+fn a_file_needing_more_than_4_extents_creates_an_index_node() {
     // Force fragmentation: pre-allocate every other block near the start of
     // group 0 so a subsequent multi-block write cannot find more than a
     // handful of blocks contiguous at a time, then ask for far more than 4
-    // fragments' worth. Writing must fail cleanly — no partial inode, no
-    // leaked blocks — rather than truncating the extent tree.
+    // fragments' worth. It should allocate an index block and succeed.
     let path = scratch("many-groups-1k.img", "fragmented");
     let mut fs = open(&path);
 
@@ -163,23 +162,28 @@ fn a_file_needing_a_fifth_extent_is_refused_not_corrupted() {
     // 30 single-byte-apart blocks against a checkerboard cannot land in fewer
     // than 5 runs.
     let content = vec![0xAAu8; 30 * fs.block_size() as usize];
-    let result = fs.write_new_file(&content);
-    assert!(
-        result.is_err(),
-        "a 30-block write into checkerboarded free space should need more than 4 extents"
-    );
+    let ino = fs.write_new_file(&content).expect("a 30-block fragmented write should succeed");
 
     fs.flush().expect("flush");
     assert_eq!(
         fs.superblock().free_blocks_count,
-        free_before,
-        "a refused write must not leak blocks"
+        free_before - 30 - 1, // 30 data blocks + 1 extent leaf block
+        "a fragmented write should consume 1 extra block for the extent tree"
     );
     assert_eq!(
         fs.superblock().free_inodes_count,
-        ino_before_next,
-        "a refused write must not leak the inode it allocated to hold it"
+        ino_before_next - 1,
+        "it should consume 1 inode"
     );
+
+    drop(fs);
+
+    // Also verify we can read it back
+    let fs = Ext4::mount(FileDevice::open(&path).expect("reopen")).expect("mount");
+    let mut read_back = vec![0u8; content.len()];
+    let inode = fs.read_inode(ino).expect("read inode");
+    fs.read_inode_data(&inode, 0, &mut read_back).expect("read data");
+    assert_eq!(read_back, content, "read content must match written content");
 }
 
 #[test]
