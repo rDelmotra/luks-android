@@ -585,13 +585,19 @@ private fun UnlockedBody(
         if (uri == null) return@rememberLauncherForActivityResult
         onBusyChange(true)
         scope.launch {
-            var lastUpdateMs = 0L
+            var lastUpdateMs = System.currentTimeMillis()
+            var lastUpdateBytes = 0L
             status = importFile(context, state.volume, path, uri) { done, total ->
                 val now = System.currentTimeMillis()
-                if (now - lastUpdateMs > 300 || done == total) {
+                val dt = now - lastUpdateMs
+                if (dt >= 500 || done == total) {
+                    val bytesDelta = done - lastUpdateBytes
+                    val speedBytesPerSec = if (dt > 0) (bytesDelta * 1000L) / dt else 0L
                     lastUpdateMs = now
+                    lastUpdateBytes = done
                     val pct = if (total > 0) done * 100 / total else 0
-                    status = "uploading — $pct% (${formatSize(done)} of ${formatSize(total)})"
+                    val speedStr = if (speedBytesPerSec > 0) " · %.1f MiB/s".format(speedBytesPerSec.toDouble() / (1L shl 20)) else ""
+                    status = "uploading — $pct% (${formatSize(done)} of ${formatSize(total)})$speedStr"
                 }
             }
             try {
