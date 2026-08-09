@@ -22,7 +22,7 @@
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::BulkTransport;
-use std::os::raw::{c_uint, c_void};
+use std::os::raw::{c_int, c_uint, c_void};
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -62,12 +62,22 @@ type IoctlReq = libc::c_ulong;
 const USB_IOC: u8 = b'U';
 
 #[repr(C)]
-struct UsbFsBulkTransfer {
-    ep: c_uint,
-    len: c_uint,
-    timeout: c_uint,
-    data: *mut c_void,
+struct UsbdevfsUrb {
+    urb_type: u8,
+    endpoint: u8,
+    status: c_int,
+    flags: c_uint,
+    buffer: *mut c_void,
+    buffer_length: c_int,
+    actual_length: c_int,
+    start_frame: c_int,
+    number_of_packets_or_stream_id: c_int,
+    error_count: c_int,
+    signr: c_uint,
+    usercontext: *mut c_void,
 }
+
+const USBDEVFS_URB_TYPE_BULK: u8 = 3;
 
 #[repr(C)]
 struct UsbFsCtrlTransfer {
@@ -80,12 +90,25 @@ struct UsbFsCtrlTransfer {
     data: *mut c_void,
 }
 
-fn bulk_code() -> u32 {
+fn submit_urb_code() -> u32 {
     ioc(
-        DIR_WRITE | DIR_READ,
+        DIR_READ,
         USB_IOC,
-        2,
-        std::mem::size_of::<UsbFsBulkTransfer>(),
+        10,
+        std::mem::size_of::<UsbdevfsUrb>(),
+    )
+}
+
+fn discard_urb_code() -> u32 {
+    ioc(DIR_NONE, USB_IOC, 11, 0)
+}
+
+fn reap_urb_code() -> u32 {
+    ioc(
+        DIR_WRITE,
+        USB_IOC,
+        12,
+        std::mem::size_of::<*mut c_void>(),
     )
 }
 
@@ -108,6 +131,12 @@ fn release_code() -> u32 {
 
 fn clear_halt_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 21, std::mem::size_of::<c_uint>())
+}
+
+struct InFlightUrb {
+    urb: UsbdevfsUrb,
+    submitted: bool,
+    reaped: bool,
 }
 
 // --------------------------------------------------------------------- errors
@@ -191,7 +220,7 @@ impl UsbFsTransport {
     /// command of which only 273 µs was wire time, so two thirds of the link was
     /// spent on overhead. Bigger transfers amortise the wrappers over more
     /// payload.
-    pub const DEFAULT_MAX_TRANSFER: usize = 128 * 1024;
+    pub const DEFAULT_MAX_TRANSFER: usize = 1024 * 1024;
 
     /// Never shrink below this. A transfer this small still works on any
     /// kernel, so an `EINVAL` here means something other than the size and
@@ -285,44 +314,178 @@ impl UsbFsTransport {
         Ok(())
     }
 
-    /// One synchronous bulk transfer. Returns the number of bytes moved, which
-    /// may be less than requested — short reads are normal on the IN endpoint.
+    /// One asynchronous bulk transfer split into smaller URBs. Returns the number of
+    /// bytes moved, which may be less than requested — short reads are normal on the
+    /// IN endpoint.
     fn bulk_out(&self, ep: u8, buf: &[u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
 
+        const CHUNK_SIZE: usize = 128 * 1024;
+
         loop {
             let limit = self.max_transfer.load(Ordering::Relaxed);
-            let len = buf.len().min(limit);
-
-            let mut req = UsbFsBulkTransfer {
-                ep: ep as c_uint,
-                len: len as c_uint,
-                timeout: self.timeout_ms,
-                data: buf.as_ptr() as *mut c_void,
-            };
-
-            let rc = unsafe {
-                libc::ioctl(
-                    self.fd,
-                    bulk_code() as IoctlReq,
-                    &mut req as *mut UsbFsBulkTransfer as *mut c_void,
-                )
-            };
-            if rc >= 0 {
-                return Ok(rc as usize);
+            let mut chunks = Vec::new();
+            let mut offset = 0;
+            while offset < buf.len() && offset < limit {
+                let chunk_len = (buf.len() - offset).min(CHUNK_SIZE).min(limit - offset);
+                if chunk_len == 0 {
+                    break;
+                }
+                chunks.push(&buf[offset..offset + chunk_len]);
+                offset += chunk_len;
             }
 
-            let e = errno();
-
-            if (e == libc::EINVAL || e == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                continue;
+            let num_urbs = chunks.len();
+            let mut urbs = Vec::with_capacity(num_urbs);
+            for i in 0..num_urbs {
+                urbs.push(InFlightUrb {
+                    urb: UsbdevfsUrb {
+                        urb_type: USBDEVFS_URB_TYPE_BULK,
+                        endpoint: ep,
+                        status: 0,
+                        flags: 0,
+                        buffer: chunks[i].as_ptr() as *mut c_void,
+                        buffer_length: chunks[i].len() as i32,
+                        actual_length: 0,
+                        start_frame: 0,
+                        number_of_packets_or_stream_id: 0,
+                        error_count: 0,
+                        signr: 0,
+                        usercontext: std::ptr::null_mut(),
+                    },
+                    submitted: false,
+                    reaped: false,
+                });
             }
 
-            return Err(bulk_err(len, limit, e));
+            for i in 0..num_urbs {
+                let inflight_ptr = &mut urbs[i] as *mut InFlightUrb as *mut c_void;
+                urbs[i].urb.usercontext = inflight_ptr;
+            }
+
+            let mut submit_err = None;
+            let mut submitted_count = 0;
+
+            for i in 0..num_urbs {
+                let rc = unsafe {
+                    libc::ioctl(
+                        self.fd,
+                        submit_urb_code() as IoctlReq,
+                        &mut urbs[i].urb as *mut UsbdevfsUrb as *mut c_void,
+                    )
+                };
+                if rc < 0 {
+                    submit_err = Some(errno());
+                    break;
+                }
+                urbs[i].submitted = true;
+                submitted_count += 1;
+            }
+
+            if let Some(err) = submit_err {
+                for j in 0..submitted_count {
+                    if urbs[j].submitted && !urbs[j].reaped {
+                        unsafe {
+                            libc::ioctl(
+                                self.fd,
+                                discard_urb_code() as IoctlReq,
+                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                            );
+                        }
+                    }
+                }
+
+                let mut completed = 0;
+                while completed < submitted_count {
+                    let mut reaped: *mut c_void = std::ptr::null_mut();
+                    let rc = unsafe {
+                        libc::ioctl(
+                            self.fd,
+                            reap_urb_code() as IoctlReq,
+                            &mut reaped as *mut *mut c_void as *mut c_void,
+                        )
+                    };
+                    if rc < 0 {
+                        let e = errno();
+                        if e == libc::EINTR {
+                            continue;
+                        }
+                        break;
+                    }
+                    let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
+                    inflight.reaped = true;
+                    completed += 1;
+                }
+
+                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
+                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                    continue;
+                }
+                return Err(bulk_err(offset, limit, err));
+            }
+
+            let mut completed = 0;
+            let mut transfer_err = None;
+            let mut total_transferred = 0;
+
+            while completed < submitted_count {
+                let mut reaped: *mut c_void = std::ptr::null_mut();
+                let rc = unsafe {
+                    libc::ioctl(
+                        self.fd,
+                        reap_urb_code() as IoctlReq,
+                        &mut reaped as *mut *mut c_void as *mut c_void,
+                    )
+                };
+                if rc < 0 {
+                    let e = errno();
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    transfer_err = Some(e);
+                    break;
+                }
+                let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
+                inflight.reaped = true;
+                completed += 1;
+
+                let status = inflight.urb.status;
+                if status < 0 {
+                    let err = -status;
+                    let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
+                    if !was_discarded && transfer_err.is_none() {
+                        transfer_err = Some(err);
+
+                        for j in 0..submitted_count {
+                            if urbs[j].submitted && !urbs[j].reaped {
+                                unsafe {
+                                    libc::ioctl(
+                                        self.fd,
+                                        discard_urb_code() as IoctlReq,
+                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    total_transferred += inflight.urb.actual_length as usize;
+                }
+            }
+
+            if let Some(err) = transfer_err {
+                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
+                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                    continue;
+                }
+                return Err(bulk_err(total_transferred, limit, err));
+            }
+
+            return Ok(total_transferred);
         }
     }
 
@@ -331,37 +494,184 @@ impl UsbFsTransport {
             return Ok(0);
         }
 
+        const CHUNK_SIZE: usize = 128 * 1024;
+
         loop {
             let limit = self.max_transfer.load(Ordering::Relaxed);
-            let len = buf.len().min(limit);
-
-            let mut req = UsbFsBulkTransfer {
-                ep: ep as c_uint,
-                len: len as c_uint,
-                timeout: self.timeout_ms,
-                data: buf.as_mut_ptr() as *mut c_void,
-            };
-
-            let rc = unsafe {
-                libc::ioctl(
-                    self.fd,
-                    bulk_code() as IoctlReq,
-                    &mut req as *mut UsbFsBulkTransfer as *mut c_void,
-                )
-            };
-            if rc >= 0 {
-                return Ok(rc as usize);
+            let mut chunks = Vec::new();
+            let buf_len = buf.len();
+            let mut remaining = &mut buf[..limit.min(buf_len)];
+            while !remaining.is_empty() {
+                let chunk_len = remaining.len().min(CHUNK_SIZE);
+                let (chunk, rest) = remaining.split_at_mut(chunk_len);
+                chunks.push(chunk);
+                remaining = rest;
             }
 
-            let e = errno();
-
-            if (e == libc::EINVAL || e == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                continue;
+            let num_urbs = chunks.len();
+            let mut urbs = Vec::with_capacity(num_urbs);
+            for i in 0..num_urbs {
+                urbs.push(InFlightUrb {
+                    urb: UsbdevfsUrb {
+                        urb_type: USBDEVFS_URB_TYPE_BULK,
+                        endpoint: ep,
+                        status: 0,
+                        flags: 0,
+                        buffer: chunks[i].as_mut_ptr() as *mut c_void,
+                        buffer_length: chunks[i].len() as i32,
+                        actual_length: 0,
+                        start_frame: 0,
+                        number_of_packets_or_stream_id: 0,
+                        error_count: 0,
+                        signr: 0,
+                        usercontext: std::ptr::null_mut(),
+                    },
+                    submitted: false,
+                    reaped: false,
+                });
             }
 
-            return Err(bulk_err(len, limit, e));
+            for i in 0..num_urbs {
+                let inflight_ptr = &mut urbs[i] as *mut InFlightUrb as *mut c_void;
+                urbs[i].urb.usercontext = inflight_ptr;
+            }
+
+            let mut submit_err = None;
+            let mut submitted_count = 0;
+
+            for i in 0..num_urbs {
+                let rc = unsafe {
+                    libc::ioctl(
+                        self.fd,
+                        submit_urb_code() as IoctlReq,
+                        &mut urbs[i].urb as *mut UsbdevfsUrb as *mut c_void,
+                    )
+                };
+                if rc < 0 {
+                    submit_err = Some(errno());
+                    break;
+                }
+                urbs[i].submitted = true;
+                submitted_count += 1;
+            }
+
+            if let Some(err) = submit_err {
+                for j in 0..submitted_count {
+                    if urbs[j].submitted && !urbs[j].reaped {
+                        unsafe {
+                            libc::ioctl(
+                                self.fd,
+                                discard_urb_code() as IoctlReq,
+                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                            );
+                        }
+                    }
+                }
+
+                let mut completed = 0;
+                while completed < submitted_count {
+                    let mut reaped: *mut c_void = std::ptr::null_mut();
+                    let rc = unsafe {
+                        libc::ioctl(
+                            self.fd,
+                            reap_urb_code() as IoctlReq,
+                            &mut reaped as *mut *mut c_void as *mut c_void,
+                        )
+                    };
+                    if rc < 0 {
+                        let e = errno();
+                        if e == libc::EINTR {
+                            continue;
+                        }
+                        break;
+                    }
+                    let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
+                    inflight.reaped = true;
+                    completed += 1;
+                }
+
+                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
+                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                    continue;
+                }
+                return Err(bulk_err(0, limit, err));
+            }
+
+            let mut completed = 0;
+            let mut transfer_err = None;
+            let mut total_transferred = 0;
+
+            while completed < submitted_count {
+                let mut reaped: *mut c_void = std::ptr::null_mut();
+                let rc = unsafe {
+                    libc::ioctl(
+                        self.fd,
+                        reap_urb_code() as IoctlReq,
+                        &mut reaped as *mut *mut c_void as *mut c_void,
+                    )
+                };
+                if rc < 0 {
+                    let e = errno();
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    transfer_err = Some(e);
+                    break;
+                }
+                let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
+                inflight.reaped = true;
+                completed += 1;
+
+                let status = inflight.urb.status;
+                if status < 0 {
+                    let err = -status;
+                    let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
+                    if !was_discarded && transfer_err.is_none() {
+                        transfer_err = Some(err);
+
+                        for j in 0..submitted_count {
+                            if urbs[j].submitted && !urbs[j].reaped {
+                                unsafe {
+                                    libc::ioctl(
+                                        self.fd,
+                                        discard_urb_code() as IoctlReq,
+                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    total_transferred += inflight.urb.actual_length as usize;
+
+                    let short_read = inflight.urb.actual_length < inflight.urb.buffer_length;
+                    if short_read {
+                        for j in 0..submitted_count {
+                            if urbs[j].submitted && !urbs[j].reaped {
+                                unsafe {
+                                    libc::ioctl(
+                                        self.fd,
+                                        discard_urb_code() as IoctlReq,
+                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(err) = transfer_err {
+                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
+                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                    continue;
+                }
+                return Err(bulk_err(total_transferred, limit, err));
+            }
+
+            return Ok(total_transferred);
         }
     }
 }
@@ -468,9 +778,11 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn ioctl_codes_match_the_kernel_header() {
-        assert_eq!(std::mem::size_of::<UsbFsBulkTransfer>(), 24);
+        assert_eq!(std::mem::size_of::<UsbdevfsUrb>(), 56);
         assert_eq!(std::mem::size_of::<UsbFsCtrlTransfer>(), 24);
-        assert_eq!(bulk_code(), 0xC018_5502, "USBDEVFS_BULK");
+        assert_eq!(submit_urb_code(), 0x8038_550A, "USBDEVFS_SUBMITURB");
+        assert_eq!(discard_urb_code(), 0x0000_550B, "USBDEVFS_DISCARDURB");
+        assert_eq!(reap_urb_code(), 0x4008_550C, "USBDEVFS_REAPURB");
         assert_eq!(control_code(), 0xC018_5500, "USBDEVFS_CONTROL");
         assert_eq!(claim_code(), 0x8004_550F, "USBDEVFS_CLAIMINTERFACE");
         assert_eq!(release_code(), 0x8004_5510, "USBDEVFS_RELEASEINTERFACE");
@@ -482,8 +794,9 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "32")]
     fn ioctl_codes_match_the_kernel_header_32bit() {
-        assert_eq!(std::mem::size_of::<UsbFsBulkTransfer>(), 16);
-        assert_eq!(bulk_code(), 0xC010_5502, "USBDEVFS_BULK");
+        assert_eq!(std::mem::size_of::<UsbdevfsUrb>(), 44);
+        assert_eq!(submit_urb_code(), 0x802C_550A, "USBDEVFS_SUBMITURB");
+        assert_eq!(reap_urb_code(), 0x4004_550C, "USBDEVFS_REAPURB");
     }
 
     #[test]
