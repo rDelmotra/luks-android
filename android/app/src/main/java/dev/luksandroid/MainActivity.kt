@@ -585,9 +585,14 @@ private fun UnlockedBody(
         if (uri == null) return@rememberLauncherForActivityResult
         onBusyChange(true)
         scope.launch {
+            var lastUpdateMs = 0L
             status = importFile(context, state.volume, path, uri) { done, total ->
-                val pct = if (total > 0) done * 100 / total else 0
-                status = "uploading — $pct% (${formatSize(done)} of ${formatSize(total)})"
+                val now = System.currentTimeMillis()
+                if (now - lastUpdateMs > 300 || done == total) {
+                    lastUpdateMs = now
+                    val pct = if (total > 0) done * 100 / total else 0
+                    status = "uploading — $pct% (${formatSize(done)} of ${formatSize(total)})"
+                }
             }
             try {
                 entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
@@ -1038,7 +1043,7 @@ private suspend fun importFile(
     "upload failed: ${e.message}"
 }
 
-private const val IMPORT_CHUNK = 4 shl 20 // 4 MiB
+private const val IMPORT_CHUNK = 512 shl 10 // 512 KiB (matches 4x 128 KiB SCSI hardware pipeline)
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
