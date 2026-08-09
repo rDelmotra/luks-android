@@ -112,8 +112,86 @@ impl<D: WriteAt> Ext4<D> {
 
     fn read_bitmap(&self, group: usize, which: Bitmap) -> Result<Vec<u8>> {
         let (offset, len) = self.bitmap_extent(group, which)?;
-        let mut buf = vec![0u8; len];
+
+        let is_uninit = match which {
+            Bitmap::Block => self.groups[group].block_bitmap_uninit(),
+            Bitmap::Inode => self.groups[group].inode_bitmap_uninit(),
+        };
+        if is_uninit {
+            return self.materialize_bitmap(group, which, self.sb.block_size as usize);
+        }
+
+        let mut buf = vec![0u8; self.sb.block_size as usize];
         self.device.read_at(offset, &mut buf)?;
+        Ok(buf)
+    }
+
+    fn materialize_bitmap(&self, group: usize, which: Bitmap, len: usize) -> Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let sb = &self.sb;
+
+        let set_bit = |buf: &mut [u8], bit: usize| {
+            if bit / 8 < buf.len() {
+                buf[bit / 8] |= 1 << (bit % 8);
+            }
+        };
+
+        match which {
+            Bitmap::Inode => {
+                let first_inode = (group as u32 * sb.inodes_per_group) + 1;
+                let mut valid_inodes = sb.inodes_per_group;
+                if first_inode + sb.inodes_per_group - 1 > sb.inodes_count {
+                    valid_inodes = sb.inodes_count.saturating_sub(first_inode) + 1;
+                }
+                for i in valid_inodes as usize..buf.len() * 8 {
+                    set_bit(&mut buf, i);
+                }
+            }
+            Bitmap::Block => {
+                let first_block = sb.group_first_block(group);
+                let mut valid_blocks = sb.blocks_per_group;
+                if first_block + valid_blocks as u64 > sb.blocks_count {
+                    valid_blocks = (sb.blocks_count.saturating_sub(first_block)) as u32;
+                }
+                for b in valid_blocks as usize..buf.len() * 8 {
+                    set_bit(&mut buf, b);
+                }
+
+                if sb.group_has_super(group) {
+                    let mut meta_blocks = 1 + sb.reserved_gdt_blocks as u32;
+                    let desc_bytes = self.groups.len() as u64 * sb.desc_size as u64;
+                    let desc_blocks = (desc_bytes + sb.block_size as u64 - 1) / sb.block_size as u64;
+                    meta_blocks += desc_blocks as u32;
+
+                    for i in 0..meta_blocks {
+                        set_bit(&mut buf, i as usize);
+                    }
+                }
+
+                let group_last_block = first_block + valid_blocks as u64 - 1;
+                for g in &self.groups {
+                    let bb = g.block_bitmap;
+                    if bb >= first_block && bb <= group_last_block {
+                        set_bit(&mut buf, (bb - first_block) as usize);
+                    }
+                    let ib = g.inode_bitmap;
+                    if ib >= first_block && ib <= group_last_block {
+                        set_bit(&mut buf, (ib - first_block) as usize);
+                    }
+                    let it_start = g.inode_table;
+                    let it_blocks = (sb.inodes_per_group as u64 * sb.inode_size as u64) / sb.block_size as u64;
+                    let it_end = it_start + it_blocks - 1;
+
+                    let overlap_start = it_start.max(first_block);
+                    let overlap_end = it_end.min(group_last_block);
+                    if overlap_start <= overlap_end {
+                        for b in overlap_start..=overlap_end {
+                            set_bit(&mut buf, (b - first_block) as usize);
+                        }
+                    }
+                }
+            }
+        }
         Ok(buf)
     }
 
@@ -121,10 +199,10 @@ impl<D: WriteAt> Ext4<D> {
     /// descriptor. The descriptor itself is not flushed here — the caller
     /// adjusts the counters first, so that it is written exactly once.
     fn write_bitmap(&mut self, group: usize, which: Bitmap, bm: &[u8], seed: &Seed) -> Result<()> {
-        let (offset, _) = self.bitmap_extent(group, which)?;
+        let (offset, csum_len) = self.bitmap_extent(group, which)?;
         self.device.write_at(offset, bm)?;
 
-        if let Some(csum) = seed.bitmap(bm) {
+        if let Some(csum) = seed.bitmap(&bm[..csum_len]) {
             let g = &mut self.groups[group];
             match which {
                 Bitmap::Block => g.block_bitmap_csum = csum,
@@ -212,6 +290,10 @@ impl<D: WriteAt> Ext4<D> {
 
     /// Push a group's bitmap, descriptor and the superblock in the safe order.
     fn commit(&mut self, group: usize, which: Bitmap, bm: &[u8], seed: &Seed) -> Result<()> {
+        match which {
+            Bitmap::Block => self.groups[group].flags &= !crate::fs::ext4::BG_BLOCK_UNINIT,
+            Bitmap::Inode => self.groups[group].flags &= !crate::fs::ext4::BG_INODE_UNINIT,
+        }
         self.write_bitmap(group, which, bm, seed)?;
         self.write_group_desc(group, seed)?;
         self.write_superblock(seed)
@@ -268,7 +350,7 @@ impl<D: WriteAt> Ext4<D> {
                 break;
             }
             let g = (start + n) % ngroups;
-            if self.groups[g].block_bitmap_uninit() || self.groups[g].free_blocks_count == 0 {
+            if self.groups[g].free_blocks_count == 0 {
                 continue;
             }
 
@@ -318,6 +400,7 @@ impl<D: WriteAt> Ext4<D> {
         // ahead of its bitmap, is still impossible.
         for (g, bm, taken) in &plan {
             self.groups[*g].free_blocks_count -= *taken as u32;
+            self.groups[*g].flags &= !crate::fs::ext4::BG_BLOCK_UNINIT;
             // Saturating: the superblock counter can already be stale-low on a
             // filesystem that saw an unclean unmount. Wrapping it to 2^64-1
             // and re-checksumming would *sign* the nonsense; sticking at 0
@@ -369,12 +452,6 @@ impl<D: WriteAt> Ext4<D> {
                 let g = ((block - first) / per) as usize;
                 let bit = ((block - first) % per) as usize;
 
-                if self.groups[g].block_bitmap_uninit() {
-                    return Err(LuksError::CorruptFs(
-                        "free of a block in an uninitialised group",
-                    ));
-                }
-
                 let slot = match plan.iter().position(|(gi, _, _)| *gi == g) {
                     Some(i) => i,
                     None => {
@@ -394,6 +471,7 @@ impl<D: WriteAt> Ext4<D> {
 
         for (g, bm, freed) in &plan {
             self.groups[*g].free_blocks_count += *freed;
+            self.groups[*g].flags &= !crate::fs::ext4::BG_BLOCK_UNINIT;
             self.sb.free_blocks_count += *freed as u64;
             self.write_bitmap(*g, Bitmap::Block, bm, &seed)?;
             self.write_group_desc(*g, &seed)?;
@@ -432,7 +510,7 @@ impl<D: WriteAt> Ext4<D> {
         let first_ino = self.sb.first_ino as u64;
 
         for g in 0..self.groups.len() {
-            if self.groups[g].inode_bitmap_uninit() || self.groups[g].free_inodes_count == 0 {
+            if self.groups[g].free_inodes_count == 0 {
                 continue;
             }
 

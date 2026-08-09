@@ -145,7 +145,11 @@ pub struct Superblock {
     /// is not cleanly unmounted or has recorded errors — see
     /// [`csum::Seed::for_writing`].
     pub state: u16,
+    pub reserved_gdt_blocks: u16,
 }
+
+pub const EXT4_FEATURE_COMPAT_RESIZE_INODE: u32 = 0x0010;
+pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 
 impl Superblock {
     fn parse(b: &[u8]) -> Result<Self> {
@@ -162,15 +166,16 @@ impl Superblock {
 
         let rev_level = u32le(b, 76);
         // Revision 0 predates configurable inode sizes and fixes them at 128.
-        let (inode_size, feature_incompat, feature_ro_compat, desc_size) = if rev_level >= 1 {
+        let (inode_size, feature_compat, feature_incompat, feature_ro_compat, desc_size) = if rev_level >= 1 {
             (
                 u16le(b, 88),
+                u32le(b, 92),
                 u32le(b, 96),
                 u32le(b, 100),
                 u16le(b, 254),
             )
         } else {
-            (128, 0, 0, 0)
+            (128, 0, 0, 0, 0)
         };
         if inode_size < 128 {
             return Err(LuksError::CorruptFs("inode size below 128"));
@@ -241,11 +246,51 @@ impl Superblock {
             checksum_seed,
             min_extra_isize,
             state: u16le(b, 0x3A),
+            reserved_gdt_blocks: if feature_compat & EXT4_FEATURE_COMPAT_RESIZE_INODE != 0 {
+                u16le(b, 206)
+            } else {
+                0
+            },
         })
     }
 
     fn is_64bit(&self) -> bool {
         self.feature_incompat & INCOMPAT_64BIT != 0
+    }
+
+    pub fn group_first_block(&self, group: usize) -> u64 {
+        group as u64 * self.blocks_per_group as u64 + self.first_data_block as u64
+    }
+
+    pub fn group_has_super(&self, group: usize) -> bool {
+        if group <= 1 {
+            return true;
+        }
+        if self.feature_ro_compat & EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER == 0 {
+            return true;
+        }
+
+        let mut test = group;
+        while test % 3 == 0 {
+            test /= 3;
+        }
+        if test == 1 {
+            return true;
+        }
+
+        let mut test = group;
+        while test % 5 == 0 {
+            test /= 5;
+        }
+        if test == 1 {
+            return true;
+        }
+
+        let mut test = group;
+        while test % 7 == 0 {
+            test /= 7;
+        }
+        test == 1
     }
 
     /// Whether every metadata structure carries a crc32c.
