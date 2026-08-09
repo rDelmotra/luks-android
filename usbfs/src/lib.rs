@@ -145,6 +145,7 @@ fn transfer_err(what: &str, e: i32) -> LuksError {
         libc::EBADF => " (bad file descriptor — was the UsbDeviceConnection closed?)",
         libc::EINVAL => " (invalid argument — the endpoint address, or a buffer \
                           the kernel considers too large)",
+        libc::ENOMEM => " (kernel memory allocation failed for this transfer size)",
         libc::EAGAIN => " (would block)",
         _ => "",
     };
@@ -315,7 +316,7 @@ impl UsbFsTransport {
 
             let e = errno();
 
-            if e == libc::EINVAL && limit > Self::MIN_MAX_TRANSFER {
+            if (e == libc::EINVAL || e == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
                 let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
                 self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
                 continue;
@@ -354,7 +355,7 @@ impl UsbFsTransport {
 
             let e = errno();
 
-            if e == libc::EINVAL && limit > Self::MIN_MAX_TRANSFER {
+            if (e == libc::EINVAL || e == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
                 let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
                 self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
                 continue;

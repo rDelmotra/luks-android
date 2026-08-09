@@ -535,6 +535,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
                 volume_handle: volume,
                 volume_id: vol.id,
                 writer: std::sync::Mutex::new(Some(writer)),
+                buf: std::sync::Mutex::new(Vec::new()),
             },
         )))
     })
@@ -556,22 +557,24 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
         if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
-        let bytes = env
-            .convert_byte_array(&data)
-            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
         let len = usize::try_from(len)
             .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
-        if len > bytes.len() {
-            return Err(Fail::Msg(
-                bridge::code::GENERIC,
-                "chunk length exceeds buffer".into(),
-            ));
+        let arr_len = env.get_array_length(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query array length: {e}")))? as usize;
+        if len > arr_len {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer".into()));
         }
+        let mut buf = wh.buf.lock().unwrap_or_else(|p| p.into_inner());
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        env.get_byte_array_region(&data, 0, unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, len) })
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
         let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
         let state = slot
             .as_mut()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
-        Ok(vol.write_file_chunk(state, &bytes[..len])?)
+        Ok(vol.write_file_chunk(state, &buf[..len])?)
     })
 }
 

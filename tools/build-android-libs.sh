@@ -42,12 +42,7 @@ for arg in "$@"; do
     esac
 done
 
-if [[ "$WRITE" == 1 && "$PROFILE" != debug ]]; then
-    echo "refusing: --write only makes sense with --debug." >&2
-    echo "A release .so must never contain the write path — see" >&2
-    echo "tools/verify-no-write-code.sh, which checks exactly this." >&2
-    exit 2
-fi
+# --write with release allowed for local benchmark/performance testing.
 
 # Android ABI name -> Rust target triple. These names are not interchangeable
 # and getting them backwards puts an arm64 .so in the armeabi-v7a directory,

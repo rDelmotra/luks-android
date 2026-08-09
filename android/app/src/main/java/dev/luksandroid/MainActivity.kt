@@ -1048,7 +1048,7 @@ private suspend fun importFile(
     "upload failed: ${e.message}"
 }
 
-private const val IMPORT_CHUNK = 128 shl 10 // 128 KiB (exact SCSI hardware pipeline transfer size)
+private const val IMPORT_CHUNK = 1 shl 20 // 1 MiB (reduces Binder IPC & JNI switches while Rust handles 128 KiB SCSI chunking)
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {

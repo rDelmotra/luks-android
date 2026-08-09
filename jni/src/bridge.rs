@@ -261,6 +261,7 @@ pub struct WriterHandle {
     pub volume_handle: i64,
     pub volume_id: u64,
     pub writer: Mutex<Option<luks_core::fs::ext4::file::FileWriter>>,
+    pub buf: Mutex<Vec<u8>>,
 }
 
 pub struct DeviceHandle {

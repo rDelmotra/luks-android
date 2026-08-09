@@ -15,6 +15,7 @@ use crate::luks::keyslot::{self, xts_decrypt};
 #[cfg(feature = "dangerous-write-support")]
 use crate::luks::keyslot::xts_encrypt;
 use crate::secret::Secret;
+use std::cell::RefCell;
 
 /// Owns its device rather than borrowing it.
 ///
@@ -36,6 +37,7 @@ pub struct LuksVolume<D: ReadAt> {
     iv_tweak: u128,
     tweak_step: u128,
     master_key: Secret,
+    write_buf: RefCell<Vec<u8>>,
 }
 
 impl<D: ReadAt> LuksVolume<D> {
@@ -121,6 +123,7 @@ impl<D: ReadAt> LuksVolume<D> {
             iv_tweak: seg.iv_tweak as u128,
             tweak_step: seg.tweak_step(),
             master_key,
+            write_buf: RefCell::new(Vec::new()),
         })
     }
 
@@ -165,17 +168,21 @@ impl<D: ReadAt> LuksVolume<D> {
         let last_sector = end.div_ceil(ss);
         let span = ((last_sector - first_sector) * ss) as usize;
 
-        let mut scratch = vec![0u8; span];
+        let mut scratch_guard = self.write_buf.borrow_mut();
+        if scratch_guard.len() < span {
+            scratch_guard.resize(span, 0);
+        }
+        let scratch = &mut scratch_guard[..span];
         let disk_offset = self
             .partition_offset
             .checked_add(self.segment_offset)
             .and_then(|o| o.checked_add(first_sector * ss))
             .ok_or(LuksError::OutOfBounds)?;
-        self.device.read_at(disk_offset, &mut scratch)?;
+        self.device.read_at(disk_offset, scratch)?;
 
         xts_decrypt(
             self.master_key.expose(),
-            &mut scratch,
+            scratch,
             self.sector_size,
             self.iv_tweak + first_sector as u128 * self.tweak_step,
             self.tweak_step,
@@ -292,16 +299,20 @@ impl<D: crate::device::WriteAt> LuksVolume<D> {
             .and_then(|o| o.checked_add(first_sector * ss))
             .ok_or(LuksError::OutOfBounds)?;
 
-        let mut scratch = vec![0u8; span];
+        let mut scratch = self.write_buf.borrow_mut();
+        if scratch.len() < span {
+            scratch.resize(span, 0);
+        }
+        let scratch = &mut scratch[..span];
         if aligned {
-            scratch.copy_from_slice(buf);
+            scratch[..buf.len()].copy_from_slice(buf);
         } else {
             // Fetch the covering sectors and decrypt them, so the bytes
             // around the caller's range survive re-encryption unchanged.
-            self.device.read_at(disk_offset, &mut scratch)?;
+            self.device.read_at(disk_offset, scratch)?;
             xts_decrypt(
                 self.master_key.expose(),
-                &mut scratch,
+                scratch,
                 self.sector_size,
                 self.iv_tweak + first_sector as u128 * self.tweak_step,
                 self.tweak_step,
@@ -311,12 +322,12 @@ impl<D: crate::device::WriteAt> LuksVolume<D> {
 
         xts_encrypt(
             self.master_key.expose(),
-            &mut scratch,
+            scratch,
             self.sector_size,
             self.iv_tweak + first_sector as u128 * self.tweak_step,
             self.tweak_step,
         )?;
-        self.device.write_at(disk_offset, &scratch)
+        self.device.write_at(disk_offset, scratch)
     }
 
     /// Push everything written so far to the medium.
