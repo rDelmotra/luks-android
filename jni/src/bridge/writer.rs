@@ -41,12 +41,13 @@ impl VolumeHandle {
     }
 
     /// Publish a complete streamed file.
-    pub fn finish_file(&self, writer: FileWriter, name: &str) -> Result<u64> {
+    pub fn finish_file(&self, writer: FileWriter, parent_path: &str, name: &str) -> Result<u64> {
         let mut fs = self.fs();
         let Fs::Ext4(ext4) = &mut *fs else {
             unreachable!("writer began on ext4")
         };
-        let ino = ext4.finish_file(writer, 2, name, FileType::Regular)?;
+        let dir_ino = ext4.resolve(parent_path)?.number;
+        let ino = ext4.finish_file(writer, dir_ino, name, FileType::Regular)?;
         ext4.flush()?;
         Ok(ino)
     }
@@ -77,7 +78,7 @@ impl VolumeHandle {
     /// acknowledges a write into its own buffer, so without it a "written"
     /// file is one yanked cable away from never having existed — and pulling
     /// the cable is how a phone transfer normally ends.
-    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<u64> {
+    pub fn write_file(&self, parent_path: &str, name: &str, data: &[u8]) -> Result<u64> {
         // One writer per *device*, not per volume.
         //
         // `nativeUnlock` can be called twice on one device handle, and nothing
@@ -121,7 +122,8 @@ impl VolumeHandle {
 
         self.claim_writer()?;
 
-        let ino = ext4.create_file(2, name, data, FileType::Regular)?;
+        let dir_ino = ext4.resolve(parent_path)?.number;
+        let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
         ext4.flush()?;
         Ok(ino)
     }

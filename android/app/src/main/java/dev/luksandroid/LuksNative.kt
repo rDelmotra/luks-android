@@ -134,10 +134,10 @@ internal object LuksNative {
      * all the way through the USB bridge before returning. Never on the main
      * thread.
      */
-    external fun nativeWriteFile(handle: Long, name: String, data: ByteArray): Long
+    external fun nativeWriteFile(handle: Long, parentPath: String, name: String, data: ByteArray): Long
 
     external fun nativeBeginFile(handle: Long, sizeBytes: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: ByteArray, len: Int)
-    external fun nativeFinishFile(handle: Long, writer: Long, name: String): Long
+    external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCloseWriter(handle: Long, writer: Long)
 }

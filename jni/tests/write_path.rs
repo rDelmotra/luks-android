@@ -84,7 +84,7 @@ fn a_file_written_through_the_bridge_is_readable_by_the_kernel() {
 
     let ino = {
         let vol = unlock(&path);
-        vol.write_file("from-the-bridge.txt", content)
+        vol.write_file("/", "from-the-bridge.txt", content)
             .expect("write through the bridge")
     };
     assert!(ino > 11, "inode {ino} is in the reserved range");
@@ -118,7 +118,7 @@ fn the_filesystem_is_clean_after_the_bridge_writes() {
     let path = scratch("e2fsck");
     {
         let vol = unlock(&path);
-        vol.write_file("checked.txt", b"graded by e2fsck\n")
+        vol.write_file("/", "checked.txt", b"graded by e2fsck\n")
             .expect("write");
     }
 
@@ -156,7 +156,7 @@ fn the_files_that_were_already_there_survive() {
 
     {
         let vol = unlock(&path);
-        vol.write_file("newcomer.txt", b"newcomer\n").expect("write");
+        vol.write_file("/", "newcomer.txt", b"newcomer\n").expect("write");
     }
 
     let vol = unlock(&path);
@@ -187,9 +187,9 @@ fn a_duplicate_name_is_refused_as_a_conflict_not_as_corruption() {
     let path = scratch("duplicate");
     let vol = unlock(&path);
 
-    vol.write_file("once.txt", b"first\n").expect("first write");
+    vol.write_file("/", "once.txt", b"first\n").expect("first write");
     let err = vol
-        .write_file("once.txt", b"second\n")
+        .write_file("/", "once.txt", b"second\n")
         .expect_err("the second write must be refused");
 
     assert_eq!(
@@ -215,9 +215,9 @@ fn a_refused_duplicate_leaves_no_orphan_behind() {
     let path = scratch("orphan");
     {
         let vol = unlock(&path);
-        vol.write_file("taken.txt", b"the first one\n")
+        vol.write_file("/", "taken.txt", b"the first one\n")
             .expect("first write");
-        vol.write_file("taken.txt", b"the second one\n")
+        vol.write_file("/", "taken.txt", b"the second one\n")
             .expect_err("the duplicate must fail");
     }
 
@@ -264,7 +264,7 @@ fn an_unwritable_name_is_refused_before_anything_is_allocated() {
 
     for bad in ["", "with/slash", "..", &"x".repeat(256)] {
         let err = vol
-            .write_file(bad, &oversized)
+            .write_file("/", bad, &oversized)
             .expect_err("a file named {bad:?} should not be creatable");
         assert_ne!(
             error_code(&err),
@@ -306,9 +306,9 @@ fn a_second_volume_on_one_device_cannot_also_write() {
     let first = handle.unlock(offset, PASSWORD).expect("first unlock");
     let second = handle.unlock(offset, PASSWORD).expect("second unlock");
 
-    first.write_file("from-first.txt", b"first\n").expect("first write");
+    first.write_file("/", "from-first.txt", b"first\n").expect("first write");
     let err = second
-        .write_file("from-second.txt", b"second\n")
+        .write_file("/", "from-second.txt", b"second\n")
         .expect_err("the second volume must not be allowed to write");
     assert!(
         err.to_string().contains("already the writer"),
@@ -366,12 +366,12 @@ fn closing_the_writer_lets_another_volume_take_over() {
         .offset_bytes();
 
     let first = handle.unlock(offset, PASSWORD).expect("unlock");
-    first.write_file("one.txt", b"one\n").expect("first write");
+    first.write_file("/", "one.txt", b"one\n").expect("first write");
     drop(first);
 
     let second = handle.unlock(offset, PASSWORD).expect("re-unlock");
     second
-        .write_file("two.txt", b"two\n")
+        .write_file("/", "two.txt", b"two\n")
         .expect("the claim should have been released when the first was dropped");
 }
 
@@ -387,7 +387,7 @@ fn writing_to_btrfs_is_refused_by_name() {
 
     let vol = unlock(&path);
     let err = vol
-        .write_file("nope.txt", b"should never land")
+        .write_file("/", "nope.txt", b"should never land")
         .expect_err("btrfs must be refused");
 
     let msg = err.to_string();
@@ -419,7 +419,7 @@ fn two_threads_writing_through_one_volume_are_never_told_another_volume_has_it()
         let handles: Vec<_> = (0..2)
             .map(|i| {
                 let vol = &vol;
-                s.spawn(move || vol.write_file(&format!("thread-{i}.txt"), b"concurrent\n"))
+                s.spawn(move || vol.write_file("/", &format!("thread-{i}.txt"), b"concurrent\n"))
             })
             .collect();
         handles
@@ -475,7 +475,7 @@ fn a_write_that_runs_out_of_room_leaves_the_filesystem_clean() {
         // A perfectly good name, so the refusal comes from the allocator rather
         // than from validation — the closure's territory, not `create_file`'s.
         let err = vol
-            .write_file("too-big.txt", &vec![0u8; free as usize])
+            .write_file("/", "too-big.txt", &vec![0u8; free as usize])
             .expect_err("a payload larger than the volume must be refused");
         assert_eq!(
             error_code(&err),
@@ -499,5 +499,79 @@ fn a_write_that_runs_out_of_room_leaves_the_filesystem_clean() {
     assert!(
         out.status.success() && text.contains("VERDICT: clean"),
         "a rolled-back write left the filesystem dirty:\n{text}"
+    );
+}
+
+#[test]
+fn a_streaming_writer_closed_before_finish_leaves_no_orphan_behind() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("streaming-abandon");
+    {
+        let vol = unlock(&path);
+        let mut writer = vol.begin_file(1024).expect("begin");
+        vol.write_file_chunk(&mut writer, b"halfway there").expect("chunk");
+        vol.abandon_file(writer); // explicitly abandon before finish
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "an abandoned stream left the filesystem unclean:\n{text}"
+    );
+}
+
+#[test]
+fn a_streaming_writer_that_collides_on_finish_rolls_back_cleanly() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("streaming-conflict");
+    {
+        let vol = unlock(&path);
+        vol.write_file("/", "existing.txt", b"already here").expect("first");
+
+        let mut writer = vol.begin_file(1024).expect("begin");
+        vol.write_file_chunk(&mut writer, &vec![0u8; 1024]).expect("chunk");
+        let err = vol.finish_file(writer, "/", "existing.txt").expect_err("finish duplicate");
+        
+        assert_eq!(
+            error_code(&err),
+            code::ALREADY_EXISTS,
+            "collision must report ALREADY_EXISTS, not corruption: {err}"
+        );
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "a failed finish left the filesystem unclean:\n{text}"
     );
 }

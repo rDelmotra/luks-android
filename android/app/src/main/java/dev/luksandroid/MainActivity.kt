@@ -718,7 +718,7 @@ private fun UnlockedBody(
                             val content = withContext(Dispatchers.Default) { testPayload(sizeBytes) }
                             val startMs = System.currentTimeMillis()
                             val ino = withContext(Dispatchers.IO) {
-                                state.volume.writeFile(name, content)
+                                state.volume.writeFile(state.currentDirectory, name, content)
                             }
                             val elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1)
                             val mibPerSec = (content.size / 1_048_576.0) / (elapsedMs / 1000.0)

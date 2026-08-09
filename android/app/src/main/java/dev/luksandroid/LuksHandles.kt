@@ -266,9 +266,9 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
      * Blocking: this is the whole write, including the flush through the USB
      * bridge. Off the main thread, same as [unlock].
      */
-    fun writeFile(name: String, data: ByteArray): Long {
+    fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
         check(handle != 0L) { "volume is closed" }
-        return LuksNative.nativeWriteFile(handle, name, data)
+        return LuksNative.nativeWriteFile(handle, parentPath, name, data)
     }
 
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
@@ -288,10 +288,10 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
             LuksNative.nativeWriteChunk(handle, writerHandle, data, len)
         }
 
-        fun finish(name: String): Long {
+        fun finish(parentPath: String, name: String): Long {
             check(writerHandle != 0L) { "writer is closed" }
             check(handle != 0L) { "volume is closed" }
-            val result = LuksNative.nativeFinishFile(handle, writerHandle, name)
+            val result = LuksNative.nativeFinishFile(handle, writerHandle, parentPath, name)
             writerHandle = 0
             activeWriters -= this
             return result

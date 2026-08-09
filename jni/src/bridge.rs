@@ -259,6 +259,7 @@ pub enum Payload {
 #[cfg(feature = "dangerous-write-support")]
 pub struct WriterHandle {
     pub volume_handle: i64,
+    pub volume_id: u64,
     pub writer: Mutex<Option<luks_core::fs::ext4::file::FileWriter>>,
 }
 
@@ -294,7 +295,10 @@ pub struct DeviceHandle {
 /// set a bit, write it back — and a read interleaved mid-sequence sees ext4
 /// state that never existed on disk. This makes each filesystem operation
 /// whole.
+static NEXT_VOLUME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct VolumeHandle {
+    pub id: u64,
     fs: Mutex<MountedFs>,
     pub partition_offset: u64,
     /// The device's writer flag, shared with every other volume on it.
@@ -594,7 +598,9 @@ impl DeviceHandle {
             password,
         )?;
         let fs = MountedFs::mount(volume)?;
+        let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(VolumeHandle {
+            id,
             fs: Mutex::new(fs),
             partition_offset,
             device_writer: Arc::clone(&self.dev.writer),

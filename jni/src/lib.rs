@@ -500,17 +500,19 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteFile<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     handle: jlong,
+    parent_path: JString<'l>,
     name: JString<'l>,
     data: JByteArray<'l>,
 ) -> jlong {
     guard(&mut env, 0, |env| {
         // SAFETY: validated against the volume magic tag.
         let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let parent_path = jstr(env, &parent_path)?;
         let name = jstr(env, &name)?;
         let bytes = env
             .convert_byte_array(&data)
             .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
-        let ino = vol.write_file(&name, &bytes)?;
+        let ino = vol.write_file(&parent_path, &name, &bytes)?;
         Ok(ino as jlong)
     })
 }
@@ -531,6 +533,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
+                volume_id: vol.id,
                 writer: std::sync::Mutex::new(Some(writer)),
             },
         )))
@@ -550,7 +553,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
     guard(&mut env, (), |env| {
         let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
         let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
-        if wh.volume_handle != volume {
+        if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
         let bytes = env
@@ -579,14 +582,16 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
     _class: JClass<'l>,
     volume: jlong,
     writer: jlong,
+    parent_path: JString<'l>,
     name: JString<'l>,
 ) -> jlong {
     guard(&mut env, 0, |env| {
         let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
         let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
-        if wh.volume_handle != volume {
+        if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
+        let parent_path = jstr(env, &parent_path)?;
         let name = jstr(env, &name)?;
         let state = wh
             .writer
@@ -594,7 +599,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
             .unwrap_or_else(|p| p.into_inner())
             .take()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
-        let result = vol.finish_file(state, &name);
+        let result = vol.finish_file(state, &parent_path, &name);
         unsafe { bridge::drop_writer(writer) };
         Ok(result? as jlong)
     })
@@ -611,7 +616,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
     guard(&mut env, (), |_env| {
         let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
         let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
-        if wh.volume_handle != volume {
+        if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
         if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
