@@ -281,10 +281,11 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
     }
 
     inner class FileWriter internal constructor(private var writerHandle: Long) : AutoCloseable {
-        fun write(data: ByteArray, len: Int = data.size) {
+        fun write(data: java.nio.ByteBuffer, len: Int = data.remaining()) {
             check(writerHandle != 0L) { "writer is closed" }
             check(handle != 0L) { "volume is closed" }
-            require(len in 0..data.size) { "chunk length exceeds buffer" }
+            require(data.isDirect) { "buffer must be direct" }
+            require(len in 0..data.limit()) { "chunk length exceeds buffer" }
             LuksNative.nativeWriteChunk(handle, writerHandle, data, len)
         }
 

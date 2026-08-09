@@ -1014,25 +1014,32 @@ private suspend fun importFile(
 
         val started = System.currentTimeMillis()
         var done = 0L
-        val buffer = ByteArray(IMPORT_CHUNK)
+        val buffer = java.nio.ByteBuffer.allocateDirect(IMPORT_CHUNK)
 
         val writer = volume.beginFile(fileSize)
         try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                while (done < fileSize) {
-                    val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
-                    var read = 0
-                    while (read < toRead) {
-                        val r = input.read(buffer, read, toRead - read)
-                        if (r <= 0) break
-                        read += r
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                java.io.FileInputStream(pfd.fileDescriptor).channel.use { channel ->
+                    while (done < fileSize) {
+                        buffer.clear()
+                        val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
+                        buffer.limit(toRead)
+                        
+                        var read = 0
+                        while (buffer.hasRemaining()) {
+                            val r = channel.read(buffer)
+                            if (r <= 0) break
+                            read += r
+                        }
+                        if (read <= 0) break
+                        
+                        buffer.flip()
+                        writer.write(buffer, read)
+                        done += read
+                        onProgress(done, fileSize)
                     }
-                    if (read <= 0) break
-                    writer.write(buffer, read)
-                    done += read
-                    onProgress(done, fileSize)
                 }
-            } ?: throw IllegalStateException("could not open input stream")
+            } ?: throw IllegalStateException("could not open input file descriptor")
 
             if (done < fileSize) {
                 throw IllegalStateException("short read: read $done bytes of $fileSize expected")

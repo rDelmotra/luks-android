@@ -20,7 +20,7 @@ pub mod bridge;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JByteArray, JClass, JString, JValue};
+use jni::objects::{JByteArray, JClass, JString, JValue, JByteBuffer};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
@@ -535,7 +535,6 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
                 volume_handle: volume,
                 volume_id: vol.id,
                 writer: std::sync::Mutex::new(Some(writer)),
-                buf: std::sync::Mutex::new(Vec::new()),
             },
         )))
     })
@@ -548,7 +547,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
     _class: JClass<'l>,
     volume: jlong,
     writer: jlong,
-    data: JByteArray<'l>,
+    data: JByteBuffer<'l>,
     len: jint,
 ) {
     guard(&mut env, (), |env| {
@@ -559,22 +558,25 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
         }
         let len = usize::try_from(len)
             .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
-        let arr_len = env.get_array_length(&data)
-            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query array length: {e}")))? as usize;
-        if len > arr_len {
-            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer".into()));
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
         }
-        let mut buf = wh.buf.lock().unwrap_or_else(|p| p.into_inner());
-        if buf.len() < len {
-            buf.resize(len, 0);
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
         }
-        env.get_byte_array_region(&data, 0, unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, len) })
-            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
+
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
         let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
         let state = slot
             .as_mut()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
-        Ok(vol.write_file_chunk(state, &buf[..len])?)
+        Ok(vol.write_file_chunk(state, slice)?)
     })
 }
 
