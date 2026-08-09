@@ -62,6 +62,25 @@ struct Run {
     len: u64,
 }
 
+/// State for one file whose contents arrive incrementally.
+///
+/// It owns no device reference: the caller supplies the mounted [`Ext4`] for
+/// each operation. That keeps a higher-layer writer handle from extending the
+/// lifetime of an unlocked LUKS volume (and therefore its master key).
+pub struct FileWriter {
+    ino: u64,
+    extents: Vec<Extent>,
+    runs: Vec<Run>,
+    seed: Seed,
+    size: u64,
+    written: u64,
+    blocks_needed: u64,
+    /// At most one filesystem block. A caller may give arbitrary chunk sizes;
+    /// holding this tail until it is complete avoids writing zero padding that
+    /// a later chunk would need to overwrite.
+    tail: Vec<u8>,
+}
+
 /// `ee_len` is 16 bits, and values above 32768 mean "uninitialised extent" —
 /// so a run longer than that is not merely unrepresentable, it would be read
 /// back as a hole.
@@ -99,6 +118,152 @@ fn runs_from(extents: &[Extent]) -> Result<Vec<Run>> {
 }
 
 impl<D: WriteAt> Ext4<D> {
+    /// Reserve an inode and blocks for a file of `size`, before its bytes are
+    /// available. Call [`write_chunk`](Self::write_chunk), then either
+    /// [`finish_file`](Self::finish_file) or [`abandon_file`](Self::abandon_file).
+    pub fn begin_file(&mut self, size: u64) -> Result<FileWriter> {
+        let seed = Seed::for_writing(&self.sb)?;
+        let bs = self.sb.block_size as u64;
+        let blocks_needed = size.div_ceil(bs.max(1));
+        let ino = self.alloc_inode(false)?;
+        let extents = match self.alloc_blocks(0, blocks_needed) {
+            Ok(extents) => extents,
+            Err(e) => {
+                self.undo_new_file(ino, &[]);
+                return Err(e);
+            }
+        };
+        let runs = match runs_from(&extents) {
+            Ok(runs) => runs,
+            Err(e) => {
+                self.undo_new_file(ino, &extents);
+                return Err(e);
+            }
+        };
+        Ok(FileWriter {
+            ino,
+            extents,
+            runs,
+            seed,
+            size,
+            written: 0,
+            blocks_needed,
+            tail: Vec::new(),
+        })
+    }
+
+    /// Append one chunk. Chunks may have any length; only a final partial
+    /// filesystem block is retained, so payload residency stays bounded.
+    pub fn write_chunk(&mut self, writer: &mut FileWriter, data: &[u8]) -> Result<()> {
+        let end = writer
+            .written
+            .checked_add(data.len() as u64)
+            .ok_or(LuksError::OutOfBounds)?;
+        if end > writer.size {
+            return Err(LuksError::OutOfBounds);
+        }
+
+        let block_size = self.sb.block_size as usize;
+        let mut input = data;
+        if !writer.tail.is_empty() {
+            let needed = block_size - writer.tail.len();
+            let take = needed.min(input.len());
+            writer.tail.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if writer.tail.len() == block_size {
+                let at = writer.written - (block_size - take) as u64;
+                self.write_full_blocks(&writer.runs, at, &writer.tail)?;
+                writer.tail.clear();
+            }
+        }
+
+        let full = input.len() / block_size * block_size;
+        if full != 0 {
+            let at = end - input.len() as u64;
+            self.write_full_blocks(&writer.runs, at, &input[..full])?;
+        }
+        writer.tail.extend_from_slice(&input[full..]);
+        writer.written = end;
+        Ok(())
+    }
+
+    /// Finish a complete stream, publish it in `dir_ino`, and return its inode.
+    pub fn finish_file(
+        &mut self,
+        mut writer: FileWriter,
+        dir_ino: u64,
+        name: &str,
+        file_type: crate::fs::FileType,
+    ) -> Result<u64> {
+        if let Err(e) = super::dirent::validate_name(name.as_bytes()) {
+            self.abandon_file(writer);
+            return Err(e);
+        }
+        let ino = match self.finish_unlinked(&mut writer) {
+            Ok(ino) => ino,
+            Err(e) => {
+                self.abandon_file(writer);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.link_file(dir_ino, name, ino, file_type) {
+            self.abandon_file(writer);
+            return Err(e);
+        }
+        Ok(ino)
+    }
+
+    /// Roll back a stream that will never be published. Safe to call after an
+    /// interrupted transfer; cleanup errors cannot replace its original cause.
+    pub fn abandon_file(&mut self, writer: FileWriter) {
+        self.undo_new_file(writer.ino, &writer.extents);
+    }
+
+    fn finish_unlinked(&mut self, writer: &mut FileWriter) -> Result<u64> {
+        if writer.written != writer.size {
+            return Err(LuksError::OutOfBounds);
+        }
+        if !writer.tail.is_empty() {
+            let block_size = self.sb.block_size as usize;
+            let mut padded = vec![0u8; block_size];
+            padded[..writer.tail.len()].copy_from_slice(&writer.tail);
+            let at = writer.written - writer.tail.len() as u64;
+            self.write_full_blocks(&writer.runs, at, &padded)?;
+            writer.tail.clear();
+        }
+        self.flush()?;
+        self.write_inode_record(
+            writer.ino,
+            writer.size,
+            writer.blocks_needed,
+            &writer.runs,
+            &writer.seed,
+        )?;
+        Ok(writer.ino)
+    }
+
+    /// Write whole filesystem blocks at a logical file offset, translating
+    /// across the preallocated physical runs without staging a run-sized copy.
+    fn write_full_blocks(&mut self, runs: &[Run], mut at: u64, mut data: &[u8]) -> Result<()> {
+        let bs = self.sb.block_size as u64;
+        debug_assert_eq!(at % bs, 0);
+        debug_assert_eq!(data.len() as u64 % bs, 0);
+        while !data.is_empty() {
+            let logical = at / bs;
+            let run = runs
+                .iter()
+                .find(|r| logical >= r.logical && logical < r.logical + r.len)
+                .ok_or(LuksError::OutOfBounds)?;
+            let in_run = logical - run.logical;
+            let bytes = ((run.len - in_run) * bs).min(data.len() as u64) as usize;
+            self.device
+                .write_at((run.physical + in_run) * bs, &data[..bytes])?;
+            at += bytes as u64;
+            data = &data[bytes..];
+        }
+        Ok(())
+    }
+
     /// Allocate blocks for `data`, write it, and create an inode pointing at
     /// it. Returns the new inode number.
     ///
@@ -252,7 +417,8 @@ impl<D: WriteAt> Ext4<D> {
             return Err(e);
         }
 
-        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed) {
+        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, &seed)
+        {
             self.undo_new_file(ino, &extents);
             return Err(e);
         }

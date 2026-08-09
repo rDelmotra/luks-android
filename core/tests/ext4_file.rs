@@ -25,6 +25,7 @@
 
 use luks_core::device::FileDevice;
 use luks_core::fs::ext4::Ext4;
+use luks_core::fs::FileType;
 use std::process::Command;
 
 fn fixture(name: &str) -> String {
@@ -68,6 +69,36 @@ fn a_small_file_reads_back_byte_identical() {
         fs.read_inode_data(&inode, 0, &mut back).expect("read data");
         assert_eq!(back, content, "{name}: content did not read back identical");
     }
+}
+
+#[test]
+fn a_streamed_file_accepts_arbitrary_chunks_and_reads_back_identical() {
+    let path = scratch("big-4k.img", "streamed-roundtrip");
+    let content: Vec<u8> = (0..(128 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+
+    let ino = {
+        let mut fs = open(&path);
+        let mut writer = fs.begin_file(content.len() as u64).expect("begin file");
+        let mut offset = 0;
+        for want in [7, 4090, 1, 65_537, 17, 8192, usize::MAX] {
+            if offset == content.len() {
+                break;
+            }
+            let end = offset.saturating_add(want).min(content.len());
+            fs.write_chunk(&mut writer, &content[offset..end])
+                .expect("write chunk");
+            offset = end;
+        }
+        assert_eq!(offset, content.len(), "all source bytes were supplied");
+        fs.finish_file(writer, 2, "streamed.bin", FileType::Regular)
+            .expect("finish file")
+    };
+
+    let fs = Ext4::mount(FileDevice::open(&path).expect("reopen")).expect("mount");
+    let inode = fs.read_inode(ino).expect("read inode");
+    let mut back = vec![0u8; content.len()];
+    fs.read_inode_data(&inode, 0, &mut back).expect("read data");
+    assert_eq!(back, content);
 }
 
 #[test]
@@ -133,7 +164,10 @@ fn a_file_needing_a_fifth_extent_is_refused_not_corrupted() {
     // than 5 runs.
     let content = vec![0xAAu8; 30 * fs.block_size() as usize];
     let result = fs.write_new_file(&content);
-    assert!(result.is_err(), "a 30-block write into checkerboarded free space should need more than 4 extents");
+    assert!(
+        result.is_err(),
+        "a 30-block write into checkerboarded free space should need more than 4 extents"
+    );
 
     fs.flush().expect("flush");
     assert_eq!(
