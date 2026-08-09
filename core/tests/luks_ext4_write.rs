@@ -64,6 +64,25 @@ fn mount_container(dev: &FileDevice) -> Ext4<LuksVolume<&FileDevice>> {
     Ext4::mount(volume).expect("mount ext4 inside the container")
 }
 
+/// The larger GPT fixture is used only where an ext4 allocation must span a
+/// LUKS chunk. Its 21 MiB LUKS partition has contiguous free space; the small
+/// bare containers deliberately exercise fragmented-filesystem refusal and
+/// cannot reliably describe a 256 KiB file in four inline extents.
+fn mount_gpt_container(dev: &FileDevice) -> Ext4<LuksVolume<&FileDevice>> {
+    let table = partition::scan(dev, 512).expect("scan GPT");
+    let part = table.luks_partitions().next().expect("a LUKS partition");
+    let header = luks::read_from(dev, part.offset_bytes()).expect("parse LUKS header");
+    let volume = LuksVolume::open(
+        dev,
+        part.offset_bytes(),
+        Some(part.size_bytes()),
+        &header,
+        PASSWORD,
+    )
+    .expect("unlock");
+    Ext4::mount(volume).expect("mount ext4 inside GPT LUKS partition")
+}
+
 #[test]
 fn a_file_written_through_luks_is_readable_by_the_kernel() {
     let Some(script) = tool("cat-in-image.sh") else {
@@ -76,7 +95,9 @@ fn a_file_written_through_luks_is_readable_by_the_kernel() {
         let content = b"encrypted on the way in, plaintext on the way out\n";
 
         {
-            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+            let dev =
+                FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+                    .expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(content).expect("write file");
             fs.link_file(2, "through-luks.txt", ino, FileType::Regular)
@@ -114,7 +135,9 @@ fn e2fsck_is_clean_inside_the_container() {
     for rel in CONTAINERS {
         let path = scratch(rel, "e2fsck");
         {
-            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+            let dev =
+                FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+                    .expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(b"checked by e2fsck\n").expect("write");
             fs.link_file(2, "checked.txt", ino, FileType::Regular)
@@ -144,9 +167,11 @@ fn e2fsck_is_clean_inside_the_container() {
 #[test]
 fn a_file_larger_than_the_luks_write_chunk_is_clean_and_kernel_readable() {
     // The write layer deliberately caps a single encrypt/write operation at
-    // 128 KiB. Use the 4096-byte-sector fixture and cross that boundary with
-    // unaligned file data: this exercises both the chunk loop and the final
-    // cipher-sector read-modify-write in the full ext4-on-LUKS stack.
+    // 128 KiB. Cross that boundary with unaligned file data: this exercises
+    // both the chunk loop and the final cipher-sector read-modify-write in the
+    // full ext4-on-LUKS stack. The raw LUKS test covers this size at 4096-byte
+    // cipher sectors too; this fixture supplies enough contiguous ext4 space
+    // for the filesystem-facing oracle.
     let Some(verify) = tool("verify-image.sh") else {
         eprintln!("skipping: colima is not running");
         return;
@@ -156,15 +181,16 @@ fn a_file_larger_than_the_luks_write_chunk_is_clean_and_kernel_readable() {
         return;
     };
 
-    let rel = "containers/unlock-argon2id-4096.img";
+    let rel = "disks/gpt-luks.img";
     let path = scratch(rel, "chunked-kernel-read");
     let content: Vec<u8> = (0..(2 * 128 * 1024 + 17))
         .map(|i| ((i * 31 + 7) % 251) as u8)
         .collect();
 
     {
-        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
-        let mut fs = mount_container(&dev);
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+            .expect("open writable");
+        let mut fs = mount_gpt_container(&dev);
         let ino = fs.write_new_file(&content).expect("write chunked file");
         fs.link_file(2, "chunked.bin", ino, FileType::Regular)
             .expect("link into root");
@@ -227,7 +253,9 @@ fn the_files_that_were_already_in_the_container_survive() {
         };
 
         {
-            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+            let dev =
+                FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+                    .expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(b"newcomer\n").expect("write");
             fs.link_file(2, "newcomer.txt", ino, FileType::Regular)
@@ -280,7 +308,9 @@ fn the_luks_header_is_never_touched() {
         let before = read_guard(&path);
 
         {
-            let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+            let dev =
+                FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+                    .expect("open writable");
             let mut fs = mount_container(&dev);
             let ino = fs.write_new_file(&vec![0x5Au8; 8192]).expect("write");
             fs.link_file(2, "big.bin", ino, FileType::Regular)
@@ -292,10 +322,7 @@ fn the_luks_header_is_never_touched() {
 
         // Report the offset, not the megabyte — a failure here should point at
         // the byte, and dumping two buffers buries it.
-        let differing = before
-            .iter()
-            .zip(&after)
-            .position(|(a, b)| a != b);
+        let differing = before.iter().zip(&after).position(|(a, b)| a != b);
         assert!(
             differing.is_none(),
             "{rel}: writing a file changed byte {} of the {guard_len}-byte \
@@ -320,12 +347,10 @@ fn a_file_written_through_gpt_and_luks_is_readable_by_the_kernel() {
     let content = b"partition table, container, filesystem\n";
 
     {
-        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+            .expect("open writable");
         let table = partition::scan(&dev, 512).expect("scan GPT");
-        let part = table
-            .luks_partitions()
-            .next()
-            .expect("a LUKS partition");
+        let part = table.luks_partitions().next().expect("a LUKS partition");
         let offset = part.offset_bytes();
         let part_len = Some(part.size_bytes());
 

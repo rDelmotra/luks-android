@@ -28,7 +28,10 @@ use luks_core::luks::{self, LuksVolume};
 const PASSWORD: &[u8] = b"test";
 
 fn fixture(name: &str) -> String {
-    format!("{}/../fixtures/containers/{name}", env!("CARGO_MANIFEST_DIR"))
+    format!(
+        "{}/../fixtures/containers/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 /// A private copy, so a failing test cannot damage a committed fixture.
@@ -77,7 +80,8 @@ fn our_ciphertext_is_byte_identical_to_the_kernels() {
 
         // Re-encrypt that plaintext with the writer, into a scratch copy.
         let path = scratch(name, "identical");
-        let wdev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+        let wdev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+            .expect("open writable");
         let wheader = luks::read_from(&wdev, 0).expect("parse header");
         let wvol = LuksVolume::open(&wdev, 0, None, &wheader, PASSWORD).expect("unlock");
         wvol.write_at(offset, &plain).expect("encrypt and write");
@@ -126,7 +130,8 @@ fn a_partial_sector_write_preserves_the_rest_of_the_sector() {
     // re-encrypting. If the surrounding plaintext is not carried through
     // correctly, the damage lands outside anything the caller named.
     let path = scratch("unlock-argon2id-512.img", "partial");
-    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+        .expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
     let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
@@ -144,8 +149,16 @@ fn a_partial_sector_write_preserves_the_rest_of_the_sector() {
     volume.read_at(base, &mut after).expect("read after");
 
     assert_eq!(&after[13..20], &payload, "the write itself");
-    assert_eq!(&after[..13], &before[..13], "plaintext before the patch moved");
-    assert_eq!(&after[20..], &before[20..], "plaintext after the patch moved");
+    assert_eq!(
+        &after[..13],
+        &before[..13],
+        "plaintext before the patch moved"
+    );
+    assert_eq!(
+        &after[20..],
+        &before[20..],
+        "plaintext after the patch moved"
+    );
 }
 
 #[test]
@@ -155,35 +168,49 @@ fn a_large_unaligned_write_crosses_chunks_without_losing_neighbours() {
     // ciphertext chunks in between; doing an RMW for every chunk would be a
     // correctness-preserving but catastrophically expensive regression.
     const CHUNK: usize = 128 * 1024;
-    let path = scratch("unlock-argon2id-512.img", "chunked-unaligned");
-    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
-        .expect("open writable");
-    let header = luks::read_from(&dev, 0).expect("header");
-    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
+    for name in ["unlock-argon2id-512.img", "unlock-argon2id-4096.img"] {
+        let path = scratch(name, "chunked-unaligned");
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+            .expect("open writable");
+        let header = luks::read_from(&dev, 0).expect("header");
+        let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
-    let sector = volume.sector_size() as u64;
-    let at = sector * 40 + 13;
-    let payload: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        let sector = volume.sector_size() as u64;
+        let at = sector * 40 + 13;
+        let payload: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
 
-    let first_sector = at / sector * sector;
-    let last_sector = (at + payload.len() as u64).div_ceil(sector) * sector;
-    let mut before = vec![0u8; (last_sector - first_sector) as usize];
-    volume
-        .read_at(first_sector, &mut before)
-        .expect("read covering sectors before write");
+        let first_sector = at / sector * sector;
+        let last_sector = (at + payload.len() as u64).div_ceil(sector) * sector;
+        let mut before = vec![0u8; (last_sector - first_sector) as usize];
+        volume
+            .read_at(first_sector, &mut before)
+            .expect("read covering sectors before write");
 
-    volume.write_at(at, &payload).expect("chunked write");
-    volume.flush().expect("flush");
+        volume.write_at(at, &payload).expect("chunked write");
+        volume.flush().expect("flush");
 
-    let mut after = vec![0u8; before.len()];
-    volume
-        .read_at(first_sector, &mut after)
-        .expect("read covering sectors after write");
-    let start = (at - first_sector) as usize;
-    let end = start + payload.len();
-    assert_eq!(&after[start..end], payload, "payload crossed a chunk incorrectly");
-    assert_eq!(&after[..start], &before[..start], "prefix neighbour changed");
-    assert_eq!(&after[end..], &before[end..], "suffix neighbour changed");
+        let mut after = vec![0u8; before.len()];
+        volume
+            .read_at(first_sector, &mut after)
+            .expect("read covering sectors after write");
+        let start = (at - first_sector) as usize;
+        let end = start + payload.len();
+        assert_eq!(
+            &after[start..end],
+            payload,
+            "{name}: payload crossed a chunk incorrectly"
+        );
+        assert_eq!(
+            &after[..start],
+            &before[..start],
+            "{name}: prefix neighbour changed"
+        );
+        assert_eq!(
+            &after[end..],
+            &before[end..],
+            "{name}: suffix neighbour changed"
+        );
+    }
 }
 
 #[test]
@@ -194,7 +221,8 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
     // wrong, the damage usually lands somewhere the superblock notices.
     let path = scratch("unlock-argon2id-512.img", "mounts");
     {
-        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+            .expect("open writable");
         let header = luks::read_from(&dev, 0).expect("header");
         let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
         // Well past the superblock and group descriptors.
@@ -217,7 +245,8 @@ fn the_filesystem_inside_still_mounts_after_a_write() {
 #[test]
 fn writing_past_the_end_of_the_segment_is_refused() {
     let path = scratch("unlock-argon2id-512.img", "bounds");
-    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+        .expect("open writable");
     let header = luks::read_from(&dev, 0).expect("header");
     let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
 
