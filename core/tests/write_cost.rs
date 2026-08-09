@@ -25,8 +25,103 @@ use luks_core::fs::Ext4;
 use luks_core::luks::{self, LuksVolume};
 use luks_core::partition;
 use luks_core::usb::ScsiBlockDevice;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 const PASSWORD: &[u8] = b"test";
+
+/// Counts allocations made only while one write is in progress. The input
+/// buffer and mount are deliberately created before measurement: the question
+/// is whether the pipeline adds an allocation proportional to that input.
+struct WriteAllocator;
+
+static MEASURING: AtomicBool = AtomicBool::new(false);
+static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
+static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+static WRITE_COST_TESTS: Mutex<()> = Mutex::new(());
+
+fn allocated(size: usize) {
+    if MEASURING.load(Ordering::Relaxed) {
+        let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+    }
+}
+
+fn freed(size: usize) {
+    if MEASURING.load(Ordering::Relaxed) {
+        let _ = LIVE_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
+            Some(live.saturating_sub(size))
+        });
+    }
+}
+
+unsafe impl GlobalAlloc for WriteAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            allocated(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            allocated(layout.size());
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        freed(layout.size());
+        unsafe { System.dealloc(ptr, layout) };
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        if !next.is_null() && MEASURING.load(Ordering::Relaxed) {
+            freed(layout.size());
+            allocated(new_size);
+        }
+        next
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: WriteAllocator = WriteAllocator;
+
+fn peak_allocated_while(f: impl FnOnce()) -> usize {
+    LIVE_BYTES.store(0, Ordering::Relaxed);
+    PEAK_BYTES.store(0, Ordering::Relaxed);
+    MEASURING.store(true, Ordering::Relaxed);
+    f();
+    MEASURING.store(false, Ordering::Relaxed);
+    PEAK_BYTES.load(Ordering::Relaxed)
+}
+
+fn peak_of_writing(bytes: usize, name: &str) -> usize {
+    let dev = ScsiBlockDevice::open(MockUsbDrive::new(fixture("disks/gpt-luks.img")))
+        .expect("open the mock drive");
+    let table = partition::scan(&dev, 512).expect("gpt");
+    let part = table.luks_partitions().next().expect("a LUKS partition");
+    let header = luks::read_from(&dev, part.offset_bytes()).expect("header");
+    let volume = LuksVolume::open(
+        &dev,
+        part.offset_bytes(),
+        Some(part.size_bytes()),
+        &header,
+        PASSWORD,
+    )
+    .expect("unlock");
+    let mut fs = Ext4::mount(&volume).expect("mount");
+    let data = vec![0x5Au8; bytes];
+
+    peak_allocated_while(|| {
+        fs.create_file(2, name, &data, luks_core::fs::FileType::Regular)
+            .expect("write the file");
+    })
+}
 
 /// Write one file of `bytes` through the whole stack and report what the
 /// transport saw.
@@ -59,6 +154,7 @@ fn cost_of_writing(bytes: usize, name: &str) -> common::Stats {
 
 #[test]
 fn a_file_write_costs_a_reported_number_of_scsi_commands() {
+    let _serial = WRITE_COST_TESTS.lock().unwrap();
     // Both sizes are multiples of the 4 KiB block so neither pays a partial
     // final block the other does not.
     const BS: usize = 4096;
@@ -130,6 +226,7 @@ fn a_file_write_costs_a_reported_number_of_scsi_commands() {
 /// generosity.
 #[test]
 fn a_large_write_is_issued_in_max_transfer_sized_commands() {
+    let _serial = WRITE_COST_TESTS.lock().unwrap();
     const MAX_TRANSFER: usize = 128 * 1024;
     const SIZE: usize = 2 * 1024 * 1024;
 
@@ -217,6 +314,7 @@ fn a_large_write_is_issued_in_max_transfer_sized_commands() {
 /// and rewriting the buffer handling would be an optimisation, not a fix.
 #[test]
 fn the_write_path_costs_this_much_cpu_with_no_device_latency() {
+    let _serial = WRITE_COST_TESTS.lock().unwrap();
     const SIZE: usize = 4 * 1024 * 1024;
 
     let dev = ScsiBlockDevice::open(MockUsbDrive::new(fixture("disks/gpt-luks.img")))
@@ -259,5 +357,26 @@ fn the_write_path_costs_this_much_cpu_with_no_device_latency() {
     assert!(
         mibs > 20.0,
         "the write path manages only {mibs:.0} MiB/s of pure CPU"
+    );
+}
+
+#[test]
+fn peak_write_pipeline_memory_does_not_scale_with_payload_size() {
+    let _serial = WRITE_COST_TESTS.lock().unwrap();
+    // The input arrays are created before measurement. A pre-2a run allocates
+    // the whole ext4 run and whole LUKS request again, so the 2 MiB case grows
+    // by roughly the payload size. The bounded path stays in the same small
+    // scratch-buffer band for both files. The fixture is only a few MiB, so
+    // this is the largest clean pair it can hold without changing the oracle.
+    let one = peak_of_writing(1 * 1024 * 1024, "alloc-one.bin");
+    let two = peak_of_writing(2 * 1024 * 1024, "alloc-two.bin");
+
+    println!(
+        "write allocation peak: 1 MiB = {one} bytes, 2 MiB = {two} bytes"
+    );
+    assert!(two < 512 * 1024, "bounded write peak is {two} bytes");
+    assert!(
+        two <= one + 256 * 1024,
+        "write peak scales with payload: 1 MiB={one}, 2 MiB={two}"
     );
 }

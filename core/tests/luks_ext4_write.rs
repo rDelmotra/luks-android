@@ -142,6 +142,67 @@ fn e2fsck_is_clean_inside_the_container() {
 }
 
 #[test]
+fn a_file_larger_than_the_luks_write_chunk_is_clean_and_kernel_readable() {
+    // The write layer deliberately caps a single encrypt/write operation at
+    // 128 KiB. Use the 4096-byte-sector fixture and cross that boundary with
+    // unaligned file data: this exercises both the chunk loop and the final
+    // cipher-sector read-modify-write in the full ext4-on-LUKS stack.
+    let Some(verify) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+    let Some(cat) = tool("cat-in-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let rel = "containers/unlock-argon2id-4096.img";
+    let path = scratch(rel, "chunked-kernel-read");
+    let content: Vec<u8> = (0..(2 * 128 * 1024 + 17))
+        .map(|i| ((i * 31 + 7) % 251) as u8)
+        .collect();
+
+    {
+        let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len()).expect("open writable");
+        let mut fs = mount_container(&dev);
+        let ino = fs.write_new_file(&content).expect("write chunked file");
+        fs.link_file(2, "chunked.bin", ino, FileType::Regular)
+            .expect("link into root");
+        fs.flush().expect("flush");
+    }
+
+    let verify_out = Command::new("bash")
+        .arg(&verify)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let verify_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&verify_out.stdout),
+        String::from_utf8_lossy(&verify_out.stderr)
+    );
+    assert!(
+        verify_out.status.success() && verify_text.contains("VERDICT: clean"),
+        "{rel}: e2fsck or the kernel rejected the chunked write:\n{verify_text}"
+    );
+
+    let read_out = Command::new("bash")
+        .arg(&cat)
+        .arg(&path)
+        .arg("chunked.bin")
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run cat-in-image");
+    assert!(
+        read_out.status.success(),
+        "{rel}: the kernel could not read the chunked file:\n{}",
+        String::from_utf8_lossy(&read_out.stderr)
+    );
+    assert_eq!(read_out.stdout, content, "{rel}: kernel readback differed");
+}
+
+#[test]
 fn the_files_that_were_already_in_the_container_survive() {
     // A read-modify-write bug at the cipher sector damages bytes the caller
     // never named, so the interesting question is not whether the new file

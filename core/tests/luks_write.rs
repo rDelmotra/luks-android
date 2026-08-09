@@ -149,6 +149,44 @@ fn a_partial_sector_write_preserves_the_rest_of_the_sector() {
 }
 
 #[test]
+fn a_large_unaligned_write_crosses_chunks_without_losing_neighbours() {
+    // Larger than LuksVolume's bounded scratch, deliberately starting and
+    // ending inside sectors. This exercises one RMW at each edge and aligned
+    // ciphertext chunks in between; doing an RMW for every chunk would be a
+    // correctness-preserving but catastrophically expensive regression.
+    const CHUNK: usize = 128 * 1024;
+    let path = scratch("unlock-argon2id-512.img", "chunked-unaligned");
+    let dev = FileDevice::open_writable(&path, std::fs::metadata(&path).expect("stat").len())
+        .expect("open writable");
+    let header = luks::read_from(&dev, 0).expect("header");
+    let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
+
+    let sector = volume.sector_size() as u64;
+    let at = sector * 40 + 13;
+    let payload: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
+
+    let first_sector = at / sector * sector;
+    let last_sector = (at + payload.len() as u64).div_ceil(sector) * sector;
+    let mut before = vec![0u8; (last_sector - first_sector) as usize];
+    volume
+        .read_at(first_sector, &mut before)
+        .expect("read covering sectors before write");
+
+    volume.write_at(at, &payload).expect("chunked write");
+    volume.flush().expect("flush");
+
+    let mut after = vec![0u8; before.len()];
+    volume
+        .read_at(first_sector, &mut after)
+        .expect("read covering sectors after write");
+    let start = (at - first_sector) as usize;
+    let end = start + payload.len();
+    assert_eq!(&after[start..end], payload, "payload crossed a chunk incorrectly");
+    assert_eq!(&after[..start], &before[..start], "prefix neighbour changed");
+    assert_eq!(&after[end..], &before[end..], "suffix neighbour changed");
+}
+
+#[test]
 fn the_filesystem_inside_still_mounts_after_a_write() {
     // An end-to-end sanity check that the container is still a container.
     // Writing into the *data* area at an offset the filesystem does not use

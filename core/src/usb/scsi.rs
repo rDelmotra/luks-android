@@ -256,9 +256,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let opcode = cdb[0];
         let tag = self.next_tag();
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
-        let encoded = cbw.encode()?;
+        let mut encoded = cbw.encode()?;
 
-        let sent = self.transport.write(&encoded)?;
+        let sent = self.transport.write(&mut encoded)?;
         if sent != encoded.len() {
             return Err(LuksError::ScsiProtocol("short CBW write"));
         }
@@ -277,7 +277,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 Direction::Out => {
                     while transferred < data.len() {
-                        let n = self.transport.write(&data[transferred..])?;
+                        let n = self.transport.write(&mut data[transferred..])?;
                         if n == 0 {
                             break;
                         }
@@ -455,7 +455,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// direction change. Divergence between the two would be a bug that shows
     /// up as data landing at the wrong LBA.
     #[cfg(feature = "dangerous-write-support")]
-    pub fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+    pub fn write_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
         let expected = count as usize * self.capacity.block_size as usize;
         if buf.len() < expected {
             return Err(LuksError::ScsiProtocol("write buffer too small"));
@@ -480,12 +480,10 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             cdb
         };
 
-        // `command` takes `&mut [u8]` because an IN transfer fills it. An OUT
-        // transfer only reads it, so a copy is needed to satisfy the signature.
-        // Widening that signature would let a read path hand out a mutable
-        // borrow it does not need; the copy is the cheaper mistake.
-        let mut data = buf[..expected].to_vec();
-        self.command(cdb, Direction::Out, &mut data)
+        // usbfs requires a mutable pointer even for OUT transfers. The caller
+        // already owns this command buffer, so passing it through is both safe
+        // and bounded: no payload-sized copy exists merely to satisfy that ABI.
+        self.command(cdb, Direction::Out, &mut buf[..expected])
     }
 
     /// Read the mode parameter header and report the medium's write-protect
@@ -724,7 +722,7 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
             }
 
             chunk[within..within + take].copy_from_slice(&buf[done..done + take]);
-            let put = self.write_blocks(lba, blocks as u32, &chunk[..span])?;
+            let put = self.write_blocks(lba, blocks as u32, &mut chunk[..span])?;
             if put < span {
                 return Err(LuksError::ScsiProtocol("short data phase"));
             }

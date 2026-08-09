@@ -189,6 +189,14 @@ impl<D: ReadAt> LuksVolume<D> {
 
 #[cfg(feature = "dangerous-write-support")]
 impl<D: crate::device::WriteAt> LuksVolume<D> {
+    /// Maximum ciphertext scratch allocation for one write operation.
+    ///
+    /// This is a multiple of every supported cipher-sector size, so interior
+    /// chunks begin and end on sector boundaries. The transport may split one
+    /// of these chunks again, but nothing below this layer allocates in
+    /// proportion to the caller's whole request.
+    const WRITE_CHUNK_BYTES: usize = 128 * 1024;
+
     /// Write plaintext at `offset` bytes from the start of the decrypted
     /// volume.
     ///
@@ -215,15 +223,62 @@ impl<D: crate::device::WriteAt> LuksVolume<D> {
         if buf.is_empty() {
             return Ok(());
         }
+        self.check_write_range(offset, buf.len())?;
+
+        if buf.len() <= Self::WRITE_CHUNK_BYTES {
+            return self.write_at_chunk(offset, buf);
+        }
+
+        // Preserve the existing read-modify-write behaviour for the only two
+        // ranges that can be unaligned. Every interior call is sector-aligned,
+        // so it takes the no-read path in `write_at_chunk`.
+        let sector = self.sector_size as u64;
+        let mut at = offset;
+        let mut done = 0usize;
+
+        if at % sector != 0 {
+            let first = ((sector - at % sector) as usize).min(buf.len());
+            self.write_at_chunk(at, &buf[..first])?;
+            at += first as u64;
+            done += first;
+        }
+
+        let chunk = Self::WRITE_CHUNK_BYTES / self.sector_size * self.sector_size;
+        while buf.len() - done >= self.sector_size {
+            let remaining_whole = (buf.len() - done) / self.sector_size * self.sector_size;
+            let take = remaining_whole.min(chunk);
+            self.write_at_chunk(at, &buf[done..done + take])?;
+            at += take as u64;
+            done += take;
+        }
+
+        if done != buf.len() {
+            self.write_at_chunk(at, &buf[done..])?;
+        }
+        Ok(())
+    }
+
+    /// Check the full request before streaming any part of it. Per-chunk
+    /// validation would discover an out-of-bounds tail only after earlier
+    /// chunks had reached the device.
+    fn check_write_range(&self, offset: u64, len: usize) -> Result<()> {
         let end = offset
-            .checked_add(buf.len() as u64)
+            .checked_add(len as u64)
             .ok_or(LuksError::OutOfBounds)?;
-        if let Some(len) = self.segment_len {
-            if end > len {
+        if let Some(volume_len) = self.segment_len {
+            if end > volume_len {
                 return Err(LuksError::OutOfBounds);
             }
         }
+        Ok(())
+    }
 
+    /// The original single-span write path. It stays intact for metadata and
+    /// for the aligned chunks emitted by `write_at` above.
+    fn write_at_chunk(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(LuksError::OutOfBounds)?;
         let ss = self.sector_size as u64;
         let first_sector = offset / ss;
         let last_sector = end.div_ceil(ss);

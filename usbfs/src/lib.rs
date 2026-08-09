@@ -343,12 +343,11 @@ impl UsbFsTransport {
 }
 
 impl BulkTransport for UsbFsTransport {
-    fn write(&self, data: &[u8]) -> Result<usize> {
-        // usbfs wants a `*mut` even for an OUT transfer. Rather than cast away
-        // the shared reference — which would be UB to hand out as `&mut` — copy
-        // into a local buffer. A CBW is 31 bytes, so this is free.
-        let mut owned = data.to_vec();
-        self.bulk(self.ep_out, &mut owned)
+    fn write(&self, data: &mut [u8]) -> Result<usize> {
+        // usbfs wants a `*mut` even for an OUT transfer. `BulkTransport`
+        // therefore requires an owned mutable buffer and can pass it directly
+        // to the ioctl, with no copy for either a 31-byte CBW or payload data.
+        self.bulk(self.ep_out, data)
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize> {

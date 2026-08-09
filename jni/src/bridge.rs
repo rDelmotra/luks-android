@@ -35,6 +35,11 @@ use luks_usbfs::UsbFsTransport;
 
 use serde_json::{json, Value};
 
+/// Write-only volume operations live separately so the long-lived JNI bridge
+/// stays navigable in read-only builds and while Pass 2b grows this boundary.
+#[cfg(feature = "dangerous-write-support")]
+mod writer;
+
 // ---------------------------------------------------------------- error codes
 
 /// Stable numeric error codes carried across JNI alongside the message.
@@ -656,9 +661,7 @@ pub unsafe fn open_usb_device(
 /// Carries no drive content — opcode names, a write-protect bit and sense
 /// codes — so it is safe to log on a device holding an encrypted volume.
 #[cfg(feature = "dangerous-write-support")]
-fn describe_write_support<T: luks_core::usb::BulkTransport>(
-    scsi: &ScsiBlockDevice<T>,
-) -> String {
+fn describe_write_support<T: luks_core::usb::BulkTransport>(scsi: &ScsiBlockDevice<T>) -> String {
     let wp = match scsi.is_write_protected() {
         Ok(true) => "write-protected: YES".to_string(),
         Ok(false) => "write-protected: no".to_string(),
@@ -835,89 +838,6 @@ impl VolumeHandle {
             } else { 0 },
         })
         .to_string())
-    }
-}
-
-/// Writing, which exists only when the write path was compiled in.
-///
-/// This is a separate `impl` block rather than a method with a runtime check,
-/// so that a read-only build does not merely refuse to write — it has nothing
-/// to refuse *with*.
-#[cfg(feature = "dangerous-write-support")]
-impl VolumeHandle {
-    /// Create `name` in the volume's root directory holding `data`, returning
-    /// the new inode number.
-    ///
-    /// # Scope
-    ///
-    /// Root directory only, one whole file at a time, held in memory. That is
-    /// what the phone needs to prove the path end to end; subdirectories and
-    /// streaming are the next thing, not this thing. The size ceiling is real
-    /// and comes from below: a new inode's extent tree is four inline extents,
-    /// so a file too fragmented to describe in four runs is refused rather
-    /// than truncated.
-    ///
-    /// # Ordering
-    ///
-    /// The flush is not optional and not the caller's to skip. A USB bridge
-    /// acknowledges a write into its own buffer, so without it a "written"
-    /// file is one yanked cable away from never having existed — and pulling
-    /// the cable is how a phone transfer normally ends.
-    pub fn write_file(&self, name: &str, data: &[u8]) -> Result<u64> {
-        use luks_core::fs::MountedFs as Fs;
-        use std::sync::atomic::Ordering;
-
-        // One writer per *device*, not per volume.
-        //
-        // `nativeUnlock` can be called twice on one device handle, and nothing
-        // on the Kotlin side prevents it. Each call mounts its own `Ext4`,
-        // which caches the superblock's free counters and every group
-        // descriptor in memory. Two of those allocating against one disk do
-        // not see each other's bitmap updates: measured, two volumes each
-        // writing one small file left `e2fsck` reporting wrong free counts,
-        // and racing them produced two files owning the same ten blocks —
-        // the one kind of damage `e2fsck` cannot repair without deleting
-        // something.
-        //
-        // A second *reader* is harmless and stays allowed: reads resolve
-        // through the disk, and only allocation depends on the cached state.
-        // So the claim is taken here, by the first write, rather than at
-        // unlock — refusing a second unlock outright would break a UI that
-        // re-prompts for a password without closing the first volume.
-        // Taken *under the filesystem lock*, and after the btrfs refusal below.
-        //
-        // Under the lock because the two-step "load, then compare_exchange"
-        // raced with itself otherwise: two threads writing through the *same*
-        // handle could both read `holds_writer == false`, both attempt the
-        // exchange, and the loser would be told another volume held the claim —
-        // a statement that was simply false. The `fs` mutex already serialises
-        // the work these two threads came to do, so it serialises the claim
-        // too, and the second one now sees the flag this one set.
-        //
-        // After the btrfs check because a volume that cannot be written must
-        // not walk away holding the device's only write claim until it is
-        // closed, locking out the ext4 volume that could have used it.
-        let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            // Refused explicitly rather than by falling through to a missing
-            // method: btrfs on this volume is a live filesystem we can read
-            // and must not touch, and the caller deserves to be told which of
-            // the two it got.
-            return Err(LuksError::UnsupportedFsFeature(
-                "writing to btrfs — this volume can be read but not written".into(),
-            ));
-        };
-
-        if !self.holds_writer.load(Ordering::Acquire) {
-            self.device_writer
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| LuksError::WriterBusy)?;
-            self.holds_writer.store(true, Ordering::Release);
-        }
-
-        let ino = ext4.create_file(2, name, data, FileType::Regular)?;
-        ext4.flush()?;
-        Ok(ino)
     }
 }
 
@@ -1104,7 +1024,10 @@ mod tests {
     /// under a handle is a real device in every build, and the fixture should
     /// be one too.
     fn disk_image() -> luks_core::device::FileDevice {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/disks/gpt-luks.img");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/disks/gpt-luks.img"
+        );
         luks_core::device::FileDevice::open(path).unwrap_or_else(|e| panic!("{path}: {e}"))
     }
 
@@ -1123,8 +1046,8 @@ mod tests {
     fn unlock_btrfs() -> VolumeHandle {
         let dev = btrfs_device();
         let blocks = dev.len().unwrap() / 512;
-        let handle = DeviceHandle::new(dev, 512, blocks, "TEST".into(), "BTRFS".into())
-            .expect("scan");
+        let handle =
+            DeviceHandle::new(dev, 512, blocks, "TEST".into(), "BTRFS".into()).expect("scan");
         let offset = handle
             .table
             .luks_partitions()
@@ -1237,7 +1160,10 @@ mod tests {
         let dev = open();
         let offset = dev.table.luks_partitions().next().unwrap().offset_bytes();
         assert!(dev.unlock(offset, b"wrong").is_err());
-        assert!(dev.unlock(offset, PASSWORD).is_ok(), "second attempt failed");
+        assert!(
+            dev.unlock(offset, PASSWORD).is_ok(),
+            "second attempt failed"
+        );
     }
 
     #[test]
@@ -1429,9 +1355,21 @@ mod tests {
     #[test]
     fn error_codes_are_distinct_per_category() {
         assert_eq!(error_code(&LuksError::WrongPassword), code::WRONG_PASSWORD);
-        assert_eq!(error_code(&LuksError::NotFound("x".into())), code::NOT_FOUND);
-        assert_eq!(error_code(&LuksError::ScsiCommandFailed { opcode: 0x2A, sense: None }), code::TRANSPORT);
+        assert_eq!(
+            error_code(&LuksError::NotFound("x".into())),
+            code::NOT_FOUND
+        );
+        assert_eq!(
+            error_code(&LuksError::ScsiCommandFailed {
+                opcode: 0x2A,
+                sense: None
+            }),
+            code::TRANSPORT
+        );
         assert_eq!(error_code(&LuksError::FsNeedsRecovery), code::NEEDS_FSCK);
-        assert_eq!(error_code(&LuksError::BadMagic { found: [0; 6] }), code::NOT_LUKS);
+        assert_eq!(
+            error_code(&LuksError::BadMagic { found: [0; 6] }),
+            code::NOT_LUKS
+        );
     }
 }

@@ -24,12 +24,17 @@ use crate::error::Result;
 /// A pair of USB bulk endpoints.
 ///
 /// On Android this wraps a file descriptor from `UsbDeviceConnection` and issues
-/// `USBDEVFS_BULK` / `USBDEVFS_SUBMITURB` ioctls. Note that Kotlin's
-/// `bulkTransfer()` is synchronous and cannot pipeline, so hitting useful
-/// throughput requires the ioctl path from native code.
+/// synchronous `USBDEVFS_BULK` ioctls. Kotlin's `bulkTransfer()` cannot express
+/// this native transport boundary; asynchronous URBs are not implemented here.
 pub trait BulkTransport {
     /// Send on the bulk OUT endpoint. Returns bytes accepted.
-    fn write(&self, data: &[u8]) -> Result<usize>;
+    ///
+    /// usbfs exposes the transfer buffer as `*mut void` even for an OUT
+    /// transfer. Requiring a mutable slice lets the platform hand the caller's
+    /// buffer to that ABI directly instead of making an owned copy solely to
+    /// manufacture mutability. Callers already own their command and payload
+    /// buffers; an OUT transfer does not change their contents.
+    fn write(&self, data: &mut [u8]) -> Result<usize>;
 
     /// Receive on the bulk IN endpoint. Returns bytes read, which may be short.
     fn read(&self, buf: &mut [u8]) -> Result<usize>;

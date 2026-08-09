@@ -262,13 +262,25 @@ impl<D: WriteAt> Ext4<D> {
 
     fn write_file_data(&mut self, runs: &[Run], data: &[u8]) -> Result<()> {
         let bs = self.sb.block_size as u64;
+        let block_size = self.sb.block_size as usize;
         let mut done = 0usize;
         for r in runs {
             let run_bytes = (r.len * bs) as usize;
             let take = run_bytes.min(data.len() - done);
-            let mut chunk = vec![0u8; run_bytes]; // zero-pads a short final block
-            chunk[..take].copy_from_slice(&data[done..done + take]);
-            self.device.write_at(r.physical * bs, &chunk)?;
+            let full_bytes = take / block_size * block_size;
+            if full_bytes != 0 {
+                self.device
+                    .write_at(r.physical * bs, &data[done..done + full_bytes])?;
+            }
+            if full_bytes != take {
+                // Only the final partial block needs a scratch buffer. Its
+                // zero tail prevents bytes from a previously deleted file
+                // becoming visible through this new inode.
+                let mut tail = vec![0u8; block_size];
+                tail[..take - full_bytes].copy_from_slice(&data[done + full_bytes..done + take]);
+                self.device
+                    .write_at(r.physical * bs + full_bytes as u64, &tail)?;
+            }
             done += take;
         }
         Ok(())
