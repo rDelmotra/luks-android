@@ -1015,7 +1015,12 @@ private suspend fun importFile(
             contentResolver.openInputStream(uri)?.use { input ->
                 while (done < fileSize) {
                     val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
-                    val read = input.read(buffer, 0, toRead)
+                    var read = 0
+                    while (read < toRead) {
+                        val r = input.read(buffer, read, toRead - read)
+                        if (r <= 0) break
+                        read += r
+                    }
                     if (read <= 0) break
                     writer.write(buffer, read)
                     done += read
@@ -1043,7 +1048,7 @@ private suspend fun importFile(
     "upload failed: ${e.message}"
 }
 
-private const val IMPORT_CHUNK = 512 shl 10 // 512 KiB (matches 4x 128 KiB SCSI hardware pipeline)
+private const val IMPORT_CHUNK = 128 shl 10 // 128 KiB (exact SCSI hardware pipeline transfer size)
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {

@@ -339,7 +339,7 @@ impl MockUsbDrive {
 }
 
 impl BulkTransport for MockUsbDrive {
-    fn write(&self, data: &mut [u8]) -> Result<usize> {
+    fn write(&self, data: &[u8]) -> Result<usize> {
         // Mid data-out phase: these bytes are payload, not a new command.
         {
             let mut phase = self.phase.borrow_mut();

@@ -286,7 +286,46 @@ impl UsbFsTransport {
 
     /// One synchronous bulk transfer. Returns the number of bytes moved, which
     /// may be less than requested — short reads are normal on the IN endpoint.
-    fn bulk(&self, ep: u8, buf: &mut [u8]) -> Result<usize> {
+    fn bulk_out(&self, ep: u8, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            let limit = self.max_transfer.load(Ordering::Relaxed);
+            let len = buf.len().min(limit);
+
+            let mut req = UsbFsBulkTransfer {
+                ep: ep as c_uint,
+                len: len as c_uint,
+                timeout: self.timeout_ms,
+                data: buf.as_ptr() as *mut c_void,
+            };
+
+            let rc = unsafe {
+                libc::ioctl(
+                    self.fd,
+                    bulk_code() as IoctlReq,
+                    &mut req as *mut UsbFsBulkTransfer as *mut c_void,
+                )
+            };
+            if rc >= 0 {
+                return Ok(rc as usize);
+            }
+
+            let e = errno();
+
+            if e == libc::EINVAL && limit > Self::MIN_MAX_TRANSFER {
+                let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                continue;
+            }
+
+            return Err(bulk_err(len, limit, e));
+        }
+    }
+
+    fn bulk_in(&self, ep: u8, buf: &mut [u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -302,10 +341,6 @@ impl UsbFsTransport {
                 data: buf.as_mut_ptr() as *mut c_void,
             };
 
-            // SAFETY: `req.data` points at `len` writable bytes owned by `buf`,
-            // and `req.len` is exactly that count, so the kernel cannot write
-            // out of bounds. The struct layout is `#[repr(C)]` and its size is
-            // what the ioctl code was computed from.
             let rc = unsafe {
                 libc::ioctl(
                     self.fd,
@@ -319,20 +354,8 @@ impl UsbFsTransport {
 
             let e = errno();
 
-            // A buffer the kernel considers too large is rejected by usbfs
-            // *before* it submits anything to the bus — it is pure argument
-            // validation. That is what makes retrying safe here: no data was
-            // moved, no packet was sent, so the Bulk-Only Transport state
-            // machine is exactly where it was and cannot desynchronise.
-            //
-            // Retrying a transfer that had actually started would be a serious
-            // bug: a repeated data phase against a live CBW would put the
-            // device and us permanently out of step.
             if e == libc::EINVAL && limit > Self::MIN_MAX_TRANSFER {
                 let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                // Only lower it. Racing callers may each observe EINVAL; taking
-                // the minimum means the limit converges downward and never
-                // bounces back up to a size already known to fail.
                 self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
                 continue;
             }
@@ -343,15 +366,12 @@ impl UsbFsTransport {
 }
 
 impl BulkTransport for UsbFsTransport {
-    fn write(&self, data: &mut [u8]) -> Result<usize> {
-        // usbfs wants a `*mut` even for an OUT transfer. `BulkTransport`
-        // therefore requires an owned mutable buffer and can pass it directly
-        // to the ioctl, with no copy for either a 31-byte CBW or payload data.
-        self.bulk(self.ep_out, data)
+    fn write(&self, data: &[u8]) -> Result<usize> {
+        self.bulk_out(self.ep_out, data)
     }
 
     fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        self.bulk(self.ep_in, buf)
+        self.bulk_in(self.ep_in, buf)
     }
 
     fn max_transfer(&self) -> usize {

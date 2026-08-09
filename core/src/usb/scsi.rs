@@ -243,6 +243,76 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.command_inner(cdb, direction, data, true)
     }
 
+    fn command_out(&self, cdb: Vec<u8>, data: &[u8]) -> Result<usize> {
+        self.command_out_inner(cdb, data, true)
+    }
+
+    fn command_out_inner(&self, cdb: Vec<u8>, data: &[u8], ask_why: bool) -> Result<usize> {
+        let opcode = cdb[0];
+        let tag = self.next_tag();
+        let cbw = CommandBlockWrapper::new(tag, data.len() as u32, Direction::Out, cdb);
+        let encoded = cbw.encode()?;
+
+        let sent = self.transport.write(&encoded)?;
+        if sent != encoded.len() {
+            return Err(LuksError::ScsiProtocol("short CBW write"));
+        }
+
+        let mut transferred = 0usize;
+        if !data.is_empty() {
+            while transferred < data.len() {
+                let n = self.transport.write(&data[transferred..])?;
+                if n == 0 {
+                    break;
+                }
+                transferred += n;
+            }
+        }
+
+        let mut csw_buf = [0u8; CSW_LEN];
+        let mut got = 0usize;
+        while got < CSW_LEN {
+            let n = self.transport.read(&mut csw_buf[got..])?;
+            if n == 0 {
+                self.transport.clear_halt(true)?;
+                let n = self.transport.read(&mut csw_buf[got..])?;
+                if n == 0 {
+                    return Err(LuksError::ScsiProtocol("no CSW"));
+                }
+                got += n;
+                continue;
+            }
+            got += n;
+        }
+
+        let csw = CommandStatusWrapper::decode(&csw_buf)?;
+        if csw.tag != tag {
+            return Err(LuksError::ScsiProtocol("CSW tag mismatch"));
+        }
+        match csw.status {
+            CswStatus::Passed => {
+                if csw.data_residue != 0 {
+                    return Err(LuksError::ScsiProtocol(
+                        "drive committed less than the full data phase",
+                    ));
+                }
+                Ok(transferred)
+            }
+            CswStatus::Failed => {
+                let sense = if ask_why {
+                    self.request_sense().ok().map(|b| Sense::parse(&b))
+                } else {
+                    None
+                };
+                Err(LuksError::ScsiCommandFailed { opcode, sense })
+            }
+            CswStatus::PhaseError => {
+                let _ = self.transport.reset();
+                Err(LuksError::ScsiProtocol("CSW phase error"))
+            }
+        }
+    }
+
     /// `ask_why` exists only to stop the REQUEST SENSE issued after a failure
     /// from recursing when it is itself the command that failed. Every other
     /// caller wants it true.
@@ -256,9 +326,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let opcode = cdb[0];
         let tag = self.next_tag();
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
-        let mut encoded = cbw.encode()?;
+        let encoded = cbw.encode()?;
 
-        let sent = self.transport.write(&mut encoded)?;
+        let sent = self.transport.write(&encoded)?;
         if sent != encoded.len() {
             return Err(LuksError::ScsiProtocol("short CBW write"));
         }
@@ -277,7 +347,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 Direction::Out => {
                     while transferred < data.len() {
-                        let n = self.transport.write(&mut data[transferred..])?;
+                        let n = self.transport.write(&data[transferred..])?;
                         if n == 0 {
                             break;
                         }
@@ -455,7 +525,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// direction change. Divergence between the two would be a bug that shows
     /// up as data landing at the wrong LBA.
     #[cfg(feature = "dangerous-write-support")]
-    pub fn write_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
+    pub fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
         let expected = count as usize * self.capacity.block_size as usize;
         if buf.len() < expected {
             return Err(LuksError::ScsiProtocol("write buffer too small"));
@@ -483,7 +553,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         // usbfs requires a mutable pointer even for OUT transfers. The caller
         // already owns this command buffer, so passing it through is both safe
         // and bounded: no payload-sized copy exists merely to satisfy that ABI.
-        self.command(cdb, Direction::Out, &mut buf[..expected])
+        self.command_out(cdb, &buf[..expected])
     }
 
     /// Read the mode parameter header and report the medium's write-protect
@@ -699,8 +769,6 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
         let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
-        let mut chunk = vec![0u8; (max_blocks * bs) as usize];
-
         while done < buf.len() {
             let pos = offset + done as u64;
             let lba = pos / bs;
@@ -712,17 +780,19 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
             let take = (span - within).min(remaining);
 
             // Whole blocks: nothing around the payload needs preserving, so
-            // the read is skipped entirely.
+            // the read is skipped entirely and no scratch buffer is allocated.
             let partial = within != 0 || take != span;
-            if partial {
-                let got = self.read_blocks(lba, blocks as u32, &mut chunk[..span])?;
+            let put = if partial {
+                let mut chunk = vec![0u8; span];
+                let got = self.read_blocks(lba, blocks as u32, &mut chunk)?;
                 if got < span {
                     return Err(LuksError::ScsiProtocol("short data phase"));
                 }
-            }
-
-            chunk[within..within + take].copy_from_slice(&buf[done..done + take]);
-            let put = self.write_blocks(lba, blocks as u32, &mut chunk[..span])?;
+                chunk[within..within + take].copy_from_slice(&buf[done..done + take]);
+                self.write_blocks(lba, blocks as u32, &chunk)?
+            } else {
+                self.write_blocks(lba, blocks as u32, &buf[done..done + take])?
+            };
             if put < span {
                 return Err(LuksError::ScsiProtocol("short data phase"));
             }
