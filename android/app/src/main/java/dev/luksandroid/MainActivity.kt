@@ -993,7 +993,7 @@ private suspend fun importFile(
         }
 
         val name = fileName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}"
-        if (fileSize <= 0L) {
+        if (fileSize < 0L) {
             contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
                 fileSize = pfd.statSize
             }
