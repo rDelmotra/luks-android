@@ -773,7 +773,8 @@ impl VolumeHandle {
     /// gigabyte file would blow the app heap long before the read finished.
     /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
     pub fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let info = self.fs().file_info(path)?;
+        let fs = self.fs();
+        let info = fs.file_info(path)?;
         if info.size > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
@@ -781,7 +782,7 @@ impl VolumeHandle {
                 info.size, max_bytes
             )));
         }
-        self.fs().read_file(path)
+        fs.read_file(path)
     }
 
     /// Fill `buf` from `offset`, returning how many bytes were written.

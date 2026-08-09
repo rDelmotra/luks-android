@@ -309,3 +309,37 @@ fn a_multi_megabyte_named_file_is_clean_and_reads_back_byte_for_byte() {
         got.stdout.iter().zip(&content).position(|(a, b)| a != b)
     );
 }
+
+#[test]
+fn an_abandoned_writer_rolls_back_its_allocations() {
+    let path = scratch("csum-uuid-4k.img", "abandon");
+    let content = vec![0xAAu8; 128 * 1024]; // 128 KiB
+    let mut fs = open(&path);
+
+    let free_blocks_before = fs.superblock().free_blocks_count;
+    let free_inodes_before = fs.superblock().free_inodes_count;
+
+    // Start a file and write a chunk
+    let mut writer = fs.begin_file(content.len() as u64).expect("begin file");
+    fs.write_chunk(&mut writer, &content).expect("write chunk");
+
+    // Blocks and inodes should be consumed
+    assert!(fs.superblock().free_blocks_count < free_blocks_before);
+    assert!(fs.superblock().free_inodes_count < free_inodes_before);
+
+    // Abandon it instead of finish
+    fs.abandon_file(writer);
+    fs.flush().expect("flush");
+
+    // They should be back to original
+    assert_eq!(
+        fs.superblock().free_blocks_count,
+        free_blocks_before,
+        "an abandoned writer must not leak blocks"
+    );
+    assert_eq!(
+        fs.superblock().free_inodes_count,
+        free_inodes_before,
+        "an abandoned writer must not leak its inode"
+    );
+}
