@@ -46,7 +46,13 @@ impl VolumeHandle {
         let Fs::Ext4(ext4) = &mut *fs else {
             unreachable!("writer began on ext4")
         };
-        let dir_ino = ext4.resolve(parent_path)?.number;
+        let dir_ino = match ext4.resolve(parent_path) {
+            Ok(d) => d.number,
+            Err(e) => {
+                ext4.abandon_file(writer);
+                return Err(e);
+            }
+        };
         let ino = ext4.finish_file(writer, dir_ino, name, FileType::Regular)?;
         ext4.flush()?;
         Ok(ino)

@@ -139,10 +139,13 @@ impl<D: WriteAt> Ext4<D> {
         match which {
             Bitmap::Inode => {
                 let first_inode = (group as u32 * sb.inodes_per_group) + 1;
-                let mut valid_inodes = sb.inodes_per_group;
-                if first_inode + sb.inodes_per_group - 1 > sb.inodes_count {
-                    valid_inodes = sb.inodes_count.saturating_sub(first_inode) + 1;
-                }
+                let valid_inodes = if first_inode > sb.inodes_count {
+                    0
+                } else if first_inode + sb.inodes_per_group - 1 > sb.inodes_count {
+                    sb.inodes_count - first_inode + 1
+                } else {
+                    sb.inodes_per_group
+                };
                 for i in valid_inodes as usize..buf.len() * 8 {
                     set_bit(&mut buf, i);
                 }
@@ -179,7 +182,7 @@ impl<D: WriteAt> Ext4<D> {
                         set_bit(&mut buf, (ib - first_block) as usize);
                     }
                     let it_start = g.inode_table;
-                    let it_blocks = (sb.inodes_per_group as u64 * sb.inode_size as u64) / sb.block_size as u64;
+                    let it_blocks = (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(sb.block_size as u64);
                     let it_end = it_start + it_blocks - 1;
 
                     let overlap_start = it_start.max(first_block);

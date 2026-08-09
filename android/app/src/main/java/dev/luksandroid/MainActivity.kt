@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -578,6 +579,23 @@ private fun UnlockedBody(
         }
     }
 
+    val importer = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        onBusyChange(true)
+        scope.launch {
+            status = importFile(context, state.volume, path, uri) { done, total ->
+                val pct = if (total > 0) done * 100 / total else 0
+                status = "uploading — $pct% (${formatSize(done)} of ${formatSize(total)})"
+            }
+            try {
+                entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
+            } catch (_: Exception) {}
+            onBusyChange(false)
+        }
+    }
+
     fun navigate(to: String) {
         onBusyChange(true)
         status = null
@@ -718,7 +736,7 @@ private fun UnlockedBody(
                             val content = withContext(Dispatchers.Default) { testPayload(sizeBytes) }
                             val startMs = System.currentTimeMillis()
                             val ino = withContext(Dispatchers.IO) {
-                                state.volume.writeFile(state.currentDirectory, name, content)
+                                state.volume.writeFile(path, name, content)
                             }
                             val elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1)
                             val mibPerSec = (content.size / 1_048_576.0) / (elapsedMs / 1000.0)
@@ -751,14 +769,28 @@ private fun UnlockedBody(
         }
     }
 
-    Button(
-        onClick = {
-            state.volume.close()
-            onVolumeChange(VolumeState.None)
-        },
-        enabled = !busy,
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
     ) {
-        Text("Lock")
+        if (state.volume.canWrite) {
+            Button(
+                onClick = { importer.launch(arrayOf("*/*")) },
+                enabled = !busy,
+            ) {
+                Text("Upload File")
+            }
+        }
+        Button(
+            onClick = {
+                state.volume.close()
+                onVolumeChange(VolumeState.None)
+            },
+            enabled = !busy,
+        ) {
+            Text("Lock")
+        }
     }
 }
 
@@ -934,6 +966,79 @@ private suspend fun exportFile(
 }
 
 private const val EXPORT_CHUNK = 1 shl 20
+
+/**
+ * Copies a file from a user-chosen Uri into the encrypted drive directory,
+ * streaming it via [LuksVolume.beginFile], [LuksVolume.FileWriter.write], and [LuksVolume.FileWriter.finish].
+ */
+private suspend fun importFile(
+    context: Context,
+    volume: LuksVolume,
+    parentPath: String,
+    uri: android.net.Uri,
+    onProgress: (done: Long, total: Long) -> Unit,
+): String = try {
+    withContext(Dispatchers.IO) {
+        val contentResolver = context.contentResolver
+        var fileName: String? = null
+        var fileSize: Long = -1L
+
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (nameIndex != -1) fileName = cursor.getString(nameIndex)
+                if (sizeIndex != -1 && !cursor.isNull(sizeIndex)) fileSize = cursor.getLong(sizeIndex)
+            }
+        }
+
+        val name = fileName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}"
+        if (fileSize <= 0L) {
+            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                fileSize = pfd.statSize
+            }
+        }
+
+        check(fileSize >= 0L) { "could not determine file size" }
+
+        val started = System.currentTimeMillis()
+        var done = 0L
+        val buffer = ByteArray(IMPORT_CHUNK)
+
+        val writer = volume.beginFile(fileSize)
+        try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                while (done < fileSize) {
+                    val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
+                    val read = input.read(buffer, 0, toRead)
+                    if (read <= 0) break
+                    writer.write(buffer, read)
+                    done += read
+                    onProgress(done, fileSize)
+                }
+            } ?: throw IllegalStateException("could not open input stream")
+
+            if (done < fileSize) {
+                throw IllegalStateException("short read: read $done bytes of $fileSize expected")
+            }
+
+            val ino = writer.finish(parentPath, name)
+            val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+            Trace.i("import: %d bytes in %.1f s · %.1f MiB/s (inode %d)".format(done, secs, done / secs / (1L shl 20), ino))
+            "uploaded $name (${formatSize(done)}) in %.1f s · %.1f MiB/s".format(secs, done / secs / (1L shl 20))
+        } finally {
+            writer.close()
+        }
+    }
+} catch (e: LuksException) {
+    Trace.e("import: failed [${e.code}] ${e.message}")
+    "upload failed [${e.code}] ${e.message}"
+} catch (e: Exception) {
+    Trace.e("import: failed", e)
+    "upload failed: ${e.message}"
+}
+
+private const val IMPORT_CHUNK = 4 shl 20 // 4 MiB
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
 private suspend fun hashFile(volume: LuksVolume, path: String): String = try {

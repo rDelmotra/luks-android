@@ -544,8 +544,9 @@ impl<D: WriteAt> Ext4<D> {
         put32(&mut raw, 0x0C, now); // i_ctime
         put32(&mut raw, 0x10, now); // i_mtime
         put16(&mut raw, 0x1A, 1); // i_links_count — see doc comment
+        let total_blocks = if leaf_block.is_some() { blocks_needed + 1 } else { blocks_needed };
         let sectors_per_block = self.sb.block_size / 512;
-        put32(&mut raw, 0x1C, blocks_needed as u32 * sectors_per_block); // i_blocks_lo
+        put32(&mut raw, 0x1C, total_blocks as u32 * sectors_per_block); // i_blocks_lo
         put32(&mut raw, 0x20, FL_EXTENTS); // i_flags
 
         write_extent_tree(&mut raw[0x28..0x28 + 60], runs, leaf_block)?;
