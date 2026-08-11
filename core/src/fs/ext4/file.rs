@@ -33,7 +33,7 @@ use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
 use crate::fs::ext4::alloc::Extent;
 use crate::fs::ext4::csum::Seed;
-use crate::fs::ext4::Ext4;
+use crate::fs::ext4::{Ext4, Inode};
 
 const EXTENT_MAGIC: u16 = 0xF30A;
 /// Header (12 bytes) + four 12-byte entries fills exactly the 60-byte
@@ -52,6 +52,14 @@ fn put16(b: &mut [u8], o: usize, v: u16) {
 }
 fn put32(b: &mut [u8], o: usize, v: u32) {
     b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+fn u16le(b: &[u8], o: usize) -> u16 {
+    u16::from_le_bytes([b[o], b[o + 1]])
+}
+
+fn u32le(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
 /// One contiguous run: `len` logical blocks starting at `logical`, backed by
@@ -576,6 +584,104 @@ impl<D: WriteAt> Ext4<D> {
         let offset = self.inode_offset(ino)?;
         self.device.write_at(offset, &raw)?;
         Ok(())
+    }
+
+    /// Walk an inode's extent tree and return all physical block runs (data)
+    /// plus any index blocks used by the tree itself (depth > 0).
+    ///
+    /// Must be called BEFORE the inode is zeroed — after Phase 2 the extents
+    /// are unrecoverable.
+    pub fn collect_extents(&self, inode: &Inode) -> Result<(Vec<Extent>, Vec<Extent>)> {
+        if inode.is_inline() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        if !inode.uses_extents() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "deleting files with indirect block mapping".into(),
+            ));
+        }
+
+        let magic = u16le(&inode.block_area, 0);
+        if magic != EXTENT_MAGIC {
+            return Err(LuksError::BadExtentHeader(magic));
+        }
+        let entries = u16le(&inode.block_area, 2) as usize;
+        let depth = u16le(&inode.block_area, 6);
+
+        if 12 + entries * 12 > inode.block_area.len() {
+            return Err(LuksError::BadExtentTree("entry count exceeds node size"));
+        }
+
+        if depth == 0 {
+            let mut data_extents = Vec::new();
+            for i in 0..entries {
+                let e = &inode.block_area[12 + i * 12..24 + i * 12];
+                let raw_len = u16le(e, 4);
+                let len = if raw_len > 32768 {
+                    (raw_len - 32768) as u64
+                } else {
+                    raw_len as u64
+                };
+                if len == 0 {
+                    continue;
+                }
+                let start = u32le(e, 8) as u64 | ((u16le(e, 6) as u64) << 32);
+                data_extents.push(Extent { physical: start, len });
+            }
+            Ok((data_extents, Vec::new()))
+        } else if depth == 1 {
+            let mut data_extents = Vec::new();
+            let mut index_extents = Vec::new();
+            let bs = self.sb.block_size as usize;
+
+            for i in 0..entries {
+                let e = &inode.block_area[12 + i * 12..24 + i * 12];
+                let child_phys = u32le(e, 4) as u64 | ((u16le(e, 8) as u64) << 32);
+                index_extents.push(Extent {
+                    physical: child_phys,
+                    len: 1,
+                });
+
+                let mut buf = vec![0u8; bs];
+                self.read_block(child_phys, &mut buf)?;
+
+                let child_magic = u16le(&buf, 0);
+                if child_magic != EXTENT_MAGIC {
+                    return Err(LuksError::BadExtentHeader(child_magic));
+                }
+                let child_entries = u16le(&buf, 2) as usize;
+                let child_depth = u16le(&buf, 6);
+                if child_depth != 0 {
+                    return Err(LuksError::BadExtentTree(
+                        "expected leaf node at depth 0 in extent tree",
+                    ));
+                }
+                if 12 + child_entries * 12 > buf.len() {
+                    return Err(LuksError::BadExtentTree("child entry count exceeds block size"));
+                }
+
+                for j in 0..child_entries {
+                    let ce = &buf[12 + j * 12..24 + j * 12];
+                    let raw_len = u16le(ce, 4);
+                    let len = if raw_len > 32768 {
+                        (raw_len - 32768) as u64
+                    } else {
+                        raw_len as u64
+                    };
+                    if len == 0 {
+                        continue;
+                    }
+                    let start = u32le(ce, 8) as u64 | ((u16le(ce, 6) as u64) << 32);
+                    data_extents.push(Extent { physical: start, len });
+                }
+            }
+            Ok((data_extents, index_extents))
+        } else {
+            Err(LuksError::UnsupportedFsFeature(
+                "file has extent tree depth > 1".into(),
+            ))
+        }
     }
 }
 

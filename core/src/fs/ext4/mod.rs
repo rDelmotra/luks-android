@@ -18,6 +18,8 @@ pub mod dirent;
 pub mod file;
 
 use crate::device::ReadAt;
+#[cfg(feature = "dangerous-write-support")]
+use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
 use crate::fs::{DirEntry, FileInfo, FileType};
 
@@ -420,11 +422,11 @@ impl Inode {
         }
     }
 
-    fn uses_extents(&self) -> bool {
+    pub(crate) fn uses_extents(&self) -> bool {
         self.flags & INODE_FL_EXTENTS != 0
     }
 
-    fn is_inline(&self) -> bool {
+    pub(crate) fn is_inline(&self) -> bool {
         self.flags & INODE_FL_INLINE_DATA != 0
     }
 
@@ -529,7 +531,12 @@ impl<D: ReadAt> Ext4<D> {
         self.sb.uuid
     }
 
-    fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<()> {
+    #[cfg(any(test, feature = "dangerous-write-support"))]
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
+    pub(crate) fn read_block(&self, block: u64, buf: &mut [u8]) -> Result<()> {
         if block >= self.sb.blocks_count {
             return Err(LuksError::CorruptFs("block pointer past end of filesystem"));
         }
@@ -593,6 +600,11 @@ impl<D: ReadAt> Ext4<D> {
             ));
         }
         Ok(offset)
+    }
+
+    #[cfg(any(test, feature = "dangerous-write-support"))]
+    pub fn test_inode_offset(&self, ino: u64) -> Result<u64> {
+        self.inode_offset(ino)
     }
 
     /// An inode's raw on-disk bytes, `s_inode_size` long. Checksumming an
@@ -1050,5 +1062,59 @@ impl<D: ReadAt> Ext4<D> {
             }
         }
         Ok(current)
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl<D: WriteAt> Ext4<D> {
+    /// Delete a regular file by path. Refuses directories and hardlinks.
+    /// Follows the Phase 0–4 ordering: collect -> sever name -> zero inode -> free blocks -> flush.
+    pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        let trimmed = path.trim_start_matches('/');
+        if trimmed.is_empty() {
+            return Err(LuksError::IsADirectory("/".into()));
+        }
+
+        let (parent_path, name) = match trimmed.rsplit_once('/') {
+            Some((p, n)) => (p, n),
+            None => ("", trimmed),
+        };
+
+        let parent_dir = self.resolve(parent_path)?;
+        if !parent_dir.file_type().is_dir() {
+            return Err(LuksError::NotADirectory(format!("path /{parent_path}")));
+        }
+
+        let target_inode = self.resolve_no_follow(path)?;
+        if target_inode.file_type().is_dir() {
+            return Err(LuksError::IsADirectory(path.to_string()));
+        }
+
+        if target_inode.links > 1 {
+            return Err(LuksError::UnsupportedFsFeature(
+                "deleting files with links_count > 1 (hardlinks)".into(),
+            ));
+        }
+
+        // Phase 0: Collect extents (read-only)
+        let (data_extents, index_extents) = self.collect_extents(&target_inode)?;
+
+        // Phase 1: Sever the name (1 disk write)
+        let removed_ino = self.unlink_file(parent_dir.number, name)?;
+        if removed_ino != target_inode.number {
+            return Err(LuksError::CorruptFs("unlinked inode number mismatch"));
+        }
+
+        // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
+        self.free_inode(target_inode.number, false)?;
+
+        // Phase 3: Return Blocks to the Free Pool
+        self.free_blocks(&data_extents)?;
+        if !index_extents.is_empty() {
+            self.free_blocks(&index_extents)?;
+        }
+
+        // Phase 4: Flush
+        self.flush()
     }
 }
