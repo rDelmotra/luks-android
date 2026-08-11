@@ -631,3 +631,19 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
         Ok(())
     })
 }
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDeleteFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+) {
+    guard(&mut env, (), |env| {
+        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let path_str = jstr(env, &path)?;
+        vol.delete_file(&path_str)?;
+        Ok(())
+    })
+}

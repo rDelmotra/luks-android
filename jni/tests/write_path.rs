@@ -575,3 +575,36 @@ fn a_streaming_writer_that_collides_on_finish_rolls_back_cleanly() {
         "a failed finish left the filesystem unclean:\n{text}"
     );
 }
+
+#[test]
+fn a_file_deleted_through_the_bridge_is_gone_and_e2fsck_clean() {
+    let path = scratch("bridge-delete");
+
+    {
+        let vol = unlock(&path);
+        // Create a file through the bridge
+        vol.write_file("/", "bridge_del.txt", b"temporary bridge file")
+            .expect("write_file");
+        // Verify it was created and delete it through the bridge
+        vol.delete_file("/bridge_del.txt").expect("delete_file");
+    }
+
+    if let Some(script) = tool("verify-image.sh") {
+        let out = Command::new("bash")
+            .arg(&script)
+            .arg(&path)
+            .arg(PASSWORD_STR)
+            .output()
+            .expect("run verify-image");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            out.status.success() && text.contains("VERDICT: clean"),
+            "delete_file through the bridge left the filesystem unclean:\n{text}"
+        );
+    }
+}
