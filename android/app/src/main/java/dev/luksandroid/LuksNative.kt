@@ -140,4 +140,5 @@ internal object LuksNative {
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCloseWriter(handle: Long, writer: Long)
+    external fun nativeDeleteFile(handle: Long, path: String)
 }

@@ -271,6 +271,11 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         return LuksNative.nativeWriteFile(handle, parentPath, name, data)
     }
 
+    fun deleteFile(path: String) {
+        check(handle != 0L) { "volume is closed" }
+        LuksNative.nativeDeleteFile(handle, path)
+    }
+
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
     fun beginFile(sizeBytes: Long): FileWriter {
         check(handle != 0L) { "volume is closed" }

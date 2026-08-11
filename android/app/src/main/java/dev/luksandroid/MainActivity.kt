@@ -687,6 +687,33 @@ private fun UnlockedBody(
                     ) {
                         Text("SHA-256")
                     }
+                    if (state.volume.canWrite) {
+                        TextButton(
+                            onClick = {
+                                status = "deleting ${entry.name}…"
+                                onBusyChange(true)
+                                scope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            state.volume.deleteFile(full)
+                                        }
+                                        entries = withContext(Dispatchers.IO) {
+                                            state.volume.listDir(path)
+                                        }
+                                        status = "deleted ${entry.name}"
+                                    } catch (e: LuksException) {
+                                        status = "delete failed [${e.code}]: ${e.message}"
+                                    } catch (e: Exception) {
+                                        status = "delete failed: ${e.message}"
+                                    }
+                                    onBusyChange(false)
+                                }
+                            },
+                            enabled = !busy,
+                        ) {
+                            Text("Delete", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
                 }
             }
         }
