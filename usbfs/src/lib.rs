@@ -137,6 +137,33 @@ struct InFlightUrb {
     urb: UsbdevfsUrb,
     submitted: bool,
     reaped: bool,
+    /// Position in the chunk sequence. Completions are scored by this, not
+    /// by the order they are reaped in — REAPURB does not promise to return
+    /// them in submission order, and a gap earlier in the sequence must stop
+    /// the count even if a later chunk happened to complete first.
+    index: usize,
+}
+
+/// Bytes actually usable from this round: the sum of `actual_length` over
+/// the longest *prefix*, by index, of URBs that completed successfully.
+///
+/// A failed, discarded, or never-reaped URB anywhere before the end stops
+/// the count there, even if later URBs — submitted concurrently, and
+/// possibly still reaped as "successful" by the kernel — completed too.
+/// Counting past a gap is exactly the bug this exists to prevent: on an OUT
+/// transfer it would claim bytes as delivered when the ones before them
+/// never reached the device in order, and on an IN transfer the bytes past
+/// a gap cannot be trusted to sit at the offset the caller expects either
+/// way.
+fn contiguous_prefix(outcomes: &[Option<i32>]) -> usize {
+    let mut total = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            Some(n) => total += *n as usize,
+            None => break,
+        }
+    }
+    total
 }
 
 // --------------------------------------------------------------------- errors
@@ -357,6 +384,7 @@ impl UsbFsTransport {
                     },
                     submitted: false,
                     reaped: false,
+                    index: i,
                 });
             }
 
@@ -384,7 +412,10 @@ impl UsbFsTransport {
                 submitted_count += 1;
             }
 
-            if let Some(err) = submit_err {
+            // Tear down immediately if submission itself failed, so the
+            // kernel starts unwinding while the drain below runs rather than
+            // after.
+            if submit_err.is_some() {
                 for j in 0..submitted_count {
                     if urbs[j].submitted && !urbs[j].reaped {
                         unsafe {
@@ -396,40 +427,14 @@ impl UsbFsTransport {
                         }
                     }
                 }
-
-                let mut completed = 0;
-                while completed < submitted_count {
-                    let mut reaped: *mut c_void = std::ptr::null_mut();
-                    let rc = unsafe {
-                        libc::ioctl(
-                            self.fd,
-                            reap_urb_code() as IoctlReq,
-                            &mut reaped as *mut *mut c_void as *mut c_void,
-                        )
-                    };
-                    if rc < 0 {
-                        let e = errno();
-                        if e == libc::EINTR {
-                            continue;
-                        }
-                        break;
-                    }
-                    let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
-                    inflight.reaped = true;
-                    completed += 1;
-                }
-
-                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                    continue;
-                }
-                return Err(bulk_err(offset, limit, err));
             }
 
+            // Reap every URB that was actually submitted and score each by
+            // *index* — REAPURB makes no promise about completion order.
+            let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
-            let mut transfer_err = None;
-            let mut total_transferred = 0;
+            let mut completion_err = None;
+            let mut reap_err = None;
 
             while completed < submitted_count {
                 let mut reaped: *mut c_void = std::ptr::null_mut();
@@ -445,7 +450,7 @@ impl UsbFsTransport {
                     if e == libc::EINTR {
                         continue;
                     }
-                    transfer_err = Some(e);
+                    reap_err = Some(e);
                     break;
                 }
                 let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
@@ -456,8 +461,8 @@ impl UsbFsTransport {
                 if status < 0 {
                     let err = -status;
                     let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
-                    if !was_discarded && transfer_err.is_none() {
-                        transfer_err = Some(err);
+                    if !was_discarded && completion_err.is_none() {
+                        completion_err = Some(err);
 
                         for j in 0..submitted_count {
                             if urbs[j].submitted && !urbs[j].reaped {
@@ -471,21 +476,59 @@ impl UsbFsTransport {
                             }
                         }
                     }
+                    // outcomes[inflight.index] stays None: failed or discarded.
                 } else {
-                    total_transferred += inflight.urb.actual_length as usize;
+                    outcomes[inflight.index] = Some(inflight.urb.actual_length);
                 }
             }
 
-            if let Some(err) = transfer_err {
-                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                    continue;
+            // A REAPURB failure leaves whatever was still in flight neither
+            // confirmed nor discarded. Best-effort clean-up so the next round
+            // does not inherit URBs this one never resolved.
+            if reap_err.is_some() {
+                for j in 0..submitted_count {
+                    if urbs[j].submitted && !urbs[j].reaped {
+                        unsafe {
+                            libc::ioctl(
+                                self.fd,
+                                discard_urb_code() as IoctlReq,
+                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                            );
+                        }
+                    }
                 }
-                return Err(bulk_err(total_transferred, limit, err));
             }
 
-            return Ok(total_transferred);
+            let prefix = contiguous_prefix(&outcomes);
+            let err = submit_err.or(completion_err).or(reap_err);
+
+            match err {
+                None => return Ok(prefix),
+                Some(e) => {
+                    let shrinkable = (e == libc::EINVAL || e == libc::ENOMEM)
+                        && limit > Self::MIN_MAX_TRANSFER;
+                    if shrinkable {
+                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                        if prefix == 0 {
+                            // Nothing reached the wire this round — safe to
+                            // redo the whole thing at the smaller size rather
+                            // than reporting a zero-byte failure.
+                            continue;
+                        }
+                    }
+                    if prefix > 0 {
+                        // Bytes are safely on the wire. Report them as a
+                        // short transfer instead of discarding that
+                        // progress — the caller already loops on a short
+                        // write, and a still-live error surfaces on the very
+                        // next call, where `prefix == 0` and it is handled
+                        // above or returned below.
+                        return Ok(prefix);
+                    }
+                    return Err(bulk_err(prefix, limit, e));
+                }
+            }
         }
     }
 
@@ -528,6 +571,7 @@ impl UsbFsTransport {
                     },
                     submitted: false,
                     reaped: false,
+                    index: i,
                 });
             }
 
@@ -555,7 +599,10 @@ impl UsbFsTransport {
                 submitted_count += 1;
             }
 
-            if let Some(err) = submit_err {
+            // Tear down immediately if submission itself failed, so the
+            // kernel starts unwinding while the drain below runs rather than
+            // after.
+            if submit_err.is_some() {
                 for j in 0..submitted_count {
                     if urbs[j].submitted && !urbs[j].reaped {
                         unsafe {
@@ -567,40 +614,15 @@ impl UsbFsTransport {
                         }
                     }
                 }
-
-                let mut completed = 0;
-                while completed < submitted_count {
-                    let mut reaped: *mut c_void = std::ptr::null_mut();
-                    let rc = unsafe {
-                        libc::ioctl(
-                            self.fd,
-                            reap_urb_code() as IoctlReq,
-                            &mut reaped as *mut *mut c_void as *mut c_void,
-                        )
-                    };
-                    if rc < 0 {
-                        let e = errno();
-                        if e == libc::EINTR {
-                            continue;
-                        }
-                        break;
-                    }
-                    let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
-                    inflight.reaped = true;
-                    completed += 1;
-                }
-
-                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                    continue;
-                }
-                return Err(bulk_err(0, limit, err));
             }
 
+            // Reap every URB that was actually submitted and score each by
+            // *index* — REAPURB makes no promise about completion order.
+            let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
-            let mut transfer_err = None;
-            let mut total_transferred = 0;
+            let mut completion_err = None;
+            let mut reap_err = None;
+            let mut discarded_for_short_read = false;
 
             while completed < submitted_count {
                 let mut reaped: *mut c_void = std::ptr::null_mut();
@@ -616,7 +638,7 @@ impl UsbFsTransport {
                     if e == libc::EINTR {
                         continue;
                     }
-                    transfer_err = Some(e);
+                    reap_err = Some(e);
                     break;
                 }
                 let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
@@ -627,8 +649,8 @@ impl UsbFsTransport {
                 if status < 0 {
                     let err = -status;
                     let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
-                    if !was_discarded && transfer_err.is_none() {
-                        transfer_err = Some(err);
+                    if !was_discarded && completion_err.is_none() {
+                        completion_err = Some(err);
 
                         for j in 0..submitted_count {
                             if urbs[j].submitted && !urbs[j].reaped {
@@ -642,11 +664,17 @@ impl UsbFsTransport {
                             }
                         }
                     }
+                    // outcomes[inflight.index] stays None: failed or discarded.
                 } else {
-                    total_transferred += inflight.urb.actual_length as usize;
+                    outcomes[inflight.index] = Some(inflight.urb.actual_length);
 
+                    // Short reads are normal — the device has no more data.
+                    // Stop asking for the rest rather than waiting on it, but
+                    // this is not an error: the prefix through here is still
+                    // exactly what a caller should see.
                     let short_read = inflight.urb.actual_length < inflight.urb.buffer_length;
-                    if short_read {
+                    if short_read && !discarded_for_short_read {
+                        discarded_for_short_read = true;
                         for j in 0..submitted_count {
                             if urbs[j].submitted && !urbs[j].reaped {
                                 unsafe {
@@ -662,16 +690,53 @@ impl UsbFsTransport {
                 }
             }
 
-            if let Some(err) = transfer_err {
-                if (err == libc::EINVAL || err == libc::ENOMEM) && limit > Self::MIN_MAX_TRANSFER {
-                    let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                    self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                    continue;
+            // A REAPURB failure leaves whatever was still in flight neither
+            // confirmed nor discarded. Best-effort clean-up so the next round
+            // does not inherit URBs this one never resolved.
+            if reap_err.is_some() {
+                for j in 0..submitted_count {
+                    if urbs[j].submitted && !urbs[j].reaped {
+                        unsafe {
+                            libc::ioctl(
+                                self.fd,
+                                discard_urb_code() as IoctlReq,
+                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
+                            );
+                        }
+                    }
                 }
-                return Err(bulk_err(total_transferred, limit, err));
             }
 
-            return Ok(total_transferred);
+            let prefix = contiguous_prefix(&outcomes);
+            let err = submit_err.or(completion_err).or(reap_err);
+
+            match err {
+                None => return Ok(prefix),
+                Some(e) => {
+                    let shrinkable = (e == libc::EINVAL || e == libc::ENOMEM)
+                        && limit > Self::MIN_MAX_TRANSFER;
+                    if shrinkable {
+                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
+                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+                        if prefix == 0 {
+                            // Nothing reached the wire this round — safe to
+                            // redo the whole thing at the smaller size rather
+                            // than reporting a zero-byte failure.
+                            continue;
+                        }
+                    }
+                    if prefix > 0 {
+                        // Bytes are safely in hand. Report them as a short
+                        // transfer instead of discarding that progress — the
+                        // caller already loops on a short read, and a still-
+                        // live error surfaces on the very next call, where
+                        // `prefix == 0` and it is handled above or returned
+                        // below.
+                        return Ok(prefix);
+                    }
+                    return Err(bulk_err(prefix, limit, e));
+                }
+            }
         }
     }
 }
@@ -752,6 +817,49 @@ impl Drop for UsbFsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The defect this exists to catch: a later URB completing successfully
+    /// must not paper over an earlier gap. Before this fix, `bulk_out`/
+    /// `bulk_in` summed `actual_length` over every URB that was *reaped*
+    /// successfully, in reap order — not over the contiguous run from the
+    /// start. A failure at index 1 with index 2 still completing used to
+    /// count as 2 chunks' worth of bytes; it must count as 1.
+    #[test]
+    fn a_gap_stops_the_count_even_if_later_urbs_succeeded() {
+        let outcomes = vec![Some(100), None, Some(100)];
+        assert_eq!(contiguous_prefix(&outcomes), 100, "must stop at the gap, not sum past it");
+    }
+
+    /// The control for the test above: with no gap, every chunk counts. If
+    /// this failed, the test above would be vacuously "passing" by
+    /// under-counting everywhere, not by correctly stopping at a gap.
+    #[test]
+    fn no_gap_sums_everything() {
+        let outcomes = vec![Some(100), Some(50), Some(25)];
+        assert_eq!(contiguous_prefix(&outcomes), 175);
+    }
+
+    /// A gap at the very first URB — nothing reached the wire in order, so
+    /// the prefix is zero even if later URBs completed.
+    #[test]
+    fn a_gap_at_the_start_is_zero_regardless_of_what_follows() {
+        let outcomes = vec![None, Some(100), Some(100)];
+        assert_eq!(contiguous_prefix(&outcomes), 0);
+    }
+
+    /// A short read (or a partial final chunk) is not a gap — it is simply
+    /// the last successful entry, and everything after it is `None` because
+    /// nothing further was submitted or it was deliberately discarded.
+    #[test]
+    fn a_short_final_urb_counts_its_own_partial_length() {
+        let outcomes = vec![Some(100), Some(37), None];
+        assert_eq!(contiguous_prefix(&outcomes), 137);
+    }
+
+    #[test]
+    fn no_urbs_at_all_is_zero() {
+        assert_eq!(contiguous_prefix(&[]), 0);
+    }
 
     /// Ground truth, not self-reference.
     ///
