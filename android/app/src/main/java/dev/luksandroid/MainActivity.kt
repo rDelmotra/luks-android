@@ -1144,28 +1144,18 @@ private fun probeReflectionSurface(context: android.content.Context): String {
             results.add("PROBE: TEXTVIEW_MEDITOR = OK")
             val editorClass = editor.javaClass
 
-            // Target 3: Editor.mAllowUndo
+            // Dump Editor fields and methods to find undo-related members
             try {
-                val fAllowUndo = editorClass.getDeclaredField("mAllowUndo").apply { isAccessible = true }
-                fAllowUndo.setBoolean(editor, false)
-                results.add("PROBE: EDITOR_ALLOW_UNDO = OK")
-            } catch (t: Throwable) {
-                results.add("PROBE: EDITOR_ALLOW_UNDO = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
-            }
+                val fields = editorClass.declaredFields.map { it.name }
+                val undoFields = fields.filter { it.contains("undo", ignoreCase = true) }
+                results.add("PROBE: EDITOR_FIELDS_ALL = ${fields.joinToString(", ")}")
+                results.add("PROBE: EDITOR_FIELDS_UNDO = ${undoFields.ifEmpty { listOf("NONE_MATCHED") }.joinToString(", ")}")
 
-            // Target 4: Editor.mUndoManager
-            try {
-                val fUndoMgr = editorClass.getDeclaredField("mUndoManager").apply { isAccessible = true }
-                val undoMgr = fUndoMgr.get(editor)
-                val undoMgrClass = undoMgr?.javaClass ?: Class.forName("android.content.UndoManager")
-                val mForget = undoMgrClass.getMethod(
-                    "forgetUndos",
-                    Class.forName("android.content.UndoOwner"),
-                    Int::class.javaPrimitiveType ?: Int::class.java
-                )
-                results.add("PROBE: EDITOR_UNDO_MGR = OK")
+                val methods = editorClass.declaredMethods.map { it.name }
+                val undoMethods = methods.filter { it.contains("undo", ignoreCase = true) }
+                results.add("PROBE: EDITOR_METHODS_UNDO = ${undoMethods.ifEmpty { listOf("NONE_MATCHED") }.joinToString(", ")}")
             } catch (t: Throwable) {
-                results.add("PROBE: EDITOR_UNDO_MGR = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+                results.add("PROBE: EDITOR_FIELDS = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
             }
         } else {
             results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (mEditor null)")
