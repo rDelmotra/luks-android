@@ -32,6 +32,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -212,7 +213,8 @@ private fun DiagnosticsScreen() {
                 selfTest = "measuring…"
                 scope.launch {
                     selfTest = try {
-                        withContext(Dispatchers.IO) {
+                        val probe = withContext(Dispatchers.Main) { probeReflectionSurface(context) }
+                        val cpu = withContext(Dispatchers.IO) {
                             val j = org.json.JSONObject(LuksNative.nativeSelfTest(64))
                             "AES-XTS %d MiB/s · SHA-256 %d MiB/s (armv8 compiled: %b)".format(
                                 j.getLong("xtsMiBs"),
@@ -220,6 +222,7 @@ private fun DiagnosticsScreen() {
                                 j.getBoolean("aesArmv8Compiled"),
                             )
                         }
+                        "$cpu\n\n$probe"
                     } catch (e: Exception) {
                         "self-test failed: ${e.message}"
                     }
@@ -449,14 +452,14 @@ private fun OpenDeviceBody(
         is VolumeState.Prompting -> PasswordPrompt(
             partition = volume.partition,
             onCancel = { onVolumeChange(VolumeState.None) },
-            onSubmit = { password ->
+            onSubmit = { passwordBuffer ->
                 onVolumeChange(VolumeState.Unlocking(volume.partition))
-                // Argon2 runs for seconds against the device handle. Closing
-                // the device during it frees what the derivation is reading
-                // through, so this counts as busy like everything else.
                 onBusyChange(true)
                 scope.launch {
-                    onVolumeChange(unlock(context, device, volume.partition, password))
+                    val result = passwordBuffer.use { buf ->
+                        unlock(context, device, volume.partition, buf)
+                    }
+                    onVolumeChange(result)
                     onBusyChange(false)
                 }
             },
@@ -499,37 +502,32 @@ private fun OpenDeviceBody(
 private fun PasswordPrompt(
     partition: PartitionInfo,
     onCancel: () -> Unit,
-    onSubmit: (ByteArray) -> Unit,
+    onSubmit: (dev.luksandroid.security.SecurePassphraseBuffer) -> Unit,
 ) {
-    var text by remember { mutableStateOf("") }
+    val window = androidx.activity.compose.LocalActivity.current?.window
+    DisposableEffect(Unit) {
+        window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        onDispose {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+        }
+    }
+
+    var activeEditable by remember { mutableStateOf<android.text.Editable?>(null) }
+    var hasContent by remember { mutableStateOf(false) }
 
     fun submit() {
-        // ⚠️ Known gap: `text` is a Kotlin String, which is immutable and
-        // cannot be scrubbed — it lives on the GC heap until collected. The
-        // password crosses JNI correctly as a ByteArray into a zeroing Secret,
-        // and LuksDevice.unlock zeroes that array in a finally, so the
-        // invariant holds everywhere it can. Closing this last gap needs a
-        // BasicTextField over a mutable CharArray. Tracked in STATE.md.
-        val bytes = text.toByteArray(Charsets.UTF_8)
-        text = ""
-        onSubmit(bytes)
+        val editable = activeEditable ?: return
+        val buffer = dev.luksandroid.security.PassphraseScrubber.extractAndScrub(editable)
+        onSubmit(buffer)
     }
 
     Text("Unlock ${partition.label}", style = MaterialTheme.typography.bodyMedium)
-    OutlinedTextField(
-        value = text,
-        onValueChange = { text = it },
-        label = { Text("Passphrase") },
-        singleLine = true,
-        visualTransformation = PasswordVisualTransformation(),
-        keyboardOptions = KeyboardOptions(
-            keyboardType = KeyboardType.Password,
-            imeAction = ImeAction.Go,
-        ),
-        modifier = Modifier.fillMaxWidth(),
+    dev.luksandroid.ui.SecurePassphraseField(
+        onEditableReady = { activeEditable = it },
+        onHasContentChange = { hasContent = it },
     )
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(onClick = ::submit, enabled = text.isNotEmpty()) { Text("Unlock") }
+        Button(onClick = ::submit, enabled = hasContent) { Text("Unlock") }
         TextButton(onClick = onCancel) { Text("Cancel") }
     }
 }
@@ -922,7 +920,7 @@ private suspend fun unlock(
     context: Context,
     device: LuksDevice,
     partition: PartitionInfo,
-    password: ByteArray,
+    password: dev.luksandroid.security.SecurePassphraseBuffer,
 ): VolumeState = try {
     Trace.i("unlock: partition at ${partition.offsetBytes} bytes")
     val started = System.currentTimeMillis()
@@ -931,9 +929,6 @@ private suspend fun unlock(
             val v = device.unlock(partition.offsetBytes, password)
             val kdf = System.currentTimeMillis() - started
             val info = v.info
-            // The line that matters for btrfs-over-USB: which filesystem the
-            // signature picked, and whether subvolume enumeration survived the
-            // transport. Paths are shapes here — a count, not the names.
             Trace.i(
                 "unlock: ok in $kdf ms · fs=${info.fsType} " +
                     "block=${info.blockSize} size=${info.sizeBytes} " +
@@ -953,10 +948,6 @@ private suspend fun unlock(
 } catch (e: Exception) {
     Trace.e("unlock: failed", e)
     VolumeState.Failed(partition, e.message ?: e.toString())
-} finally {
-    // Belt and braces: LuksDevice.unlock already zeroes this, but that only
-    // runs if the call was reached at all.
-    password.fill(0)
 }
 
 /**
@@ -1101,4 +1092,88 @@ private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
 } catch (e: Exception) {
     Trace.e("hash: failed", e)
     "hash failed: ${e.message}"
+}
+
+private fun probeReflectionSurface(context: android.content.Context): String {
+    val results = mutableListOf<String>()
+
+    // Control 1: Known Good (public method)
+    try {
+        val m = android.text.SpannableStringBuilder::class.java.getMethod("length")
+        val ssb = android.text.SpannableStringBuilder("test")
+        val res = m.invoke(ssb) as Int
+        if (res == 4) {
+            results.add("PROBE: CONTROL_GOOD = OK")
+        } else {
+            results.add("PROBE: CONTROL_GOOD = FAIL (unexpected value $res)")
+        }
+    } catch (t: Throwable) {
+        results.add("PROBE: CONTROL_GOOD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+    }
+
+    // Control 2: Known Bad (non-existent field)
+    try {
+        android.text.SpannableStringBuilder::class.java.getDeclaredField("mNoSuchField")
+        results.add("PROBE: CONTROL_BAD = FAIL (unexpectedly found field)")
+    } catch (e: NoSuchFieldException) {
+        results.add("PROBE: CONTROL_BAD = OK (NoSuchFieldException)")
+    } catch (t: Throwable) {
+        results.add("PROBE: CONTROL_BAD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+    }
+
+    // Target 1: SpannableStringBuilder.mText
+    try {
+        val f = android.text.SpannableStringBuilder::class.java.getDeclaredField("mText").apply { isAccessible = true }
+        val ssb = android.text.SpannableStringBuilder("hello")
+        val arr = f.get(ssb) as CharArray
+        if (arr.isNotEmpty() && arr[0] == 'h') {
+            results.add("PROBE: SSB_MTEXT = OK")
+        } else {
+            results.add("PROBE: SSB_MTEXT = FAIL (array mismatch)")
+        }
+    } catch (t: Throwable) {
+        results.add("PROBE: SSB_MTEXT = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+    }
+
+    // Targets 2, 3, 4: TextView.mEditor, Editor.mAllowUndo, Editor.mUndoManager
+    try {
+        val tv = android.widget.EditText(context)
+        val fEditor = android.widget.TextView::class.java.getDeclaredField("mEditor").apply { isAccessible = true }
+        val editor = fEditor.get(tv)
+        if (editor != null) {
+            results.add("PROBE: TEXTVIEW_MEDITOR = OK")
+            val editorClass = editor.javaClass
+
+            // Target 3: Editor.mAllowUndo
+            try {
+                val fAllowUndo = editorClass.getDeclaredField("mAllowUndo").apply { isAccessible = true }
+                fAllowUndo.setBoolean(editor, false)
+                results.add("PROBE: EDITOR_ALLOW_UNDO = OK")
+            } catch (t: Throwable) {
+                results.add("PROBE: EDITOR_ALLOW_UNDO = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+            }
+
+            // Target 4: Editor.mUndoManager
+            try {
+                val fUndoMgr = editorClass.getDeclaredField("mUndoManager").apply { isAccessible = true }
+                val undoMgr = fUndoMgr.get(editor)
+                val undoMgrClass = undoMgr?.javaClass ?: Class.forName("android.content.UndoManager")
+                val mForget = undoMgrClass.getMethod(
+                    "forgetUndos",
+                    Class.forName("android.content.UndoOwner"),
+                    Int::class.javaPrimitiveType ?: Int::class.java
+                )
+                results.add("PROBE: EDITOR_UNDO_MGR = OK")
+            } catch (t: Throwable) {
+                results.add("PROBE: EDITOR_UNDO_MGR = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+            }
+        } else {
+            results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (mEditor null)")
+        }
+    } catch (t: Throwable) {
+        results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+    }
+
+    results.forEach { android.util.Log.i("PassphraseProbe", it) }
+    return results.joinToString("\n")
 }

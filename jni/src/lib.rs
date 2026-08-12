@@ -257,7 +257,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
     _class: JClass<'l>,
     handle: jlong,
     partition_offset: jlong,
-    password: JByteArray<'l>,
+    password: JByteBuffer<'l>,
+    length: jint,
 ) -> jlong {
     guard(&mut env, 0, |env| {
         // SAFETY: validated against the device magic tag.
@@ -269,14 +270,29 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
             )
         })?;
 
-        // Copied out of the Java array, then owned by a Secret so it is zeroed
-        // when this scope ends — including on the error path.
-        let raw = env
-            .convert_byte_array(&password)
-            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read password: {e}")))?;
-        let secret = bridge::password_secret(raw);
+        let len = usize::try_from(length)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative passphrase length".into()))?;
 
-        let volume = dev.unlock(offset, secret.expose())?;
+        let ptr = env
+            .get_direct_buffer_address(&password)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env
+            .get_direct_buffer_capacity(&password)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                "passphrase length exceeds buffer capacity".into(),
+            ));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        let volume = dev.unlock(offset, slice)?;
         Ok(bridge::into_raw(bridge::Payload::Volume(volume)))
     })
 }

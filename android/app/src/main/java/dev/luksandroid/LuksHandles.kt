@@ -101,15 +101,13 @@ class LuksDevice internal constructor(
      * Blocking and slow — seconds of CPU and up to a gigabyte of allocation.
      * Call from a background thread with [UnlockService] running.
      *
-     * [password] is overwritten before this returns, on both the success and the
-     * failure path. The caller should still not keep another copy.
+     * [password] buffer is valid for the duration of this call and zeroed on close.
      */
-    fun unlock(partitionOffset: Long, password: ByteArray): LuksVolume {
+    fun unlock(partitionOffset: Long, password: dev.luksandroid.security.SecurePassphraseBuffer): LuksVolume {
         check(handle != 0L) { "device is closed" }
-        return try {
-            LuksVolume(LuksNative.nativeUnlock(handle, partitionOffset, password))
-        } finally {
-            password.fill(0)
+        require(password.length > 0) { "empty passphrase" }
+        return password.withBuffer { buf, len ->
+            LuksVolume(LuksNative.nativeUnlock(handle, partitionOffset, buf, len))
         }
     }
 

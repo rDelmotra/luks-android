@@ -54,10 +54,10 @@ internal object LuksNative {
      * to a gigabyte of allocation — never on the main thread, and only with
      * [UnlockService] running.
      *
-     * @param password raw bytes, **not** a String. Copied into a zeroing buffer
-     *   on the Rust side; the caller must overwrite this array afterwards.
+     * @param password direct [java.nio.ByteBuffer] containing the passphrase bytes.
+     * @param length length of the passphrase in bytes.
      */
-    external fun nativeUnlock(handle: Long, partitionOffset: Long, password: ByteArray): Long
+    external fun nativeUnlock(handle: Long, partitionOffset: Long, password: java.nio.ByteBuffer, length: Int): Long
 
     /** JSON: filesystem label, UUID, block size. */
     external fun nativeVolumeInfo(handle: Long): String
