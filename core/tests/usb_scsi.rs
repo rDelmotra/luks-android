@@ -276,6 +276,113 @@ fn reports_no_table_on_blank_media() {
     assert!(partition::scan(&dev, 512).is_err());
 }
 
+// --- BOT error recovery (#14) -----------------------------------------------
+
+/// Wraps a real transport and can be armed to fail one specific call by
+/// number, while counting how many times `reset()` fires. Everything else
+/// delegates straight through, so `ScsiBlockDevice::open` — which itself
+/// issues several commands — behaves normally until `arm` is called.
+struct FlakyTransport<T> {
+    inner: T,
+    fail_on_call: std::cell::Cell<Option<usize>>,
+    call_count: std::cell::Cell<usize>,
+    reset_count: std::cell::Cell<usize>,
+}
+
+impl<T> FlakyTransport<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            fail_on_call: std::cell::Cell::new(None),
+            call_count: std::cell::Cell::new(0),
+            reset_count: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Fail the `on_call`-th `write`/`read` from this point on (1-indexed),
+    /// resetting the counter so the next command starts counting at 1.
+    fn arm(&self, on_call: usize) {
+        self.call_count.set(0);
+        self.fail_on_call.set(Some(on_call));
+    }
+
+    fn should_fail(&self) -> bool {
+        let n = self.call_count.get() + 1;
+        self.call_count.set(n);
+        Some(n) == self.fail_on_call.get()
+    }
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for FlakyTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        if self.should_fail() {
+            return Err(LuksError::UsbTransfer("injected failure".into()));
+        }
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        if self.should_fail() {
+            return Err(LuksError::UsbTransfer("injected failure".into()));
+        }
+        self.inner.read(buf)
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<(), LuksError> {
+        self.reset_count.set(self.reset_count.get() + 1);
+        self.inner.reset()
+    }
+}
+
+/// The regression #14 exists for: before this fix, a transport-level
+/// failure (a real bulk timeout, not a CSW-reported command failure)
+/// propagated straight up with no attempt to reset the bus, leaving a real
+/// bridge wedged until a physical replug. `arm(1)` fails the very first
+/// transport call of the next command — the CBW write — which is as close
+/// as this mock gets to "the drive stopped answering".
+#[test]
+fn a_transport_failure_triggers_a_bot_reset_before_propagating() {
+    let dev = ScsiBlockDevice::open(FlakyTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
+        .unwrap();
+
+    dev.transport().arm(1);
+    let mut buf = [0u8; 512];
+    let err = dev.read_at(0, &mut buf).unwrap_err();
+
+    assert!(
+        matches!(err, LuksError::UsbTransfer(_)),
+        "the injected failure must still be what the caller sees: {err}"
+    );
+    assert_eq!(
+        dev.transport().reset_count.get(),
+        1,
+        "a transport-level failure must trigger exactly one BOT reset"
+    );
+}
+
+/// The control for the test above: with the transport never armed, a normal
+/// read must not touch reset at all. Without this, a version of the fix that
+/// resets unconditionally on every command would pass the test above for
+/// the wrong reason.
+#[test]
+fn a_clean_transfer_never_touches_reset() {
+    let dev = ScsiBlockDevice::open(FlakyTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
+        .unwrap();
+
+    let mut buf = [0u8; 512];
+    dev.read_at(0, &mut buf).unwrap();
+
+    assert_eq!(dev.transport().reset_count.get(), 0);
+}
+
 #[test]
 fn guid_formatting_uses_mixed_endian_order() {
     // GPT stores the first three fields little-endian; printing must undo that.

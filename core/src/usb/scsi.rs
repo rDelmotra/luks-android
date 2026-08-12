@@ -238,6 +238,23 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.tag.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Best-effort Bulk-Only Mass Storage Reset before propagating a
+    /// transport-level failure, so the bus is in a known state for the
+    /// *next* command rather than left wedged. This is the spec's own Reset
+    /// Recovery procedure — clean up, then still fail the command that
+    /// triggered it — not a retry of that command (#14).
+    ///
+    /// Reset's own failure is discarded rather than propagated: the
+    /// original error is the diagnosis, and losing it to a follow-up
+    /// failure would be the same mistake `RULES.md` already names — an
+    /// error that does not name what actually went wrong.
+    fn recover<R>(&self, result: Result<R>) -> Result<R> {
+        if result.is_err() {
+            let _ = self.transport.reset();
+        }
+        result
+    }
+
     /// Run one CBW / data / CSW exchange, asking the drive why on a failure.
     fn command(&self, cdb: Vec<u8>, direction: Direction, data: &mut [u8]) -> Result<usize> {
         self.command_inner(cdb, direction, data, true)
@@ -253,7 +270,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, Direction::Out, cdb);
         let encoded = cbw.encode()?;
 
-        let sent = self.transport.write(&encoded)?;
+        let sent = self.recover(self.transport.write(&encoded))?;
         if sent != encoded.len() {
             return Err(LuksError::ScsiProtocol("short CBW write"));
         }
@@ -261,7 +278,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut transferred = 0usize;
         if !data.is_empty() {
             while transferred < data.len() {
-                let n = self.transport.write(&data[transferred..])?;
+                let n = self.recover(self.transport.write(&data[transferred..]))?;
                 if n == 0 {
                     break;
                 }
@@ -272,10 +289,10 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
         while got < CSW_LEN {
-            let n = self.transport.read(&mut csw_buf[got..])?;
+            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
             if n == 0 {
-                self.transport.clear_halt(true)?;
-                let n = self.transport.read(&mut csw_buf[got..])?;
+                self.recover(self.transport.clear_halt(true))?;
+                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
                 if n == 0 {
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
@@ -328,7 +345,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
 
-        let sent = self.transport.write(&encoded)?;
+        let sent = self.recover(self.transport.write(&encoded))?;
         if sent != encoded.len() {
             return Err(LuksError::ScsiProtocol("short CBW write"));
         }
@@ -338,7 +355,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             match direction {
                 Direction::In => {
                     while transferred < data.len() {
-                        let n = self.transport.read(&mut data[transferred..])?;
+                        let n = self.recover(self.transport.read(&mut data[transferred..]))?;
                         if n == 0 {
                             break; // device ended the data phase early
                         }
@@ -347,7 +364,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 Direction::Out => {
                     while transferred < data.len() {
-                        let n = self.transport.write(&data[transferred..])?;
+                        let n = self.recover(self.transport.write(&data[transferred..]))?;
                         if n == 0 {
                             break;
                         }
@@ -361,11 +378,11 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
         while got < CSW_LEN {
-            let n = self.transport.read(&mut csw_buf[got..])?;
+            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
             if n == 0 {
                 // A stalled endpoint is the usual cause; clear it and retry once.
-                self.transport.clear_halt(true)?;
-                let n = self.transport.read(&mut csw_buf[got..])?;
+                self.recover(self.transport.clear_halt(true))?;
+                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
                 if n == 0 {
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
@@ -413,7 +430,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
-                self.transport.reset()?;
+                // Best-effort, like `recover`: a reset failure must not mask
+                // the phase error that caused it.
+                let _ = self.transport.reset();
                 Err(LuksError::ScsiProtocol("phase error"))
             }
         }
