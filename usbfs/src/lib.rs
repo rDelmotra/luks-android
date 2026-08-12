@@ -341,6 +341,49 @@ impl UsbFsTransport {
         Ok(())
     }
 
+    /// Wait for at least one submitted URB to be ready to reap, or time out.
+    ///
+    /// The synchronous `USBDEVFS_BULK` ioctl this crate used before the async
+    /// URB rewrite carried its own `timeout` field; `USBDEVFS_SUBMITURB` /
+    /// `USBDEVFS_REAPURB` do not, and nothing filled that gap when the
+    /// rewrite landed. `REAPURB` blocks with **no bound at all** — if a URB
+    /// never completes (a bridge that stops answering, or on Android, this
+    /// app's `claimInterface(force = true)` racing the kernel's own
+    /// `vold`-driven usb-storage probe of the same interface), the reap loop
+    /// hangs forever. Not even a physical replug helps if the block is
+    /// pinned to a descriptor from before the replug.
+    ///
+    /// `poll()` on the usbfs fd is the documented way to wait for a URB with
+    /// a deadline: the fd reports writable when one is ready to reap.
+    /// Returns a raw errno rather than this crate's `Result` so it plugs
+    /// directly into the `reap_err` tracking in `bulk_out`/`bulk_in`, which
+    /// already knows how to score a partial transfer and — one layer up, via
+    /// `ScsiBlockDevice::recover` — trigger a Bulk-Only reset on any
+    /// transport failure rather than leaving the bus wedged.
+    fn poll_for_urb(&self) -> std::result::Result<(), i32> {
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: self.fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: `pfd` is a single, stack-local, correctly-sized
+            // `pollfd` and `poll` writes only `revents` back into it.
+            let rc = unsafe { libc::poll(&mut pfd, 1, self.timeout_ms as libc::c_int) };
+            if rc < 0 {
+                let e = errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                return Err(e);
+            }
+            if rc == 0 {
+                return Err(libc::ETIMEDOUT);
+            }
+            return Ok(());
+        }
+    }
+
     /// One asynchronous bulk transfer split into smaller URBs. Returns the number of
     /// bytes moved, which may be less than requested — short reads are normal on the
     /// IN endpoint.
@@ -437,6 +480,10 @@ impl UsbFsTransport {
             let mut reap_err = None;
 
             while completed < submitted_count {
+                if let Err(e) = self.poll_for_urb() {
+                    reap_err = Some(e);
+                    break;
+                }
                 let mut reaped: *mut c_void = std::ptr::null_mut();
                 let rc = unsafe {
                     libc::ioctl(
@@ -625,6 +672,10 @@ impl UsbFsTransport {
             let mut discarded_for_short_read = false;
 
             while completed < submitted_count {
+                if let Err(e) = self.poll_for_urb() {
+                    reap_err = Some(e);
+                    break;
+                }
                 let mut reaped: *mut c_void = std::ptr::null_mut();
                 let rc = unsafe {
                     libc::ioctl(
