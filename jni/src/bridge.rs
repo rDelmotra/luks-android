@@ -29,7 +29,6 @@ use luks_core::error::{LuksError, Result};
 use luks_core::fs::FileType;
 use luks_core::luks::{self, keyslot, LuksVolume};
 use luks_core::partition::{self, PartitionTable, TableKind};
-use luks_core::secret::Secret;
 use luks_core::usb::ScsiBlockDevice;
 use luks_usbfs::UsbFsTransport;
 
@@ -1042,15 +1041,6 @@ pub unsafe fn drop_volume(handle: i64) {
 #[cfg(feature = "dangerous-write-support")]
 pub unsafe fn drop_writer(handle: i64) {
     drop_handle(handle, HandleKind::Writer)
-}
-
-/// Zeroising owner for a password copied out of a Java `byte[]`.
-///
-/// The Java side is expected to overwrite its own array in a `finally`; this
-/// covers our copy of it. Both halves are needed — neither can zero the other's
-/// memory.
-pub fn password_secret(bytes: Vec<u8>) -> Secret {
-    Secret::new(bytes)
 }
 
 #[cfg(test)]
