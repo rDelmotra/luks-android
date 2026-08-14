@@ -91,8 +91,14 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         Ok(cursor)
     }
 
-    /// Step back one item in key order.
-    fn retreat(&mut self) -> Result<()> {
+    /// Step back one item in key order, crossing into the previous leaf when
+    /// this one is exhausted.
+    ///
+    /// `pub(crate)` rather than private: `find_max_inode` in
+    /// `write/txn.rs` needs to walk backwards past a run of reserved-objectid
+    /// items (e.g. `ORPHAN_OBJECTID`) that can occupy the tail of the
+    /// rightmost leaf, and `search_le` alone only steps back once.
+    pub(crate) fn retreat(&mut self) -> Result<()> {
         let last = self.path.len() - 1;
         let (_, i) = &mut self.path[last];
         if *i > 0 {
@@ -193,42 +199,64 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// Climb until a level has an unvisited child, then descend its leftmost
     /// path. If no level does, the cursor is at the end of the tree and stays
     /// invalid — which is the normal way a range scan finishes.
+    ///
+    /// The climb is a read-only probe over `self.path` first, and only
+    /// mutates the path once a usable ancestor is actually found. An earlier
+    /// version popped path entries while probing and committed each pop
+    /// immediately, so a probe that ran off the very end of a multi-level
+    /// tree left `self.path` holding only interior-node frames — the leaf
+    /// frame `lower_bound` had parked past-the-end was gone, popped and
+    /// never restored. `valid()` still reported false by coincidence (it
+    /// only compares the deepest index against the deepest node's item
+    /// count, whichever node that is), but `retreat()` then read that
+    /// interior node as if it were a leaf: decrementing a *child* index and
+    /// calling `key()` on it returns the child's lowest key, not an error —
+    /// silently wrong rather than merely invalid. Caught by
+    /// `write/txn.rs`'s `find_max_inode`, the first caller to `search_le` a
+    /// key past every real key in a tree with more than one leaf: measured
+    /// returning the wrong-but-plausible-looking objectid 263249 (the
+    /// rightmost leaf's *first* key) instead of retreating properly to
+    /// 263276 (the true last key) on `fixtures/btrfs/plain.img`.
     fn advance_leaf(&mut self) -> Result<()> {
+        let leaf_idx = self.path.len() - 1;
+        let mut climb_to = None;
+        for idx in (0..leaf_idx).rev() {
+            let (node, i) = &self.path[idx];
+            if *i + 1 < node.nr_items {
+                climb_to = Some(idx);
+                break;
+            }
+        }
+        let last = match climb_to {
+            Some(idx) => idx,
+            // No ancestor has an unvisited child: end of tree. `self.path`
+            // was never touched, so it is still exactly the leaf-terminated,
+            // past-the-end state `search()` left it in.
+            None => return Ok(()),
+        };
+
+        self.path.truncate(last + 1);
+        let (node, i) = &mut self.path[last];
+        *i += 1;
+
+        // Descend leftmost from here.
+        let mut ptr = node.key_ptr(*i)?.blockptr;
+        let mut level = node.level;
         loop {
-            // Drop the exhausted level. Stopping at length 1 leaves the leaf in
-            // place so the cursor stays structurally valid (and `valid()`
-            // keeps reporting false) rather than panicking in `leaf()`.
-            if self.path.len() == 1 {
+            let child = self.fs.read_node(ptr)?;
+            if child.level + 1 != level {
+                return Err(LuksError::CorruptFs(
+                    "btrfs child node is not one level below its parent",
+                ));
+            }
+            level = child.level;
+            let leaf = child.is_leaf();
+            let next = if leaf { 0 } else { child.key_ptr(0)?.blockptr };
+            self.path.push((child, 0));
+            if leaf {
                 return Ok(());
             }
-            self.path.pop();
-
-            let last = self.path.len() - 1;
-            let (node, i) = &mut self.path[last];
-            *i += 1;
-            if *i >= node.nr_items {
-                continue;
-            }
-
-            // Descend leftmost from here.
-            let mut ptr = node.key_ptr(*i)?.blockptr;
-            let mut level = node.level;
-            loop {
-                let child = self.fs.read_node(ptr)?;
-                if child.level + 1 != level {
-                    return Err(LuksError::CorruptFs(
-                        "btrfs child node is not one level below its parent",
-                    ));
-                }
-                level = child.level;
-                let leaf = child.is_leaf();
-                let next = if leaf { 0 } else { child.key_ptr(0)?.blockptr };
-                self.path.push((child, 0));
-                if leaf {
-                    return Ok(());
-                }
-                ptr = next;
-            }
+            ptr = next;
         }
     }
 }

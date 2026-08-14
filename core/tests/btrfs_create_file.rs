@@ -16,8 +16,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use luks_core::device::FileDevice;
+use luks_core::device::{FileDevice, ReadAt, WriteAt};
 use luks_core::error::LuksError;
+use luks_core::fs::btrfs::tree::{Key, Node};
+use luks_core::fs::btrfs::write::node::Leaf;
 use luks_core::fs::btrfs::Btrfs;
 
 fn fixture(name: &str) -> PathBuf {
@@ -273,4 +275,153 @@ fn create_multiple_files_consecutively_and_verify() {
         oracle_clean,
         "kernel oracle verification failed on multiple files creation"
     );
+}
+
+// --- Fix 2 (E.1): find_max_inode must not be fooled by reserved objectids ---
+//
+// `ORPHAN_OBJECTID` (kernel `BTRFS_ORPHAN_OBJECTID` = -5, i.e.
+// `0xFFFF_FFFF_FFFF_FFFB` as u64) is one of btrfs's reserved objectids that
+// count down from `u64::MAX`. Reserved objectids sort after every real
+// inode, so an `ORPHAN_ITEM` (kernel `BTRFS_ORPHAN_ITEM_KEY` = 48) — left
+// behind when a still-open file is deleted — can end up as the only item in
+// the FS tree's rightmost leaf: the real files that used to live there are
+// gone, and the orphan item outsorts everything else, so it inherits their
+// spot as the last leaf. `find_max_inode` must still return the true
+// maximum real inode from earlier in the tree, not fall back to 256 just
+// because the rightmost leaf itself has nothing but reserved objectids.
+//
+// Reproducing this precisely (rather than just appending an orphan item next
+// to real ones, which leaves the real max reachable in the same leaf and
+// doesn't exercise the bug) means the rightmost leaf's real items have to be
+// gone. This test wipes plain.img's actual rightmost FS-tree leaf and
+// replaces it with a single ORPHAN_ITEM, using this project's own writer
+// (`Leaf::insert_item` / `Leaf::emit`, from `write/node.rs`) — the same
+// pattern `btrfs_node_surgery.rs` uses for Pass C.
+const ORPHAN_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFFB;
+const ORPHAN_ITEM_KEY: u8 = 48;
+const FS_TREE_OBJECTID: u64 = 5;
+
+/// Highest real-inode objectid across every leaf under `root` *except*
+/// `exclude_bytenr`, by direct enumeration rather than any tree-descent
+/// heuristic. This is the independent ground truth the test checks
+/// `find_max_inode` against, so it deliberately does not share any code path
+/// with `find_max_inode` itself (production or buggy).
+///
+/// plain.img's FS tree is exactly two levels (one interior root, leaves
+/// below), which this asserts rather than assumes — a fixture change that
+/// added another level would otherwise make this silently check the wrong
+/// thing.
+fn true_max_inode_excluding<D: ReadAt>(fs: &Btrfs<D>, exclude_bytenr: u64) -> u64 {
+    let root = fs.read_node(fs.fs_tree().bytenr).expect("read fs tree root");
+    assert_eq!(root.level, 1, "fixture is no longer a 2-level tree; update this test");
+
+    let mut max_ino = 256u64;
+    for i in 0..root.nr_items {
+        let bytenr = root.key_ptr(i).expect("key_ptr").blockptr;
+        if bytenr == exclude_bytenr {
+            continue;
+        }
+        let leaf = fs.read_node(bytenr).expect("read leaf");
+        for j in 0..leaf.nr_items {
+            let objectid = leaf.key(j).expect("key").objectid;
+            if objectid >= 256 && objectid < 0xFFFF_FFFF_FFFF_FF00 {
+                max_ino = max_ino.max(objectid);
+            }
+        }
+    }
+    max_ino
+}
+
+#[test]
+fn find_max_inode_survives_a_rightmost_leaf_full_of_orphan_items() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    let sb = fs.superblock();
+    let node_size = sb.node_size;
+    let csum_type = sb.csum_type;
+    let metadata_uuid = sb.metadata_uuid;
+
+    // 1. Locate the FS tree's actual rightmost leaf (last child of the root).
+    let root = fs.read_node(fs.fs_tree().bytenr).expect("read fs tree root");
+    assert_eq!(root.level, 1, "fixture is no longer a 2-level tree; update this test");
+    let last_idx = root.nr_items - 1;
+    let leaf_ptr = root.key_ptr(last_idx).expect("key_ptr");
+    let leaf_bytenr = leaf_ptr.blockptr;
+    let leaf_node = fs.read_node(leaf_bytenr).expect("read rightmost leaf");
+    let leaf_generation = leaf_node.generation;
+
+    // Sanity: plain.img's rightmost leaf really does hold real inode items
+    // before we touch it — otherwise this fixture no longer represents the
+    // "rightmost leaf = real inodes" case the old code assumed always held.
+    let real_items_in_leaf = (0..leaf_node.nr_items)
+        .filter(|&i| {
+            let o = leaf_node.key(i).unwrap().objectid;
+            o >= 256 && o < 0xFFFF_FFFF_FFFF_FF00
+        })
+        .count();
+    assert!(
+        real_items_in_leaf > 0,
+        "fixture assumption violated: rightmost leaf holds no real inode items to begin with"
+    );
+
+    // 2. Ground truth: the true max real inode once this leaf is wiped.
+    let expected_max_ino = true_max_inode_excluding(&fs, leaf_bytenr);
+    assert!(expected_max_ino > 256, "plain.img should have real files besides root");
+
+    // 3. Replace the leaf's contents outright with a single ORPHAN_ITEM —
+    //    modeling every file that used to live here having been deleted
+    //    while still open. The reserved objectid sorts after everything
+    //    else, so this leaf, still the rightmost, now holds nothing a
+    //    real-inode filter would accept.
+    let mut leaf = Leaf::new(leaf_bytenr, leaf_generation, FS_TREE_OBJECTID, metadata_uuid, csum_type);
+    leaf.insert_item(Key::new(ORPHAN_OBJECTID, ORPHAN_ITEM_KEY, 0), Vec::new(), node_size)
+        .expect("insert orphan item");
+
+    let emitted = leaf.emit(node_size).expect("emit corrupted leaf");
+    // Confirm the reader accepts it before trusting it back onto disk — same
+    // acceptance bar as btrfs_node_surgery.rs.
+    Node::parse(emitted.clone(), leaf_bytenr, csum_type, &metadata_uuid)
+        .expect("reader must accept the re-emitted leaf");
+
+    // 4. Write the corrupted leaf back to every physical stripe (DUP
+    //    metadata profile writes two copies; see write/commit.rs for the
+    //    same pattern).
+    let stripes = fs.chunk_map().map_all_stripes(leaf_bytenr).expect("map stripes");
+    for phys in &stripes {
+        fs.device().write_at(*phys, &emitted).expect("write leaf");
+    }
+    fs.device().flush().expect("flush");
+    drop(fs);
+
+    // 5. Remount fresh (clears the node cache) and exercise the fix through
+    //    the public create_file path: the new file's inode must be
+    //    expected_max_ino + 1, not 256 and not a collision with any
+    //    existing inode.
+    let dev2 = FileDevice::open_writable(&temp_img, file_len).expect("reopen writable");
+    let mut fs2 = Btrfs::mount(dev2).expect("remount writable btrfs");
+
+    fs2.create_file("/", "after_orphan.txt")
+        .expect("create_file after orphan injection");
+
+    let new_ino = fs2
+        .resolve_no_follow(fs2.fs_tree(), "/after_orphan.txt")
+        .expect("resolve new file")
+        .inode
+        .objectid;
+
+    assert_ne!(
+        new_ino, 256,
+        "find_max_inode fell back to 256 — the orphan-only leaf was not skipped"
+    );
+    assert_eq!(
+        new_ino,
+        expected_max_ino + 1,
+        "new inode collides with or skips past an existing inode"
+    );
+
+    let _ = fs::remove_file(&temp_img);
 }

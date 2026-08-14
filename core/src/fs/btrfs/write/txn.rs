@@ -571,32 +571,56 @@ fn record_cow_result(
     Ok(())
 }
 
+/// Highest real inode number present in the FS tree, or `256` if there are
+/// none (the lowest inode objectid btrfs hands out; `1..255` are reserved).
+///
+/// Descending only the rightmost key pointer at every level (the previous
+/// implementation) assumes the largest real inode lives in the rightmost
+/// leaf. Sort order does put it there *if* that leaf holds any real inodes —
+/// but btrfs's reserved objectids (`ORPHAN_OBJECTID` = `-5`,
+/// `FREE_INO_OBJECTID`, etc.) count down from `u64::MAX` and sort after every
+/// real inode, so a leaf that holds only reserved-objectid items (e.g. an
+/// `ORPHAN_ITEM`, left behind by deleting a file that's still open) sorts
+/// last and pushes every real inode out of "the rightmost leaf". The old code
+/// would then filter every item out and silently return 256, handing the
+/// caller an inode number already in use.
+///
+/// The fix: start a cursor at the top of the *real*-inode range
+/// (`0xFFFF_FFFF_FFFF_FEFF`, the highest legal offset/type at the highest
+/// non-reserved objectid) and walk backwards, crossing leaf boundaries via
+/// `Cursor::retreat`, until an item with a plausible-inode objectid turns up
+/// or the tree is exhausted. This is a genuine search rather than a bet on
+/// tree shape, so it is correct regardless of how many reserved-objectid
+/// items trail off the end.
+///
+/// Filtering is on objectid alone, not on `INODE_ITEM_KEY`: every item that
+/// belongs to inode N (`INODE_ITEM`, `INODE_REF`, `DIR_ITEM`, `EXTENT_DATA`,
+/// ...) shares N as its objectid, and because keys sort by objectid first,
+/// the maximum objectid over *any* item type equals the maximum objectid
+/// over `INODE_ITEM`s specifically — but reaching it doesn't require the
+/// INODE_ITEM to be the last item of that inode's run, so type-filtering
+/// would just mean extra retreats for the same answer. Restricting to
+/// `INODE_ITEM_KEY` only would still be correct, just costs more steps when
+/// an inode's non-INODE_ITEM items (e.g. a later DIR_ITEM/EXTENT_DATA,
+/// type > 1) sort after it.
 fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>) -> Result<u64> {
-    let mut current_bytenr = fs.fs_tree().bytenr;
-    let mut current_level = fs.fs_tree().level;
+    const MAX_REAL_INODE_KEY: Key = Key {
+        objectid: 0xFFFF_FFFF_FFFF_FEFF,
+        item_type: u8::MAX,
+        offset: u64::MAX,
+    };
 
-    while current_level > 0 {
-        let node = fs.read_node(current_bytenr)?;
-        if node.nr_items == 0 {
+    let mut cursor = fs.search_le(fs.fs_tree().bytenr, &MAX_REAL_INODE_KEY)?;
+    loop {
+        if !cursor.valid() {
             return Ok(256);
         }
-        let last_idx = node.nr_items - 1;
-        let ptr = node.key_ptr(last_idx)?;
-        current_bytenr = ptr.blockptr;
-        current_level -= 1;
-    }
-
-    let leaf_node = fs.read_node(current_bytenr)?;
-    let mut max_ino = 256;
-    for i in 0..leaf_node.nr_items {
-        let key = leaf_node.key(i)?;
+        let key = cursor.key()?;
         if key.objectid >= 256 && key.objectid < 0xFFFF_FFFF_FFFF_FF00 {
-            if key.objectid > max_ino {
-                max_ino = key.objectid;
-            }
+            return Ok(key.objectid);
         }
+        cursor.retreat()?;
     }
-    Ok(max_ino)
 }
 
 fn converge_and_finalize<D: ReadAt>(
