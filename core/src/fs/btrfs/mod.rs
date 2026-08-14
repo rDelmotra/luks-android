@@ -35,6 +35,8 @@ pub mod inode;
 pub mod subvol;
 pub mod superblock;
 pub mod tree;
+#[cfg(feature = "dangerous-write-support")]
+pub mod write;
 
 pub use chunk::{Chunk, ChunkMap};
 pub use csum::Verified;

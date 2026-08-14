@@ -328,6 +328,14 @@ impl Superblock {
     pub fn is_mixed_groups(&self) -> bool {
         self.incompat_flags & INCOMPAT_MIXED_GROUPS != 0
     }
+
+    /// Whether tree blocks are recorded as skinny `METADATA_ITEM`s (key
+    /// offset = level) rather than legacy `EXTENT_ITEM`s carrying an inline
+    /// `tree_block_info` header. The write engine's extent-tree parser only
+    /// understands the skinny layout — see `write::extent_tree`.
+    pub fn has_skinny_metadata(&self) -> bool {
+        self.incompat_flags & INCOMPAT_SKINNY_METADATA != 0
+    }
 }
 
 /// Name the flags we refused, so the error says what the drive uses rather than

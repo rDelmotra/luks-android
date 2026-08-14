@@ -43,17 +43,29 @@ pub const ROOT_ITEM_KEY: u8 = 132;
 pub const ROOT_BACKREF_KEY: u8 = 144;
 /// The mirror of [`ROOT_BACKREF_KEY`], filed under the parent.
 pub const ROOT_REF_KEY: u8 = 156;
+pub const EXTENT_ITEM_KEY: u8 = 168;
+pub const METADATA_ITEM_KEY: u8 = 169;
+pub const TREE_BLOCK_REF_KEY: u8 = 176;
+pub const EXTENT_DATA_REF_KEY: u8 = 178;
+pub const SHARED_BLOCK_REF_KEY: u8 = 182;
+pub const SHARED_DATA_REF_KEY: u8 = 184;
+pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
+pub const FREE_SPACE_INFO_KEY: u8 = 198;
+pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
 // --- objectids we name -----------------------------------------------------
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const ROOT_TREE_OBJECTID: u64 = 1;
+pub const EXTENT_TREE_OBJECTID: u64 = 2;
+pub const CHUNK_TREE_OBJECTID: u64 = 3;
+pub const DEV_TREE_OBJECTID: u64 = 4;
 pub const FS_TREE_OBJECTID: u64 = 5;
-pub const CSUM_TREE_OBJECTID: u64 = 7;
-/// The root tree's own directory, which holds exactly one entry: `default`,
-/// naming the subvolume a plain `mount` shows.
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
+pub const CSUM_TREE_OBJECTID: u64 = 7;
+pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
+pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// The objectid every `EXTENT_CSUM` item is filed under: `-10` as a `u64`.
 /// btrfs reserves the top of the objectid space by counting down, so this sorts
