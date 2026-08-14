@@ -354,4 +354,19 @@ impl<D: ReadAt> Btrfs<D> {
     pub fn device(&self) -> &D {
         &self.device
     }
+
+    /// Mutable access to the underlying device for writer operations.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
+    /// Update the in-memory mount state (superblock and root trees) after a committed transaction,
+    /// invalidating the node cache.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn update_mount_state(&mut self, sb: Superblock, fs_tree: TreeRoot) {
+        self.sb = sb;
+        self.fs_tree = fs_tree;
+        self.nodes.clear();
+    }
 }

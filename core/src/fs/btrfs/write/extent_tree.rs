@@ -103,6 +103,16 @@ impl BlockGroupItem {
         self.flags & BLOCK_GROUP_SYSTEM != 0
     }
 
+    /// Emit a `BLOCK_GROUP_ITEM` key and 24-byte payload.
+    pub fn emit(&self) -> (Key, Vec<u8>) {
+        let key = Key::new(self.start, BLOCK_GROUP_ITEM_KEY, self.length);
+        let mut data = vec![0u8; 24];
+        data[0..8].copy_from_slice(&self.used.to_le_bytes());
+        data[8..16].copy_from_slice(&self.chunk_objectid.to_le_bytes());
+        data[16..24].copy_from_slice(&self.flags.to_le_bytes());
+        (key, data)
+    }
+
     pub fn is_metadata(&self) -> bool {
         self.flags & BLOCK_GROUP_METADATA != 0
     }
@@ -217,6 +227,27 @@ impl MetadataItem {
             flags,
             backrefs,
         })
+    }
+
+    /// Emit a `METADATA_ITEM` key and payload for an allocated tree block.
+    pub fn emit_tree_block(
+        bytenr: u64,
+        level: u8,
+        generation: u64,
+        owner_root: u64,
+    ) -> (Key, Vec<u8>) {
+        let key = Key::new(bytenr, METADATA_ITEM_KEY, level as u64);
+        let mut data = vec![0u8; 33];
+        // refs = 1
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        // generation
+        data[8..16].copy_from_slice(&generation.to_le_bytes());
+        // flags: EXTENT_FLAG_TREE_BLOCK (0x2)
+        data[16..24].copy_from_slice(&EXTENT_FLAG_TREE_BLOCK.to_le_bytes());
+        // inline backref: TREE_BLOCK_REF_KEY (176)
+        data[24] = TREE_BLOCK_REF_KEY;
+        data[25..33].copy_from_slice(&owner_root.to_le_bytes());
+        (key, data)
     }
 }
 

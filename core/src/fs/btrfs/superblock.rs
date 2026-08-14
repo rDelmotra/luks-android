@@ -352,7 +352,51 @@ impl Superblock {
     pub fn has_skinny_metadata(&self) -> bool {
         self.incompat_flags & INCOMPAT_SKINNY_METADATA != 0
     }
+
+    /// Format and checksum a 4096-byte superblock buffer for a specific mirror location `bytenr`,
+    /// based on an existing `raw_template`.
+    pub fn emit_copy(&self, raw_template: &[u8], bytenr: u64) -> [u8; SUPER_SIZE] {
+        let mut buf = [0u8; SUPER_SIZE];
+        let copy_len = raw_template.len().min(SUPER_SIZE);
+        buf[..copy_len].copy_from_slice(&raw_template[..copy_len]);
+
+        // Magic
+        buf[0x40..0x48].copy_from_slice(MAGIC);
+
+        // Location of this copy
+        buf[0x30..0x38].copy_from_slice(&bytenr.to_le_bytes());
+
+        // Generation and root pointers
+        buf[0x48..0x50].copy_from_slice(&self.generation.to_le_bytes());
+        buf[0x50..0x58].copy_from_slice(&self.root.to_le_bytes());
+        buf[0x58..0x60].copy_from_slice(&self.chunk_root.to_le_bytes());
+        buf[0x60..0x68].copy_from_slice(&self.log_root.to_le_bytes());
+        buf[0x70..0x78].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[0x78..0x80].copy_from_slice(&self.bytes_used.to_le_bytes());
+        buf[0x80..0x88].copy_from_slice(&self.root_dir_objectid.to_le_bytes());
+        buf[0x88..0x90].copy_from_slice(&self.num_devices.to_le_bytes());
+
+        buf[0x90..0x94].copy_from_slice(&self.sector_size.to_le_bytes());
+        buf[0x94..0x98].copy_from_slice(&self.node_size.to_le_bytes());
+        buf[0x98..0x9c].copy_from_slice(&self.node_size.to_le_bytes()); // leafsize
+        buf[0x9c..0xa0].copy_from_slice(&self.stripe_size.to_le_bytes());
+
+        buf[0xb4..0xbc].copy_from_slice(&self.compat_ro_flags.to_le_bytes());
+        buf[0xbc..0xc4].copy_from_slice(&self.incompat_flags.to_le_bytes());
+
+        buf[0xc6] = self.root_level;
+        buf[0xc7] = self.chunk_root_level;
+
+        // Checksum over CSUM_START..SUPER_SIZE (32..4096)
+        let csum = self.csum_type.calculate(&buf[CSUM_START..]);
+        buf[..32].copy_from_slice(&csum);
+
+        buf
+    }
 }
+
+pub const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE: u64 = 0x1;
+pub const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 0x2;
 
 /// Name the flags we refused, so the error says what the drive uses rather than
 /// printing a hex word the user cannot act on.

@@ -27,6 +27,7 @@ pub struct BlockGroupFreeSpace {
     pub block_group: BlockGroupItem,
     pub allocated_extents: Vec<AllocatedExtent>,
     pub free_ranges: Vec<FreeRange>,
+    pub pinned_freed: Vec<FreeRange>,
     pub total_allocated_bytes: u64,
     pub total_free_bytes: u64,
 }
@@ -48,31 +49,18 @@ impl FreeSpaceMap {
                 LuksError::CorruptFs("block group range overflow")
             })?;
 
-            // Find all allocated extents belonging to this block group.
             let mut bg_extents = Vec::new();
-            for ext in &extent_tree.extents {
-                if ext.bytenr >= bg_start && ext.bytenr < bg_end {
-                    let ext_end = ext.bytenr.checked_add(ext.length).ok_or_else(|| {
-                        LuksError::CorruptFs("extent range overflow")
-                    })?;
-                    if ext_end > bg_end {
-                        return Err(LuksError::CorruptFs(
-                            "extent spans across block group boundary",
-                        ));
-                    }
-                    bg_extents.push(ext.clone());
-                }
-            }
-
-            // Compute free ranges by walking gaps between allocations.
             let mut free_ranges = Vec::new();
-            let mut cursor = bg_start;
             let mut total_allocated = 0u64;
+            let mut cursor = bg_start;
 
-            for ext in &bg_extents {
-                if ext.bytenr < cursor {
-                    return Err(LuksError::CorruptFs("overlapping allocated extents in extent tree"));
+            for ext in &extent_tree.extents {
+                if ext.bytenr < bg_start || ext.bytenr >= bg_end {
+                    continue;
                 }
+
+                bg_extents.push(ext.clone());
+
                 if ext.bytenr > cursor {
                     free_ranges.push(FreeRange {
                         start: cursor,
@@ -110,6 +98,7 @@ impl FreeSpaceMap {
                 block_group: bg.clone(),
                 allocated_extents: bg_extents,
                 free_ranges,
+                pinned_freed: Vec::new(),
                 total_allocated_bytes: total_allocated,
                 total_free_bytes: total_free,
             });
@@ -151,6 +140,153 @@ impl FreeSpaceMap {
             }
         }
         None
+    }
+
+    /// Allocate a metadata block of `size` bytes.
+    ///
+    /// Finds a metadata (or mixed data/metadata) block group with sufficient space,
+    /// carves out the range, updates the free space accounting, and returns the
+    /// logical start address.
+    pub fn allocate_metadata(&mut self, size: u32) -> Result<u64> {
+        let needed = size as u64;
+        let alignment = size as u64;
+
+        for bg in &mut self.block_groups {
+            // Check for metadata or mixed block group
+            let is_metadata = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA != 0)
+                || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+
+            if !is_metadata {
+                continue;
+            }
+
+            for i in 0..bg.free_ranges.len() {
+                let range = bg.free_ranges[i];
+                let aligned_start = (range.start + alignment - 1) & !(alignment - 1);
+                if aligned_start + needed <= range.start + range.length {
+                    let allocated_start = aligned_start;
+                    let before_len = allocated_start - range.start;
+                    let after_len = (range.start + range.length) - (allocated_start + needed);
+
+                    bg.free_ranges.remove(i);
+                    let insert_pos = i;
+                    if after_len > 0 {
+                        bg.free_ranges.insert(
+                            insert_pos,
+                            FreeRange {
+                                start: allocated_start + needed,
+                                length: after_len,
+                            },
+                        );
+                    }
+                    if before_len > 0 {
+                        bg.free_ranges.insert(
+                            insert_pos,
+                            FreeRange {
+                                start: range.start,
+                                length: before_len,
+                            },
+                        );
+                    }
+
+                    bg.total_allocated_bytes += needed;
+                    bg.total_free_bytes -= needed;
+                    bg.block_group.used += needed;
+
+                    return Ok(allocated_start);
+                }
+            }
+        }
+
+        Err(LuksError::FilesystemFull)
+    }
+
+    /// Mark a metadata block of `size` bytes starting at `bytenr` as freed in this transaction.
+    ///
+    /// The block is recorded in `pinned_freed` rather than returned to `free_ranges`
+    /// to avoid reusing it within the same transaction.
+    pub fn free_metadata(&mut self, bytenr: u64, size: u32) -> Result<()> {
+        let freed_len = size as u64;
+        for bg in &mut self.block_groups {
+            if bytenr >= bg.block_group.start
+                && bytenr + freed_len <= bg.block_group.start + bg.block_group.length
+            {
+                let pos = bg.pinned_freed.partition_point(|r| r.start < bytenr);
+                bg.pinned_freed.insert(
+                    pos,
+                    FreeRange {
+                        start: bytenr,
+                        length: freed_len,
+                    },
+                );
+
+                let mut merged: Vec<FreeRange> = Vec::new();
+                for r in bg.pinned_freed.drain(..) {
+                    if let Some(last) = merged.last_mut() {
+                        if last.start + last.length == r.start {
+                            last.length += r.length;
+                            continue;
+                        }
+                    }
+                    merged.push(r);
+                }
+                bg.pinned_freed = merged;
+
+                bg.block_group.used = bg.block_group.used.saturating_sub(freed_len);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the complete list of `FREE_SPACE_INFO` and `FREE_SPACE_EXTENT` items
+    /// for the Free Space Tree, combining existing free ranges with blocks freed
+    /// in this transaction.
+    pub fn emit_free_space_tree_items(&self) -> Vec<crate::fs::btrfs::write::node::LeafItem> {
+        let mut items = Vec::new();
+        for bg in &self.block_groups {
+            let mut combined = Vec::new();
+            combined.extend_from_slice(&bg.free_ranges);
+            combined.extend_from_slice(&bg.pinned_freed);
+            combined.sort_by_key(|r| r.start);
+
+            let mut merged: Vec<FreeRange> = Vec::new();
+            for r in combined {
+                if let Some(last) = merged.last_mut() {
+                    if last.start + last.length == r.start {
+                        last.length += r.length;
+                        continue;
+                    }
+                }
+                merged.push(r);
+            }
+
+            let mut info_data = vec![0u8; 8];
+            info_data[0..4].copy_from_slice(&(merged.len() as u32).to_le_bytes());
+            info_data[4..8].copy_from_slice(&0u32.to_le_bytes());
+
+            items.push(crate::fs::btrfs::write::node::LeafItem {
+                key: crate::fs::btrfs::tree::Key::new(
+                    bg.block_group.start,
+                    crate::fs::btrfs::tree::FREE_SPACE_INFO_KEY,
+                    bg.block_group.length,
+                ),
+                data: info_data,
+            });
+
+            for r in &merged {
+                items.push(crate::fs::btrfs::write::node::LeafItem {
+                    key: crate::fs::btrfs::tree::Key::new(
+                        r.start,
+                        crate::fs::btrfs::tree::FREE_SPACE_EXTENT_KEY,
+                        r.length,
+                    ),
+                    data: Vec::new(),
+                });
+            }
+        }
+        items
     }
 }
 

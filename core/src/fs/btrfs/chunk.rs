@@ -256,6 +256,39 @@ impl ChunkMap {
         Ok((physical, chunk.length - within))
     }
 
+    /// Translate `logical` into physical byte offsets for **every stripe** of
+    /// its chunk.
+    ///
+    /// For single-profile chunks, this returns a single physical offset.
+    /// For DUP-profile chunks, this returns two physical offsets (one per copy).
+    pub fn map_all_stripes(&self, logical: u64) -> Result<Vec<u64>> {
+        let i = match self
+            .chunks
+            .binary_search_by_key(&logical, |c| c.logical)
+        {
+            Ok(i) => i,
+            Err(0) => return Err(LuksError::CorruptFs("btrfs logical address below the first chunk")),
+            Err(i) => i - 1,
+        };
+        let chunk = &self.chunks[i];
+        let within = logical - chunk.logical;
+        if within >= chunk.length {
+            return Err(LuksError::CorruptFs(
+                "btrfs logical address falls in an unmapped gap",
+            ));
+        }
+
+        let mut physicals = Vec::with_capacity(chunk.stripes.len());
+        for stripe in &chunk.stripes {
+            let phys = stripe
+                .offset
+                .checked_add(within)
+                .ok_or(LuksError::CorruptFs("btrfs physical address overflows"))?;
+            physicals.push(phys);
+        }
+        Ok(physicals)
+    }
+
     /// The device id every stripe must belong to on a single-device
     /// filesystem. A chunk naming any other device is one we cannot read.
     pub fn check_single_device(&self, devid: u64) -> Result<()> {
