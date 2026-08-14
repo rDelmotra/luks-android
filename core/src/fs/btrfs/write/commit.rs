@@ -24,7 +24,15 @@ pub fn commit_transaction<D: WriteAt>(
 
     let dev_len = fs.device().len();
 
-    // 1. Write all new metadata blocks to all physical stripes.
+    // 1. Write all new data blocks to all physical stripes.
+    for (bytenr, data_bytes) in &txn.pending_data {
+        let stripes = fs.chunk_map().map_all_stripes(*bytenr)?;
+        for phys in stripes {
+            fs.device_mut().write_at(phys, data_bytes)?;
+        }
+    }
+
+    // 2. Write all new metadata blocks to all physical stripes.
     for (bytenr, block_bytes) in &txn.pending_blocks {
         let stripes = fs.chunk_map().map_all_stripes(*bytenr)?;
         for phys in stripes {
@@ -32,7 +40,7 @@ pub fn commit_transaction<D: WriteAt>(
         }
     }
 
-    // 2. Push all metadata blocks to medium before writing superblock.
+    // 3. Push all data and metadata blocks to medium before writing superblock.
     fs.device_mut().flush()?;
 
     // 3. Prepare updated superblock.

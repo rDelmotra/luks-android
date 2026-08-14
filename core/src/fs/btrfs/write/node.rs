@@ -507,3 +507,52 @@ pub fn build_dir_item(
     data[30..].copy_from_slice(name_bytes);
     data
 }
+
+/// Build a 53-byte `btrfs_file_extent_item` payload for a regular uncompressed data extent.
+pub fn build_regular_file_extent(
+    generation: u64,
+    ram_bytes: u64,
+    disk_bytenr: u64,
+    disk_num_bytes: u64,
+    num_bytes: u64,
+) -> Vec<u8> {
+    let mut data = vec![0u8; 53];
+    data[0..8].copy_from_slice(&generation.to_le_bytes()); // generation
+    data[8..16].copy_from_slice(&ram_bytes.to_le_bytes()); // ram_bytes
+    data[16] = 0; // compression = NONE
+    data[17] = 0; // encryption = NONE
+    data[18..20].copy_from_slice(&0u16.to_le_bytes()); // other_encoding = 0
+    data[20] = 1; // type = BTRFS_FILE_EXTENT_REG
+    data[21..29].copy_from_slice(&disk_bytenr.to_le_bytes()); // disk_bytenr
+    data[29..37].copy_from_slice(&disk_num_bytes.to_le_bytes()); // disk_num_bytes
+    data[37..45].copy_from_slice(&0u64.to_le_bytes()); // offset = 0
+    data[45..53].copy_from_slice(&num_bytes.to_le_bytes()); // num_bytes
+    data
+}
+
+/// Build the checksum payload for `disk_num_bytes` of data starting at sector boundary.
+///
+/// Computes a checksum for every `sector_size` (e.g. 4096) bytes.
+pub fn build_extent_csum_payload(
+    csum_type: crate::fs::btrfs::superblock::CsumType,
+    sector_size: u32,
+    disk_num_bytes: u64,
+    data: &[u8],
+) -> Vec<u8> {
+    let sector = sector_size as usize;
+    let nr_sectors = (disk_num_bytes as usize).div_ceil(sector);
+    let mut payload = Vec::with_capacity(nr_sectors * csum_type.size());
+
+    for i in 0..nr_sectors {
+        let start = i * sector;
+        let mut sector_buf = vec![0u8; sector];
+        if start < data.len() {
+            let copy_end = (start + sector).min(data.len());
+            sector_buf[..copy_end - start].copy_from_slice(&data[start..copy_end]);
+        }
+        let csum = csum_type.calculate(&sector_buf);
+        payload.extend_from_slice(&csum[..csum_type.size()]);
+    }
+
+    payload
+}

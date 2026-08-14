@@ -192,6 +192,32 @@ impl ExtentItem {
             backrefs,
         })
     }
+
+    /// Emit an `EXTENT_ITEM` key and payload for an allocated data extent with an inline `EXTENT_DATA_REF`.
+    pub fn emit_data_extent(
+        disk_bytenr: u64,
+        disk_num_bytes: u64,
+        generation: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+    ) -> (Key, Vec<u8>) {
+        let key = Key::new(disk_bytenr, EXTENT_ITEM_KEY, disk_num_bytes);
+        let mut data = vec![0u8; 53];
+        // refs = 1
+        data[0..8].copy_from_slice(&1u64.to_le_bytes());
+        // generation
+        data[8..16].copy_from_slice(&generation.to_le_bytes());
+        // flags: EXTENT_FLAG_DATA (0x1)
+        data[16..24].copy_from_slice(&EXTENT_FLAG_DATA.to_le_bytes());
+        // inline backref: EXTENT_DATA_REF_KEY (178)
+        data[24] = EXTENT_DATA_REF_KEY;
+        data[25..33].copy_from_slice(&root.to_le_bytes());
+        data[33..41].copy_from_slice(&objectid.to_le_bytes());
+        data[41..49].copy_from_slice(&offset.to_le_bytes());
+        data[49..53].copy_from_slice(&1u32.to_le_bytes()); // count = 1
+        (key, data)
+    }
 }
 
 /// A parsed `METADATA_ITEM` (skinny metadata tree block).

@@ -9,12 +9,12 @@ use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
-    Key, EXTENT_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID, FS_TREE_OBJECTID, INODE_ITEM_KEY,
-    METADATA_ITEM_KEY, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
+    Key, CSUM_TREE_OBJECTID, EXTENT_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID, FS_TREE_OBJECTID,
+    INODE_ITEM_KEY, METADATA_ITEM_KEY, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate, CowResult};
-use crate::fs::btrfs::write::extent_tree::{ExtentTree, MetadataItem};
+use crate::fs::btrfs::write::extent_tree::{ExtentItem, ExtentTree, MetadataItem};
 use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::write::node::Leaf;
 use crate::fs::btrfs::{Btrfs, TreeRoot};
@@ -27,6 +27,7 @@ pub struct Transaction {
     pub final_bytes_used: u64,
     pub new_fs_tree: TreeRoot,
     pub pending_blocks: HashMap<u64, Vec<u8>>,
+    pub pending_data: Vec<(u64, Vec<u8>)>,
 }
 
 impl Transaction {
@@ -102,10 +103,13 @@ impl Transaction {
             fs,
             new_generation,
             new_fs_tree,
+            None,
             pending_blocks,
+            Vec::new(),
             allocator,
             blocks_to_add,
             blocks_to_remove,
+            Vec::new(),
         )
     }
 
@@ -343,10 +347,204 @@ impl Transaction {
             fs,
             new_generation,
             new_fs_tree,
+            None,
             pending_blocks,
+            Vec::new(),
             allocator,
             blocks_to_add,
             blocks_to_remove,
+            Vec::new(),
+        )
+    }
+
+    /// Prepare a transaction that writes `data` into the file at `file_path`.
+    pub fn write_file_data<D: ReadAt>(
+        fs: &Btrfs<D>,
+        file_path: &str,
+        data: &[u8],
+        now_sec: u64,
+        now_nsec: u32,
+    ) -> Result<Self> {
+        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_subvolume(&fs.fs_tree())?;
+
+        let located = fs.resolve_no_follow(fs.fs_tree(), file_path)?;
+        if located.inode.file_type().is_dir() {
+            return Err(LuksError::IsADirectory(file_path.to_string()));
+        }
+        if located.tree.objectid != FS_TREE_OBJECTID {
+            return Err(LuksError::UnsupportedFsFeature(
+                "subvolume file write not yet supported".into(),
+            ));
+        }
+
+        let ino = located.inode.objectid;
+        let sb = fs.superblock();
+        let new_generation = sb.generation + 1;
+        let sector_size = sb.sector_size;
+
+        let extent_tree = ExtentTree::read(fs)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut pending_blocks = HashMap::new();
+        let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut data_extents_to_add = Vec::<(u64, u64, u64, u64, u64)>::new();
+
+        // 1. Allocate data extent
+        let data_len = data.len() as u64;
+        let disk_num_bytes = if data_len == 0 {
+            0
+        } else {
+            ((data_len + sector_size as u64 - 1) / sector_size as u64) * sector_size as u64
+        };
+
+        let mut pending_data = Vec::new();
+        let disk_bytenr = if disk_num_bytes > 0 {
+            let bytenr = allocator.allocate_data(disk_num_bytes as u32, sector_size)?;
+            let mut padded = vec![0u8; disk_num_bytes as usize];
+            padded[..data.len()].copy_from_slice(data);
+            pending_data.push((bytenr, padded));
+            data_extents_to_add.push((bytenr, disk_num_bytes, FS_TREE_OBJECTID, ino, 0));
+            bytenr
+        } else {
+            0
+        };
+
+        let mut fs_root_bytenr = fs.fs_tree().bytenr;
+        let mut fs_root_level = fs.fs_tree().level;
+
+        // 2. CoW FS_TREE: Update INODE_ITEM (size, nbytes, sequence, transid, mtime/ctime)
+        let inode_key = Key::new(ino, INODE_ITEM_KEY, 0);
+        let res = cow_tree_mutate(
+            fs,
+            &pending_blocks,
+            fs_root_bytenr,
+            fs_root_level,
+            FS_TREE_OBJECTID,
+            &inode_key,
+            new_generation,
+            &mut allocator,
+            |leaf| {
+                let idx = leaf
+                    .find_item(&inode_key)
+                    .ok_or_else(|| LuksError::NotFound("inode not found".into()))?;
+                let item_data = &mut leaf.items[idx].data;
+                if item_data.len() < 160 {
+                    return Err(LuksError::CorruptFs("inode item truncated"));
+                }
+                item_data[8..16].copy_from_slice(&new_generation.to_le_bytes()); // transid
+                item_data[16..24].copy_from_slice(&data_len.to_le_bytes()); // size
+                item_data[24..32].copy_from_slice(&disk_num_bytes.to_le_bytes()); // nbytes
+                let seq = u64::from_le_bytes(item_data[72..80].try_into().unwrap()).wrapping_add(1);
+                item_data[72..80].copy_from_slice(&seq.to_le_bytes()); // sequence
+                item_data[124..132].copy_from_slice(&now_sec.to_le_bytes()); // ctime
+                item_data[132..136].copy_from_slice(&now_nsec.to_le_bytes());
+                item_data[136..144].copy_from_slice(&now_sec.to_le_bytes()); // mtime
+                item_data[144..148].copy_from_slice(&now_nsec.to_le_bytes());
+                Ok(())
+            },
+        )?;
+        record_cow_result(
+            &res,
+            &mut blocks_to_add,
+            &mut blocks_to_remove,
+            &mut allocator,
+            &mut pending_blocks,
+            sb.node_size,
+            FS_TREE_OBJECTID,
+        )?;
+        fs_root_bytenr = res.new_root_bytenr;
+        fs_root_level = res.new_root_level;
+
+        // 3. CoW FS_TREE: Insert EXTENT_DATA item if disk_num_bytes > 0
+        if disk_num_bytes > 0 {
+            let extent_data_key = Key::new(ino, crate::fs::btrfs::tree::EXTENT_DATA_KEY, 0);
+            let extent_payload = crate::fs::btrfs::write::node::build_regular_file_extent(
+                new_generation,
+                disk_num_bytes,
+                disk_bytenr,
+                disk_num_bytes,
+                disk_num_bytes,
+            );
+            let res = cow_tree_insert(
+                fs,
+                &pending_blocks,
+                fs_root_bytenr,
+                fs_root_level,
+                FS_TREE_OBJECTID,
+                extent_data_key,
+                extent_payload,
+                new_generation,
+                &mut allocator,
+            )?;
+            record_cow_result(
+                &res,
+                &mut blocks_to_add,
+                &mut blocks_to_remove,
+                &mut allocator,
+                &mut pending_blocks,
+                sb.node_size,
+                FS_TREE_OBJECTID,
+            )?;
+            fs_root_bytenr = res.new_root_bytenr;
+            fs_root_level = res.new_root_level;
+        }
+
+        // 4. CoW CSUM_TREE: Insert EXTENT_CSUM item if disk_num_bytes > 0
+        let mut csum_root_opt = None;
+        if disk_num_bytes > 0 {
+            if let Ok(csum_root) = fs.tree_root(CSUM_TREE_OBJECTID) {
+                let csum_payload = crate::fs::btrfs::write::node::build_extent_csum_payload(
+                    sb.csum_type,
+                    sector_size,
+                    disk_num_bytes,
+                    data,
+                );
+                let csum_key = Key::new(
+                    crate::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
+                    crate::fs::btrfs::tree::EXTENT_CSUM_KEY,
+                    disk_bytenr,
+                );
+                let res = cow_tree_insert(
+                    fs,
+                    &pending_blocks,
+                    csum_root.bytenr,
+                    csum_root.level,
+                    CSUM_TREE_OBJECTID,
+                    csum_key,
+                    csum_payload,
+                    new_generation,
+                    &mut allocator,
+                )?;
+                record_cow_result(
+                    &res,
+                    &mut blocks_to_add,
+                    &mut blocks_to_remove,
+                    &mut allocator,
+                    &mut pending_blocks,
+                    sb.node_size,
+                    CSUM_TREE_OBJECTID,
+                )?;
+                csum_root_opt = Some((res.new_root_bytenr, res.new_root_level));
+            }
+        }
+
+        let mut new_fs_tree = fs.fs_tree();
+        new_fs_tree.bytenr = fs_root_bytenr;
+        new_fs_tree.level = fs_root_level;
+        new_fs_tree.generation = new_generation;
+
+        converge_and_finalize(
+            fs,
+            new_generation,
+            new_fs_tree,
+            csum_root_opt,
+            pending_blocks,
+            pending_data,
+            allocator,
+            blocks_to_add,
+            blocks_to_remove,
+            data_extents_to_add,
         )
     }
 }
@@ -405,10 +603,13 @@ fn converge_and_finalize<D: ReadAt>(
     fs: &Btrfs<D>,
     new_generation: u64,
     new_fs_tree: TreeRoot,
+    csum_root_opt: Option<(u64, u8)>,
     mut pending_blocks: HashMap<u64, Vec<u8>>,
+    pending_data: Vec<(u64, Vec<u8>)>,
     mut allocator: FreeSpaceMap,
     mut blocks_to_add: Vec<(u64, u8, u64)>,
     mut blocks_to_remove: Vec<(u64, u8)>,
+    data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
 ) -> Result<Transaction> {
     let sb = fs.superblock();
     let mut root_tree_bytenr = sb.root;
@@ -458,9 +659,78 @@ fn converge_and_finalize<D: ReadAt>(
     root_tree_bytenr = root_res.new_root_bytenr;
     root_tree_level = root_res.new_root_level;
 
+    // 2. Update CSUM_TREE root item in ROOT_TREE if modified
+    if let Some((csum_bytenr, csum_level)) = csum_root_opt {
+        let csum_root_key = Key::new(CSUM_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+        let root_res = cow_tree_mutate(
+            fs,
+            &pending_blocks,
+            root_tree_bytenr,
+            root_tree_level,
+            ROOT_TREE_OBJECTID,
+            &csum_root_key,
+            new_generation,
+            &mut allocator,
+            |leaf| {
+                let idx = leaf
+                    .find_item(&csum_root_key)
+                    .ok_or_else(|| LuksError::NotFound("csum root item not found".into()))?;
+                let data = &mut leaf.items[idx].data;
+                if data.len() < 239 {
+                    return Err(LuksError::CorruptFs("root item truncated"));
+                }
+                data[160..168].copy_from_slice(&new_generation.to_le_bytes());
+                data[176..184].copy_from_slice(&csum_bytenr.to_le_bytes());
+                data[238] = csum_level;
+                Ok(())
+            },
+        )?;
+
+        record_cow_result(
+            &root_res,
+            &mut blocks_to_add,
+            &mut blocks_to_remove,
+            &mut allocator,
+            &mut pending_blocks,
+            sb.node_size,
+            ROOT_TREE_OBJECTID,
+        )?;
+        root_tree_bytenr = root_res.new_root_bytenr;
+        root_tree_level = root_res.new_root_level;
+    }
+
+    // 3. Insert newly allocated data extents into EXTENT_TREE
+    for (bytenr, len, root, ino, offset) in data_extents_to_add {
+        let (data_key, data_payload) =
+            ExtentItem::emit_data_extent(bytenr, len, new_generation, root, ino, offset);
+        let ext_res = cow_tree_insert(
+            fs,
+            &pending_blocks,
+            extent_root_bytenr,
+            extent_root_level,
+            EXTENT_TREE_OBJECTID,
+            data_key,
+            data_payload,
+            new_generation,
+            &mut allocator,
+        )?;
+
+        record_cow_result(
+            &ext_res,
+            &mut blocks_to_add,
+            &mut blocks_to_remove,
+            &mut allocator,
+            &mut pending_blocks,
+            sb.node_size,
+            EXTENT_TREE_OBJECTID,
+        )?;
+        extent_root_bytenr = ext_res.new_root_bytenr;
+        extent_root_level = ext_res.new_root_level;
+    }
+
     let mut fst_bytenr_opt: Option<u64> = None;
 
-    // 2. Fixed-point loop to record allocations and update root pointers until convergence.
+    // 4. Fixed-point loop to record allocations and update root pointers until convergence.
     for _iteration in 0..10 {
         if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
             // Convergence achieved
@@ -704,5 +974,6 @@ fn converge_and_finalize<D: ReadAt>(
         final_bytes_used,
         new_fs_tree,
         pending_blocks,
+        pending_data,
     })
 }

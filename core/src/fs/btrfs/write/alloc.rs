@@ -202,6 +202,63 @@ impl FreeSpaceMap {
         Err(LuksError::FilesystemFull)
     }
 
+    /// Allocate a data extent of `size` bytes from a DATA (or MIXED) block group,
+    /// aligned to `sector_size` (e.g. 4096).
+    pub fn allocate_data(&mut self, size: u32, sector_size: u32) -> Result<u64> {
+        let needed = size as u64;
+        let alignment = sector_size as u64;
+
+        for bg in &mut self.block_groups {
+            // Check for data or mixed block group
+            let is_data = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
+                || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+
+            if !is_data {
+                continue;
+            }
+
+            for i in 0..bg.free_ranges.len() {
+                let range = bg.free_ranges[i];
+                let aligned_start = (range.start + alignment - 1) & !(alignment - 1);
+                if aligned_start + needed <= range.start + range.length {
+                    let allocated_start = aligned_start;
+                    let before_len = allocated_start - range.start;
+                    let after_len = (range.start + range.length) - (allocated_start + needed);
+
+                    bg.free_ranges.remove(i);
+                    let insert_pos = i;
+                    if after_len > 0 {
+                        bg.free_ranges.insert(
+                            insert_pos,
+                            FreeRange {
+                                start: allocated_start + needed,
+                                length: after_len,
+                            },
+                        );
+                    }
+                    if before_len > 0 {
+                        bg.free_ranges.insert(
+                            insert_pos,
+                            FreeRange {
+                                start: range.start,
+                                length: before_len,
+                            },
+                        );
+                    }
+
+                    bg.total_allocated_bytes += needed;
+                    bg.total_free_bytes -= needed;
+                    bg.block_group.used += needed;
+
+                    return Ok(allocated_start);
+                }
+            }
+        }
+
+        Err(LuksError::FilesystemFull)
+    }
+
     /// Mark a metadata block of `size` bytes starting at `bytenr` as freed in this transaction.
     ///
     /// The block is recorded in `pinned_freed` rather than returned to `free_ranges`

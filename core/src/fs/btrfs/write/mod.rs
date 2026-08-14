@@ -54,4 +54,15 @@ impl<D: WriteAt> Btrfs<D> {
         commit_transaction(self, txn)?;
         Ok(())
     }
+
+    /// Write `data` into the regular file at `path`.
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let txn = Transaction::write_file_data(self, path, data, now_sec, now_nsec)?;
+        commit_transaction(self, txn)?;
+        Ok(())
+    }
 }
