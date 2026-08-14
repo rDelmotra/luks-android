@@ -43,4 +43,15 @@ impl<D: WriteAt> Btrfs<D> {
         commit_transaction(self, txn)?;
         Ok(())
     }
+
+    /// Create an empty regular file named `filename` in the directory at `parent_dir_path`.
+    pub fn create_file(&mut self, parent_dir_path: &str, filename: &str) -> Result<()> {
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let txn = Transaction::create_empty_file(self, parent_dir_path, filename, now_sec, now_nsec)?;
+        commit_transaction(self, txn)?;
+        Ok(())
+    }
 }

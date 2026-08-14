@@ -366,6 +366,46 @@ impl InteriorNode {
         Ok(())
     }
 
+    /// Split an overflowing interior node into `(left_interior, right_interior, pivot_key)`.
+    pub fn split(&self, right_bytenr: u64) -> Result<(InteriorNode, InteriorNode, Key)> {
+        if self.entries.len() < 2 {
+            return Err(LuksError::CorruptFs(
+                "cannot split interior node with fewer than 2 entries",
+            ));
+        }
+
+        let mid = self.entries.len() / 2;
+        let left_entries = self.entries[..mid].to_vec();
+        let right_entries = self.entries[mid..].to_vec();
+        let pivot_key = right_entries[0].key;
+
+        let left = InteriorNode {
+            bytenr: self.bytenr,
+            generation: self.generation,
+            owner: self.owner,
+            level: self.level,
+            flags: self.flags,
+            metadata_uuid: self.metadata_uuid,
+            chunk_tree_uuid: self.chunk_tree_uuid,
+            csum_type: self.csum_type,
+            entries: left_entries,
+        };
+
+        let right = InteriorNode {
+            bytenr: right_bytenr,
+            generation: self.generation,
+            owner: self.owner,
+            level: self.level,
+            flags: self.flags,
+            metadata_uuid: self.metadata_uuid,
+            chunk_tree_uuid: self.chunk_tree_uuid,
+            csum_type: self.csum_type,
+            entries: right_entries,
+        };
+
+        Ok((left, right, pivot_key))
+    }
+
     /// Serialize this interior node into the canonical on-disk byte representation.
     pub fn emit(&self, node_size: u32) -> Result<Vec<u8>> {
         let size = node_size as usize;
@@ -403,4 +443,67 @@ impl InteriorNode {
 
         Ok(raw)
     }
+}
+
+// --- Item payload builders ---------------------------------------------------
+
+/// Build a 160-byte `btrfs_inode_item` payload for a new empty file.
+pub fn build_empty_inode_item(
+    generation: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    sec: u64,
+    nsec: u32,
+) -> Vec<u8> {
+    let mut data = vec![0u8; 160];
+    data[0..8].copy_from_slice(&generation.to_le_bytes()); // generation
+    data[8..16].copy_from_slice(&generation.to_le_bytes()); // transid
+    data[16..24].copy_from_slice(&0u64.to_le_bytes()); // size = 0
+    data[24..32].copy_from_slice(&0u64.to_le_bytes()); // nbytes = 0
+    data[32..40].copy_from_slice(&0u64.to_le_bytes()); // block_group = 0
+    data[40..44].copy_from_slice(&nlink.to_le_bytes()); // nlink
+    data[44..48].copy_from_slice(&uid.to_le_bytes()); // uid
+    data[48..52].copy_from_slice(&gid.to_le_bytes()); // gid
+    data[52..56].copy_from_slice(&mode.to_le_bytes()); // mode
+    data[56..64].copy_from_slice(&0u64.to_le_bytes()); // rdev = 0
+    data[64..72].copy_from_slice(&0u64.to_le_bytes()); // flags = 0
+    data[72..80].copy_from_slice(&1u64.to_le_bytes()); // sequence = 1
+    // Timestamps: atime (112), ctime (124), mtime (136), otime (148)
+    for offset in [112, 124, 136, 148] {
+        data[offset..offset + 8].copy_from_slice(&sec.to_le_bytes());
+        data[offset + 8..offset + 12].copy_from_slice(&nsec.to_le_bytes());
+    }
+    data
+}
+
+/// Build a `btrfs_inode_ref` payload `(index, name_len, name)`.
+pub fn build_inode_ref(dir_index: u64, name: &str) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let mut data = vec![0u8; 10 + name_bytes.len()];
+    data[0..8].copy_from_slice(&dir_index.to_le_bytes());
+    data[8..10].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    data[10..].copy_from_slice(name_bytes);
+    data
+}
+
+/// Build a `btrfs_dir_item` payload `(location, transid, data_len, name_len, type, name)`.
+pub fn build_dir_item(
+    child_ino: u64,
+    transid: u64,
+    file_type: u8,
+    name: &str,
+) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let mut data = vec![0u8; 30 + name_bytes.len()];
+    data[0..8].copy_from_slice(&child_ino.to_le_bytes());
+    data[8] = crate::fs::btrfs::tree::INODE_ITEM_KEY;
+    data[9..17].copy_from_slice(&0u64.to_le_bytes());
+    data[17..25].copy_from_slice(&transid.to_le_bytes());
+    data[25..27].copy_from_slice(&0u16.to_le_bytes()); // data_len = 0
+    data[27..29].copy_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+    data[29] = file_type;
+    data[30..].copy_from_slice(name_bytes);
+    data
 }

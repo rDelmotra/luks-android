@@ -40,6 +40,7 @@ pub fn commit_transaction<D: WriteAt>(
     new_sb.generation = txn.new_generation;
     new_sb.root = txn.final_root_bytenr;
     new_sb.root_level = txn.final_root_level;
+    new_sb.bytes_used = txn.final_bytes_used;
     // Keep compat_ro_flags consistent with the emitted Free Space Tree.
 
     // Write superblock mirrors.
