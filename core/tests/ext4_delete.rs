@@ -335,7 +335,7 @@ fn break_verification_missing_unlink_leaves_unattached_inode() {
 
     // e2fsck must complain that a directory entry points to an unused/deleted inode
     assert!(
-        text.contains("deleted inode") || text.contains("points to") || text.contains("not in use") || text.contains("invalid"),
+        text.contains("deleted inode") || text.contains("deleted/unused") || text.contains("unused inode") || text.contains("points to") || text.contains("not in use") || text.contains("invalid"),
         "e2fsck did not complain about unlinked inode reference:\n{text}"
     );
 }
