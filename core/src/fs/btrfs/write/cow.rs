@@ -237,12 +237,15 @@ fn cow_descend_insert<D: ReadAt>(
             freed,
         )?;
 
-        // Update child pointer in interior node
+        // Update child pointer in interior node. The key must always be
+        // propagated, including at child_idx == 0: a KeyPtr holds "where a
+        // subtree lives and the lowest key in it" (tree.rs), so when the
+        // leftmost child's minimum key changes, the parent's own reported
+        // minimum is stale until this runs. Real btrfs calls this case
+        // fixup_low_keys(); skipping child_idx == 0 was doing the opposite.
         interior.entries[child_idx].blockptr = new_child_bytenr;
         interior.entries[child_idx].generation = generation;
-        if child_idx > 0 {
-            interior.entries[child_idx].key = new_child_key;
-        }
+        interior.entries[child_idx].key = new_child_key;
 
         if let Some((split_key, split_bytenr)) = split_opt {
             let needed = crate::fs::btrfs::tree::HEADER_SIZE
@@ -451,12 +454,12 @@ where
             mutate_fn,
         )?;
 
-        // Update child pointer in interior node
+        // Update child pointer in interior node. See the matching comment in
+        // cow_descend_insert above: the key must always be propagated, even
+        // for child_idx == 0, or the parent's minimum goes stale.
         interior.entries[child_idx].blockptr = new_child_bytenr;
         interior.entries[child_idx].generation = generation;
-        if child_idx > 0 {
-            interior.entries[child_idx].key = new_child_key;
-        }
+        interior.entries[child_idx].key = new_child_key;
 
         let target_bytenr = if is_already_new {
             bytenr
