@@ -112,6 +112,22 @@ impl CsumType {
             }
         }
     }
+
+    pub fn calculate(self, data: &[u8]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        match self {
+            CsumType::Crc32c => {
+                let c = crc32c(data);
+                out[0..4].copy_from_slice(&c.to_le_bytes());
+            }
+            CsumType::Sha256 => {
+                use sha2::{Digest, Sha256};
+                let digest = Sha256::digest(data);
+                out.copy_from_slice(digest.as_slice());
+            }
+        }
+        out
+    }
 }
 
 fn u16le(b: &[u8], o: usize) -> u16 {

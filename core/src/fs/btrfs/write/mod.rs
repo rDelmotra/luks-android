@@ -5,8 +5,10 @@
 
 pub mod alloc;
 pub mod extent_tree;
+pub mod node;
 
 pub use alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
 pub use extent_tree::{
     AllocatedExtent, BlockGroupItem, ExtentItem, ExtentTree, InlineBackref, MetadataItem,
 };
+pub use node::{InteriorEntry, InteriorNode, Leaf, LeafItem};

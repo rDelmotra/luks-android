@@ -19,10 +19,9 @@ use crate::error::{LuksError, Result};
 
 /// Bytes before the first item descriptor or key pointer.
 pub const HEADER_SIZE: usize = 101;
-/// `key (17) + offset (4) + size (4)`.
-const ITEM_SIZE: usize = 25;
+pub const ITEM_SIZE: usize = 25;
 /// `key (17) + blockptr (8) + generation (8)`.
-const KEY_PTR_SIZE: usize = 33;
+pub const KEY_PTR_SIZE: usize = 33;
 /// `objectid (8) + type (1) + offset (8)`.
 pub const KEY_SIZE: usize = 17;
 
@@ -209,6 +208,30 @@ impl Node {
 
     pub fn is_leaf(&self) -> bool {
         self.level == 0
+    }
+
+    pub fn bytenr(&self) -> u64 {
+        u64le(&self.raw, 48)
+    }
+
+    pub fn flags(&self) -> u64 {
+        u64le(&self.raw, 56)
+    }
+
+    pub fn metadata_uuid(&self) -> [u8; 16] {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(&self.raw[32..48]);
+        u
+    }
+
+    pub fn chunk_tree_uuid(&self) -> [u8; 16] {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(&self.raw[64..80]);
+        u
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
     }
 
     /// Key of entry `i`, in either kind of node.
