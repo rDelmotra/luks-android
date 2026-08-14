@@ -66,3 +66,7 @@ dangerous-write-support = []
 
 # [profile.release] moved to the workspace root Cargo.toml — Cargo ignores
 # profile settings in non-root members and warns about them.
+
+[[example]]
+name = "write_btrfs_to_drive"
+required-features = ["dangerous-write-support"]
