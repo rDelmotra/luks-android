@@ -800,16 +800,34 @@ fn converge_and_finalize<D: ReadAt>(
                 new_generation,
                 alloc_owner,
             );
-            let ext_res = cow_tree_mutate(
+            // `cow_tree_insert`, not `cow_tree_mutate`: this is a brand new key
+            // (the block was just allocated, so no METADATA_ITEM for it can
+            // already exist), not an edit of one already in the leaf.
+            // `cow_tree_mutate`'s leaf branch has no split path at all — it
+            // calls `mutate_fn` and unconditionally emits, so once the extent
+            // tree's target leaf was full this failed closed with
+            // `FilesystemFull` even with the rest of the filesystem empty.
+            // Measured 2026-08-15: a probe against a *freshly mkfs'd, mostly
+            // empty* mixed-4k.img (no prior fragmentation) hit exactly this
+            // error via this call site at the 319th file created, long
+            // before the FS tree itself needed an interior split — meaning
+            // the "adversarial 5,557-file run hit FilesystemFull" this
+            // project's plan attributed to running out of physical space was
+            // very likely this bug, not exhausted media. `cow_tree_insert`
+            // already carries the leaf-split and root-height-increment logic
+            // this needs, and is already used for extent-tree data-extent
+            // inserts a few lines above — this just makes metadata-item
+            // inserts consistent with that.
+            let ext_res = cow_tree_insert(
                 fs,
                 &pending_blocks,
                 extent_root_bytenr,
                 extent_root_level,
                 EXTENT_TREE_OBJECTID,
-                &meta_key,
+                meta_key,
+                meta_data,
                 new_generation,
                 &mut allocator,
-                |leaf| leaf.insert_item(meta_key, meta_data, sb.node_size),
             )?;
 
             record_cow_result(
