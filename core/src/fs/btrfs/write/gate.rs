@@ -58,3 +58,30 @@ pub fn check_writeable_subvolume(root: &TreeRoot) -> Result<()> {
     }
     Ok(())
 }
+
+/// Refuse a free-space tree this writer cannot rewrite correctly.
+///
+/// Every commit rewrites the free-space tree wholesale from the allocator's
+/// own view of free space (`txn.rs`), emitting it as **one leaf**. That is
+/// sound only while the tree really is a single leaf — true of every fixture
+/// here, and false of any drive large enough to need an interior root, where
+/// the rewrite would install a level-0 node as the root and strand the real
+/// child leaves: still charged to the extent tree, no longer reachable from
+/// it.
+///
+/// Refusing by name is the project convention for a shape we understand but
+/// have not implemented (§1). It is deliberately *not* worked around by
+/// clearing `FREE_SPACE_TREE_VALID` and letting the kernel rebuild the tree:
+/// measured 2026-08-14, `btrfs check` validates free-space-tree *contents*
+/// against the extent tree whether or not that bit is set, so a stale tree
+/// fails `check` until something mounts the filesystem read-write — see the
+/// correction to §2 in `feature-btrfs-write.md`.
+pub fn check_free_space_tree_shape(fst_root: &TreeRoot) -> Result<()> {
+    if fst_root.level != 0 {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "btrfs free-space tree spanning multiple leaves (root level {})",
+            fst_root.level
+        )));
+    }
+    Ok(())
+}

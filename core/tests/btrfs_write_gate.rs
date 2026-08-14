@@ -8,7 +8,8 @@
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::superblock::Superblock;
 use luks_core::fs::btrfs::write::gate::{
-    check_writeable_fs, check_writeable_subvolume, SUPPORTED_WRITE_COMPAT_RO,
+    check_free_space_tree_shape, check_writeable_fs, check_writeable_subvolume,
+    SUPPORTED_WRITE_COMPAT_RO,
 };
 use luks_core::fs::btrfs::TreeRoot;
 
@@ -101,4 +102,34 @@ fn read_only_subvolume_is_refused() {
         }
         other => panic!("expected UnsupportedFsFeature, got {other:?}"),
     }
+}
+
+/// Fix 1 (D.1). Every commit rewrites the free-space tree as a single leaf,
+/// so a tree with an interior root must be refused rather than flattened —
+/// flattening it would strand the real child leaves, still charged to the
+/// extent tree but unreachable from it.
+#[test]
+fn multi_leaf_free_space_tree_is_refused() {
+    let mut fst_root = TreeRoot::default();
+    fst_root.level = 1;
+    match check_free_space_tree_shape(&fst_root).unwrap_err() {
+        LuksError::UnsupportedFsFeature(msg) => {
+            assert!(
+                msg.contains("free-space tree"),
+                "refusal must name the free-space tree, got: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFsFeature, got {other:?}"),
+    }
+}
+
+/// The control for the test above. Without it, a gate that refused *every*
+/// free-space tree — including the single-leaf ones this writer handles
+/// correctly, i.e. all four fixtures — would look identically green.
+#[test]
+fn single_leaf_free_space_tree_is_allowed() {
+    let fst_root = TreeRoot::default();
+    assert_eq!(fst_root.level, 0, "default TreeRoot must be a leaf for this control to mean anything");
+    check_free_space_tree_shape(&fst_root)
+        .expect("a single-leaf free-space tree is exactly what this writer supports");
 }

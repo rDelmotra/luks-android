@@ -801,9 +801,19 @@ fn converge_and_finalize<D: ReadAt>(
             extent_root_level = ext_res.new_root_level;
         }
 
-        // Update Free Space Tree if present on this filesystem
+        // Update Free Space Tree if present on this filesystem.
+        //
+        // Rewritten wholesale from the allocator's own view rather than
+        // edited in place, and therefore emitted as a single leaf — which is
+        // only correct for a single-leaf tree, so that shape is refused up
+        // front rather than silently mangled. Leaving the tree stale instead
+        // is not an option: `btrfs check` cross-checks its contents against
+        // the extent tree even with FREE_SPACE_TREE_VALID cleared (measured
+        // 2026-08-14; see the §2 correction in feature-btrfs-write.md).
         if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
             if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+                gate::check_free_space_tree_shape(&fst_root)?;
+
                 let fst_target = match fst_bytenr_opt {
                     Some(b) => b,
                     None => {
@@ -831,6 +841,18 @@ fn converge_and_finalize<D: ReadAt>(
                     csum_type: sb.csum_type,
                     items: allocator.emit_free_space_tree_items(),
                 };
+                // The same single-leaf limit, caught from the other side: the
+                // tree can start as one leaf and still not fit in one once
+                // this write fragments free space. `emit` would report this
+                // as a bare FilesystemFull, which reads as "the drive is
+                // full" — a different and much more alarming claim than the
+                // true one, and `RULES.md` requires an error to name its own
+                // operation.
+                if fst_leaf.free_space(sb.node_size) == 0 {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "btrfs free-space tree no longer fits in a single leaf".into(),
+                    ));
+                }
                 let fst_raw = fst_leaf.emit(sb.node_size)?;
                 pending_blocks.insert(fst_target, fst_raw);
 
