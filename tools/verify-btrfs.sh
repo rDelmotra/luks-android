@@ -32,6 +32,18 @@
 # 2026-08-14, not assumed. That is this script's control: a check that cannot
 # fail on a known-bad input is not a check.
 #
+# ⚠️ scrub's own exit code is NOT enough. Measured 2026-08-14: zeroing only
+# the second DUP metadata mirror of a live tree block (exactly the failure
+# mode §2 of feature-btrfs-write.md exists to catch) makes `btrfs scrub start
+# -Bdr` print "Error summary: verify=4 / Corrected: 4 / Uncorrectable: 0" and
+# **exit 0** — scrub self-heals from the surviving good mirror and calls that
+# success. Only a genuinely *uncorrectable* error (no good mirror anywhere)
+# returns nonzero. So this script greps scrub's own printed summary for the
+# literal "no errors found" line and fails explicitly if it's anything else,
+# regardless of scrub's exit code. Without this, a regression that silently
+# stops writing the second DUP mirror — the single invariant this whole
+# write engine is built around — passes clean.
+#
 # Runs in the colima VM because macOS has neither btrfs-progs nor a btrfs
 # kernel module. Start it with `colima start` if it is not up.
 #
@@ -74,12 +86,24 @@ btrfs check --readonly "$IMG"
 mkdir -p "$MNT"
 mount -o ro,loop "$IMG" "$MNT"
 echo "--- mounted read-only, root contains ---"
-ls -la "$MNT" | head -40
+# `|| true`: under `set -o pipefail`, a directory with more than the
+# `head -40` cutoff makes `ls` catch SIGPIPE and this pipeline "fail" before
+# scrub ever runs — measured 2026-08-14 on a 400-entry directory, which
+# aborted the whole script at exit 141 with the filesystem itself completely
+# clean. This is a display line, not a check; it must never gate the verdict.
+ls -la "$MNT" | head -40 || true
 
 echo "--- btrfs scrub start -Bdr ---"
-btrfs scrub start -Bdr "$MNT"
-echo "--- btrfs scrub status ---"
-btrfs scrub status "$MNT"
+SCRUB_OUT="$(btrfs scrub start -Bdr "$MNT" 2>&1)" || true
+echo "$SCRUB_OUT"
+if ! grep -q "Error summary:    no errors found" <<<"$SCRUB_OUT"; then
+    echo "FAIL: scrub reported errors — see \"Error summary\" above. A" >&2
+    echo "'Corrected' count is not success: it means a DUP mirror was wrong" >&2
+    echo "and scrub silently repaired it from the other copy, which for this" >&2
+    echo "project means the writer failed to write that mirror in the first" >&2
+    echo "place. scrub's own exit code does not distinguish this from clean." >&2
+    exit 1
+fi
 REMOTE_SCRIPT
 
 colima ssh -- tee "$REMOTE" < "$IMG" > /dev/null
