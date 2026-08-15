@@ -82,6 +82,13 @@ pub mod code {
     /// btrfs" — two refusals whose remedies have nothing in common, arriving
     /// at the UI as the same number.
     pub const WRITER_BUSY: i32 = 16;
+    /// A single btrfs item was too large for a tree node. Split from
+    /// `NO_SPACE`, which it used to share: on 2026-08-16 that made a 20 MB
+    /// write on a drive with 676 MiB free tell the user their drive was full,
+    /// and sent a day of investigation at the flash rather than at the leaf.
+    /// The remedies are unrelated — 12 means "free something up", 17 means
+    /// "this file's shape does not fit this filesystem's geometry".
+    pub const ITEM_TOO_LARGE: i32 = 17;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -104,6 +111,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | AmbiguousFs => code::UNSUPPORTED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
+        BtrfsItemTooLarge { .. } => code::ITEM_TOO_LARGE,
         AlreadyExists(_) => code::ALREADY_EXISTS,
         WriterBusy => code::WRITER_BUSY,
         WrongWriteTarget { .. } => code::WRONG_TARGET,

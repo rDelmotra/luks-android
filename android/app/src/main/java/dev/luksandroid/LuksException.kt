@@ -43,5 +43,16 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * "this volume is btrfs" — because the remedy is specific.
          */
         const val WRITER_BUSY = 16
+
+        /**
+         * A single btrfs metadata item was too large for a tree node — a
+         * geometry limit, not a full drive.
+         *
+         * Distinct from [NO_SPACE], which it used to arrive as. On 2026-08-16
+         * that made a 20 MB transfer to a stick with 676 MiB free tell the
+         * user the drive was out of space, which was false and sent the
+         * investigation at the hardware.
+         */
+        const val ITEM_TOO_LARGE = 17
     }
 }

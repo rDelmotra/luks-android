@@ -57,12 +57,19 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// See the note on the same counter in `btrfs_create_file.rs`: a timestamp
+/// alone does not make this path unique, because this host's `SystemTime`
+/// advances in 1 µs steps and `cargo` starts a binary's tests together.
+static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn copy_to_temp(src_name: &str) -> PathBuf {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dst = temp_dir.join(format!(
-        "btrfs-rootsplit-{src_name}-{}-{}",
+        "btrfs-rootsplit-{src_name}-{}-{}-{}",
         std::process::id(),
+        count,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

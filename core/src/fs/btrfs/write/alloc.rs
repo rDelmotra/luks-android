@@ -204,8 +204,15 @@ impl FreeSpaceMap {
 
     /// Allocate a data extent of `size` bytes from a DATA (or MIXED) block group,
     /// aligned to `sector_size` (e.g. 4096).
-    pub fn allocate_data(&mut self, size: u32, sector_size: u32) -> Result<u64> {
-        let needed = size as u64;
+    ///
+    /// `size` is a `u64` deliberately. It was a `u32`, and the caller passed
+    /// `disk_num_bytes as u32` — so a file of 4 GiB or more wrapped to a small
+    /// allocation while the commit still wrote the full-length buffer at that
+    /// address, overwriting whatever followed. Nothing on the 4 GiB test stick
+    /// could reach that size, so it was latent rather than observed; it is
+    /// fixed here rather than left for the first drive big enough to hit it.
+    pub fn allocate_data(&mut self, size: u64, sector_size: u32) -> Result<u64> {
+        let needed = size;
         let alignment = sector_size as u64;
 
         for bg in &mut self.block_groups {

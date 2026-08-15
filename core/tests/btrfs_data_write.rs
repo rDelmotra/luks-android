@@ -227,3 +227,74 @@ fn write_file_in_subdirectory_on_plain_img() {
         "kernel oracle verification failed on subdir data write"
     );
 }
+
+#[test]
+fn write_4mb_file_data_on_plain_img() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_file("/", "large_4mb.bin").expect("create file");
+
+    let size = 4 * 1024 * 1024;
+    let mut test_data = vec![0u8; size];
+    for (i, b) in test_data.iter_mut().enumerate() {
+        *b = ((i * 31 + 17) & 0xFF) as u8;
+    }
+
+    fs.write_file("/large_4mb.bin", &test_data)
+        .expect("write 4MB file data");
+
+    let readback = fs.read_file("/large_4mb.bin").expect("readback 4MB file");
+    assert_eq!(readback.len(), test_data.len());
+    assert_eq!(readback, test_data);
+
+    drop(fs);
+
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle verification failed on 4MB write"
+    );
+}
+
+#[test]
+fn write_multi_item_csum_on_mixed_4k_img() {
+    let temp_img = copy_to_temp("mixed-4k.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_file("/", "multi_csum.bin").expect("create file");
+
+    // On mixed-4k.img (4096 node size), max_csum_item_bytes is 3940 bytes (985 sectors = ~3.84 MiB).
+    // Writing 5 MiB (1280 sectors) forces splitting across 2 EXTENT_CSUM items in CSUM_TREE,
+    // exercising both multi-item checksum splitting and B-tree leaf splitting under real CoW.
+    let size = 5 * 1024 * 1024;
+    let mut test_data = vec![0u8; size];
+    for (i, b) in test_data.iter_mut().enumerate() {
+        *b = ((i * 37 + 13) & 0xFF) as u8;
+    }
+
+    fs.write_file("/multi_csum.bin", &test_data)
+        .expect("write multi-item csum data");
+
+    let readback = fs.read_file("/multi_csum.bin").expect("readback multi csum file");
+    assert_eq!(readback.len(), test_data.len());
+    assert_eq!(readback, test_data);
+
+    drop(fs);
+
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle verification failed on multi-item csum write on mixed-4k.img"
+    );
+}
+
+

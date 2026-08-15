@@ -54,6 +54,40 @@ pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
 
+/// A human name for an item type, for errors that would otherwise describe a
+/// bare number.
+///
+/// `RULES.md`: *an error about an operation must name the operation.* A
+/// capacity failure that says only "an item did not fit" leaves the reader to
+/// supply which item from context, and context is exactly what was wrong the
+/// last two times this project chased a misattributed error.
+pub fn item_type_name(item_type: u8) -> &'static str {
+    match item_type {
+        INODE_ITEM_KEY => "inode item",
+        INODE_REF_KEY => "inode ref",
+        XATTR_ITEM_KEY => "xattr item",
+        DIR_ITEM_KEY => "directory item",
+        DIR_INDEX_KEY => "directory index",
+        EXTENT_DATA_KEY => "file extent item",
+        EXTENT_CSUM_KEY => "checksum item",
+        ROOT_ITEM_KEY => "root item",
+        ROOT_BACKREF_KEY => "root backref",
+        ROOT_REF_KEY => "root ref",
+        EXTENT_ITEM_KEY => "extent item",
+        METADATA_ITEM_KEY => "metadata item",
+        TREE_BLOCK_REF_KEY => "tree block ref",
+        EXTENT_DATA_REF_KEY => "extent data ref",
+        SHARED_BLOCK_REF_KEY => "shared block ref",
+        SHARED_DATA_REF_KEY => "shared data ref",
+        BLOCK_GROUP_ITEM_KEY => "block group item",
+        FREE_SPACE_INFO_KEY => "free space info",
+        FREE_SPACE_EXTENT_KEY => "free space extent",
+        DEV_ITEM_KEY => "device item",
+        CHUNK_ITEM_KEY => "chunk item",
+        _ => "tree item",
+    }
+}
+
 // --- objectids we name -----------------------------------------------------
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const ROOT_TREE_OBJECTID: u64 = 1;

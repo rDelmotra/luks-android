@@ -154,6 +154,30 @@ pub enum LuksError {
     #[error("no space left on the filesystem")]
     FilesystemFull,
 
+    /// A single btrfs item is larger than any tree node could ever hold, so no
+    /// amount of splitting or free space can place it.
+    ///
+    /// Its own variant because sharing [`LuksError::FilesystemFull`] cost a
+    /// day. On 2026-08-16 a 20 MB phone→stick write reported *"no space left
+    /// on the filesystem"* on a drive with 676 MiB free: the real cause was
+    /// one `EXTENT_CSUM` item covering a whole file and overflowing a 16 KiB
+    /// leaf. The investigation went at the drive, the flashing and the free
+    /// space, none of which were involved. `RULES.md` already required that an
+    /// error name its own operation; one error meaning two unrelated things is
+    /// the same defect wearing a different mask, so the two are now separate
+    /// and this one says outright that space is not the problem.
+    #[error(
+        "a {item_bytes}-byte {what} does not fit in a {node_size}-byte btrfs tree node \
+         — this is a node-capacity limit, not a full disk"
+    )]
+    BtrfsItemTooLarge {
+        /// What was being written, so the message names its own operation
+        /// rather than leaving the reader to supply one from context.
+        what: &'static str,
+        item_bytes: usize,
+        node_size: u32,
+    },
+
     #[error("no free inodes left on the filesystem")]
     NoFreeInodes,
 
