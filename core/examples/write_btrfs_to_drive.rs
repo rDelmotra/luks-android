@@ -105,8 +105,7 @@ fn run(
         fs.superblock().node_size
     );
 
-    fs.create_file("/", dest)?;
-    fs.write_file(&format!("/{dest}"), content)?;
+    fs.create_file_with_data("/", dest, content)?;
     println!("written and flushed");
 
     Ok(())
