@@ -375,28 +375,16 @@ fn closing_the_writer_lets_another_volume_take_over() {
         .expect("the claim should have been released when the first was dropped");
 }
 
-#[test]
-fn writing_to_btrfs_is_refused_by_name() {
-    // The real drive this project targets is btrfs and holds a live OS. The
-    // bridge must say so rather than fail somewhere further down where the
-    // cause is a guess.
-    let src = fixture("disks/gpt-luks-btrfs.img");
-    let dst = std::env::temp_dir().join("luks-jni-write-btrfs.img");
-    std::fs::copy(&src, &dst).expect("copy btrfs fixture");
-    let path = dst.to_string_lossy().into_owned();
-
-    let vol = unlock(&path);
-    let err = vol
-        .write_file("/", "nope.txt", b"should never land")
-        .expect_err("btrfs must be refused");
-
-    let msg = err.to_string();
-    assert!(
-        msg.contains("btrfs"),
-        "the refusal should name the filesystem it refused: {msg}"
-    );
-    assert_eq!(error_code(&err), code::UNSUPPORTED);
-}
+// `writing_to_btrfs_is_refused_by_name` retired here (Pass G): its entire
+// premise — that the bridge refuses every btrfs write outright — is what
+// this pass changed on purpose. What remains true and is still covered,
+// by name, elsewhere in this file: a write into a subvolume is refused
+// (`writing_into_a_btrfs_subvolume_is_refused_by_name_not_miswritten`), a
+// duplicate name is refused as a conflict
+// (`a_btrfs_duplicate_name_is_refused_as_a_conflict_not_as_corruption`),
+// and the real 1 TB SSD stays refused by its own free-space-tree shape —
+// see `feature-btrfs-write.md` Fix 1 — which this small fixture cannot
+// exercise and is not this file's job to.
 
 #[test]
 fn two_threads_writing_through_one_volume_are_never_told_another_volume_has_it() {
@@ -607,4 +595,189 @@ fn a_file_deleted_through_the_bridge_is_gone_and_e2fsck_clean() {
             "delete_file through the bridge left the filesystem unclean:\n{text}"
         );
     }
+}
+
+// --- btrfs through the same bridge (Pass G) ---------------------------------
+
+/// A private btrfs copy, mirroring `scratch` for the ext4 fixture above.
+fn scratch_btrfs(test: &str) -> String {
+    let dst = std::env::temp_dir().join(format!("luks-jni-write-btrfs-{test}.img"));
+    std::fs::copy(fixture("disks/gpt-luks-btrfs.img"), &dst).expect("copy fixture");
+    dst.to_string_lossy().into_owned()
+}
+
+#[test]
+fn a_btrfs_file_written_through_the_bridge_is_readable_by_the_kernel() {
+    let Some(script) = tool("cat-in-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch_btrfs("kernel-read");
+    let content = b"written through the JNI bridge to btrfs\n";
+
+    let ino = {
+        let vol = unlock(&path);
+        vol.write_file("/", "from-the-bridge.txt", content)
+            .expect("write through the bridge")
+    };
+    // btrfs's own numbering starts well above the reserved range too — same
+    // shape of assertion as the ext4 test above, different floor.
+    assert!(ino >= 256, "objectid {ino} is in btrfs's reserved range");
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg("from-the-bridge.txt")
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run cat-in-image");
+
+    assert!(
+        out.status.success(),
+        "the kernel could not read back what the bridge wrote to btrfs:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, content,
+        "the kernel returned different bytes than the bridge wrote"
+    );
+}
+
+#[test]
+fn the_btrfs_filesystem_is_clean_after_the_bridge_writes() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch_btrfs("check");
+    {
+        let vol = unlock(&path);
+        vol.write_file("/", "checked.txt", b"graded by btrfs check + scrub\n")
+            .expect("write");
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "btrfs check was not clean after a write through the bridge:\n{text}"
+    );
+}
+
+#[test]
+fn the_btrfs_files_that_were_already_there_survive() {
+    let path = scratch_btrfs("survivors");
+
+    let before = {
+        let vol = unlock(&path);
+        let json = vol.list_dir_json("/").expect("list");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["entries"].as_array().unwrap().len()
+    };
+
+    {
+        let vol = unlock(&path);
+        vol.write_file("/", "newcomer.txt", b"newcomer\n").expect("write");
+    }
+
+    let vol = unlock(&path);
+    let json = vol.list_dir_json("/").expect("list");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let names: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+
+    assert!(
+        names.contains(&"newcomer.txt"),
+        "the written file is missing: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        before + 1,
+        "the directory gained or lost something other than the new file: {names:?}"
+    );
+    // proof.txt and sub/ predate this test and must still be exactly what
+    // they were — see bridge.rs's own read-side tests for their contents.
+    assert!(names.contains(&"proof.txt"), "{names:?}");
+    assert!(names.contains(&"sub"), "{names:?}");
+}
+
+#[test]
+fn a_btrfs_duplicate_name_is_refused_as_a_conflict_not_as_corruption() {
+    let path = scratch_btrfs("duplicate");
+    let vol = unlock(&path);
+
+    vol.write_file("/", "once.txt", b"first\n").expect("first write");
+    let err = vol
+        .write_file("/", "once.txt", b"second\n")
+        .expect_err("the second write must be refused");
+
+    assert_eq!(
+        error_code(&err),
+        code::ALREADY_EXISTS,
+        "a name collision reported code {} ({err})",
+        error_code(&err)
+    );
+}
+
+#[test]
+fn writing_into_a_btrfs_subvolume_is_refused_by_name_not_miswritten() {
+    // The engine refuses anything outside the default subvolume's FS_TREE
+    // (feature-btrfs-write.md) rather than writing into the wrong tree. `sub`
+    // is a real subvolume in this fixture (see bridge.rs's own
+    // `reads_across_a_subvolume_boundary_through_the_bridge`).
+    let path = scratch_btrfs("subvolume-refused");
+    let vol = unlock(&path);
+
+    let err = vol
+        .write_file("/sub", "should-not-land-here.txt", b"x")
+        .expect_err("a subvolume write must be refused, not silently misplaced");
+    assert_eq!(
+        error_code(&err),
+        code::UNSUPPORTED,
+        "wrong error for a subvolume write: {err}"
+    );
+}
+
+#[test]
+fn a_btrfs_write_correctly_claims_the_device_writer() {
+    // Same mechanism as the ext4 test above, proven fs-agnostic: the claim
+    // lives on `SharedDevice`, not inside either filesystem implementation.
+    let path = scratch_btrfs("writer-claim");
+    let len = std::fs::metadata(&path).expect("stat").len();
+    let dev = FileDevice::open_writable(&path, len).expect("open writable");
+    let handle =
+        DeviceHandle::new(dev, 512, len / 512, "TEST".into(), "IMAGE".into()).expect("scan");
+    let offset = handle
+        .table
+        .luks_partitions()
+        .next()
+        .expect("a LUKS partition")
+        .offset_bytes();
+
+    let first = handle.unlock(offset, PASSWORD).expect("first unlock");
+    let second = handle.unlock(offset, PASSWORD).expect("second unlock");
+
+    first.write_file("/", "from-first.txt", b"first\n").expect("first write");
+    let err = second
+        .write_file("/", "from-second.txt", b"second\n")
+        .expect_err("the second volume must not be allowed to write");
+    assert_eq!(error_code(&err), code::WRITER_BUSY);
+
+    second.list_dir_json("/").expect("the second volume must still read");
 }

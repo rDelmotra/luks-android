@@ -88,21 +88,22 @@ impl VolumeHandle {
         // One writer per *device*, not per volume.
         //
         // `nativeUnlock` can be called twice on one device handle, and nothing
-        // on the Kotlin side prevents it. Each call mounts its own `Ext4`,
-        // which caches the superblock's free counters and every group
-        // descriptor in memory. Two of those allocating against one disk do
-        // not see each other's bitmap updates: measured, two volumes each
-        // writing one small file left `e2fsck` reporting wrong free counts,
-        // and racing them produced two files owning the same ten blocks —
-        // the one kind of damage `e2fsck` cannot repair without deleting
-        // something.
+        // on the Kotlin side prevents it. Each call mounts its own filesystem
+        // state — ext4's superblock free counters and group descriptors, or
+        // btrfs's node cache — separately. Two of those allocating against one
+        // disk do not see each other's bookkeeping updates: measured on ext4,
+        // two volumes each writing one small file left `e2fsck` reporting
+        // wrong free counts, and racing them produced two files owning the
+        // same ten blocks — the one kind of damage `e2fsck` cannot repair
+        // without deleting something. Nothing about that argument is specific
+        // to ext4, so the same claim covers btrfs.
         //
         // A second *reader* is harmless and stays allowed: reads resolve
         // through the disk, and only allocation depends on the cached state.
         // So the claim is taken here, by the first write, rather than at
         // unlock — refusing a second unlock outright would break a UI that
         // re-prompts for a password without closing the first volume.
-        // Taken *under the filesystem lock*, and after the btrfs refusal below.
+        // Taken *under the filesystem lock*.
         //
         // Under the lock because the two-step "load, then compare_exchange"
         // raced with itself otherwise: two threads writing through the *same*
@@ -111,27 +112,39 @@ impl VolumeHandle {
         // a statement that was simply false. The `fs` mutex already serialises
         // the work these two threads came to do, so it serialises the claim
         // too, and the second one now sees the flag this one set.
-        //
-        // After the btrfs check because a volume that cannot be written must
-        // not walk away holding the device's only write claim until it is
-        // closed, locking out the ext4 volume that could have used it.
         let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            // Refused explicitly rather than by falling through to a missing
-            // method: btrfs on this volume is a live filesystem we can read
-            // and must not touch, and the caller deserves to be told which of
-            // the two it got.
-            return Err(LuksError::UnsupportedFsFeature(
-                "writing to btrfs — this volume can be read but not written".into(),
-            ));
-        };
-
         self.claim_writer()?;
 
-        let dir_ino = ext4.resolve(parent_path)?.number;
-        let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
-        ext4.flush()?;
-        Ok(ino)
+        match &mut *fs {
+            Fs::Ext4(ext4) => {
+                let dir_ino = ext4.resolve(parent_path)?.number;
+                let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
+                ext4.flush()?;
+                Ok(ino)
+            }
+            Fs::Btrfs(btrfs) => {
+                // Two core calls, not one, matching how the write engine
+                // itself is staged (Pass E creates the empty inode + dirent;
+                // Pass F allocates and writes the data extent). Root-directory
+                // and subdirectory writes only — anything outside the default
+                // subvolume's FS_TREE is refused inside `write_file_data`
+                // itself (feature-btrfs-write.md, "not doing this yet"), so
+                // there is nothing to duplicate here.
+                let full_path = if parent_path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{parent_path}/{name}")
+                };
+                btrfs.create_file(parent_path, name)?;
+                btrfs.write_file(&full_path, data)?;
+                // btrfs's own inode numbers are objectids, and this is the
+                // only way to learn the one `create_file` picked — its
+                // signature returns `()`, unlike ext4's `create_file`, which
+                // hands the number straight back.
+                let located = btrfs.resolve_no_follow(btrfs.fs_tree(), &full_path)?;
+                Ok(located.inode.objectid)
+            }
+        }
     }
 
     /// Delete a file by path from the encrypted volume.
