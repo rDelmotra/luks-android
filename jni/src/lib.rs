@@ -26,6 +26,44 @@ use jni::JNIEnv;
 
 use luks_core::error::LuksError;
 
+#[cfg(target_os = "android")]
+mod log {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    const ANDROID_LOG_DEBUG: c_int = 3;
+    const ANDROID_LOG_INFO: c_int = 4;
+    const ANDROID_LOG_WARN: c_int = 5;
+    const ANDROID_LOG_ERROR: c_int = 6;
+    const TAG: &[u8] = b"luks_native\0";
+
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    pub fn write(prio: c_int, msg: &str) {
+        if let Ok(c_msg) = CString::new(msg) {
+            unsafe {
+                __android_log_write(prio, TAG.as_ptr() as *const c_char, c_msg.as_ptr());
+            }
+        }
+    }
+
+    pub fn d(msg: &str) { write(ANDROID_LOG_DEBUG, msg); }
+    pub fn i(msg: &str) { write(ANDROID_LOG_INFO, msg); }
+    pub fn w(msg: &str) { write(ANDROID_LOG_WARN, msg); }
+    pub fn e(msg: &str) { write(ANDROID_LOG_ERROR, msg); }
+}
+
+#[cfg(not(target_os = "android"))]
+mod log {
+    pub fn d(_msg: &str) {}
+    pub fn i(_msg: &str) {}
+    pub fn w(_msg: &str) {}
+    pub fn e(_msg: &str) {}
+}
+
 const EXCEPTION_CLASS: &str = "dev/luksandroid/LuksException";
 
 /// What a failed entry point reports back to Java.
@@ -64,15 +102,18 @@ fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>
         Ok(Ok(value)) => value,
         Ok(Err(fail)) => {
             let (code, msg) = fail.parts();
+            log::e(&format!("guard failed [{}]: {}", code, msg));
             throw(env, code, &msg);
             default
         }
         Err(payload) => {
             let msg = panic_message(&payload);
+            let err_msg = format!("internal error (this is a bug): {msg}");
+            log::e(&format!("guard panicked: {}", err_msg));
             throw(
                 env,
                 bridge::code::PANIC,
-                &format!("internal error (this is a bug): {msg}"),
+                &err_msg,
             );
             default
         }
@@ -201,6 +242,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenDevice<'l>(
         let handle = unsafe {
             bridge::open_usb_device(fd, ep_in, ep_out, interface, max_transfer.max(0) as usize)
         }?;
+        log::i(&format!("nativeOpenDevice: opened fd={} ep_in={} ep_out={} interface={}", fd, ep_in, ep_out, interface));
         Ok(bridge::into_raw(bridge::Payload::Device(handle)))
     })
 }
@@ -214,6 +256,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseDevice<'l>(
     guard(&mut env, (), |_env| {
         // SAFETY: freeing a handle we minted. The magic tag makes a double close
         // or a wrong-type close a no-op rather than a corrupt free.
+        log::i("nativeCloseDevice");
         unsafe { bridge::drop_device(handle) };
         Ok(())
     })
@@ -227,6 +270,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseVolume<'l>(
 ) {
     guard(&mut env, (), |_env| {
         // SAFETY: as above. The master key inside is zeroed by `Secret::drop`.
+        log::i("nativeCloseVolume");
         unsafe { bridge::drop_volume(handle) };
         Ok(())
     })
@@ -292,7 +336,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
+        let start = std::time::Instant::now();
         let volume = dev.unlock(offset, slice)?;
+        log::i(&format!("nativeUnlock: volume unlocked in {} ms", start.elapsed().as_millis()));
         Ok(bridge::into_raw(bridge::Payload::Volume(volume)))
     })
 }
@@ -528,7 +574,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteFile<'l>(
         let bytes = env
             .convert_byte_array(&data)
             .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
+        let start = std::time::Instant::now();
         let ino = vol.write_file(&parent_path, &name, &bytes)?;
+        log::i(&format!("nativeWriteFile: wrote {} bytes in {} ms", bytes.len(), start.elapsed().as_millis()));
         Ok(ino as jlong)
     })
 }
@@ -620,9 +668,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
             .unwrap_or_else(|p| p.into_inner())
             .take()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        let start = std::time::Instant::now();
         let result = vol.finish_file(state, &parent_path, &name);
         unsafe { bridge::drop_writer(writer) };
-        Ok(result? as jlong)
+        let ino = result?;
+        log::i(&format!("nativeFinishFile: file finished in {} ms", start.elapsed().as_millis()));
+        Ok(ino as jlong)
     })
 }
 
@@ -660,6 +711,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDeleteFile<'l>(
         let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
         let path_str = jstr(env, &path)?;
         vol.delete_file(&path_str)?;
+        log::i("nativeDeleteFile: file deleted");
         Ok(())
     })
 }

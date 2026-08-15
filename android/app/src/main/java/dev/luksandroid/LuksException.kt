@@ -11,6 +11,21 @@ class LuksException(message: String, val code: Int) : Exception(message) {
 
     /** True when the user simply typed the wrong password, and can retry. */
     val isWrongPassword: Boolean get() = code == WRONG_PASSWORD
+    val isNotLuks: Boolean get() = code == NOT_LUKS
+    val isUnsupported: Boolean get() = code == UNSUPPORTED
+    val isCorrupt: Boolean get() = code == CORRUPT
+    val isNotFound: Boolean get() = code == NOT_FOUND
+    val isTransport: Boolean get() = code == TRANSPORT
+    val isNeedsFsck: Boolean get() = code == NEEDS_FSCK
+    val isIo: Boolean get() = code == IO
+    val isBadHandle: Boolean get() = code == BAD_HANDLE
+    val isPanic: Boolean get() = code == PANIC
+    val isNoSpace: Boolean get() = code == NO_SPACE
+    val isWrongTarget: Boolean get() = code == WRONG_TARGET
+    val isUnverifiableTarget: Boolean get() = code == UNVERIFIABLE_TARGET
+    val isAlreadyExists: Boolean get() = code == ALREADY_EXISTS
+    val isWriterBusy: Boolean get() = code == WRITER_BUSY
+    val isItemTooLarge: Boolean get() = code == ITEM_TOO_LARGE
 
     override fun toString(): String = "LuksException[$code] ${message.orEmpty()}"
 
