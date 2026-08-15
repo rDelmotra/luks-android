@@ -781,3 +781,52 @@ fn a_btrfs_write_correctly_claims_the_device_writer() {
 
     second.list_dir_json("/").expect("the second volume must still read");
 }
+
+#[test]
+fn a_btrfs_refused_duplicate_leaves_no_orphan_behind() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch_btrfs("orphan");
+    {
+        let vol = unlock(&path);
+        vol.write_file("/", "taken.txt", b"the first one\n")
+            .expect("first write");
+        let err = vol
+            .write_file("/", "taken.txt", b"the second one\n")
+            .expect_err("the duplicate must fail");
+        assert_eq!(error_code(&err), code::ALREADY_EXISTS);
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "a failed btrfs write left the filesystem unclean:\n{text}"
+    );
+}
+
+#[test]
+fn writing_into_nonexistent_directory_on_btrfs_is_refused() {
+    let path = scratch_btrfs("nonexistent-dir");
+    let vol = unlock(&path);
+
+    let err = vol
+        .write_file("/docs", "guide.txt", b"content")
+        .expect_err("writing into nonexistent directory must fail");
+    assert_eq!(error_code(&err), code::NOT_FOUND);
+}
+
+

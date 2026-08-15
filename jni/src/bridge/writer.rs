@@ -123,26 +123,11 @@ impl VolumeHandle {
                 Ok(ino)
             }
             Fs::Btrfs(btrfs) => {
-                // Two core calls, not one, matching how the write engine
-                // itself is staged (Pass E creates the empty inode + dirent;
-                // Pass F allocates and writes the data extent). Root-directory
-                // and subdirectory writes only — anything outside the default
-                // subvolume's FS_TREE is refused inside `write_file_data`
-                // itself (feature-btrfs-write.md, "not doing this yet"), so
-                // there is nothing to duplicate here.
-                let full_path = if parent_path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{parent_path}/{name}")
-                };
-                btrfs.create_file(parent_path, name)?;
-                btrfs.write_file(&full_path, data)?;
-                // btrfs's own inode numbers are objectids, and this is the
-                // only way to learn the one `create_file` picked — its
-                // signature returns `()`, unlike ext4's `create_file`, which
-                // hands the number straight back.
-                let located = btrfs.resolve_no_follow(btrfs.fs_tree(), &full_path)?;
-                Ok(located.inode.objectid)
+                // Now uses the single-transaction Phase 2 implementation,
+                // which guarantees atomicity: we either create the file AND write its data,
+                // or fail cleanly with no orphan file left behind.
+                let ino = btrfs.create_file_with_data(parent_path, name, data)?;
+                Ok(ino)
             }
         }
     }

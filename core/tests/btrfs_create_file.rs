@@ -30,12 +30,33 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Distinguishes two scratch images made in the same microsecond.
+///
+/// A timestamp alone is not unique here, and that is measured rather than
+/// assumed: `SystemTime::now()` on this host advances in **1 µs** steps (every
+/// sample is a multiple of 1000 ns, and 97% of back-to-back calls return the
+/// identical value). `cargo` starts a binary's tests as threads at effectively
+/// the same instant, so two of them calling `copy_to_temp("plain.img")` land in
+/// the same microsecond often enough to matter — 8 threads racing collided in
+/// 1 run out of 5.
+///
+/// Two tests that agree on a path both `fs::copy` to it, and the second copy
+/// **truncates the first's image while the first is using it**. That is the
+/// whole of issue #25: the "flaky" failures were `WrongWriteTarget { expected:
+/// 0 }`, `... it is smaller than that`, and `NotBtrfs([0, 0, ...])` — three
+/// faces of one file being re-copied underneath a running test, which is also
+/// why it always passed in isolation. `btrfs_data_write.rs` already had this
+/// counter and was the one btrfs suite never reported flaky.
+static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn copy_to_temp(src_name: &str) -> PathBuf {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dst = temp_dir.join(format!(
-        "btrfs-create-{src_name}-{}-{}",
+        "btrfs-create-{src_name}-{}-{}-{}",
         std::process::id(),
+        count,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -425,3 +446,118 @@ fn find_max_inode_survives_a_rightmost_leaf_full_of_orphan_items() {
 
     let _ = fs::remove_file(&temp_img);
 }
+
+#[test]
+fn create_file_with_data_in_root_directory_on_plain_img() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    let initial_gen = fs.superblock().generation;
+    let payload = b"Atomic single-transaction file creation with data payload!";
+
+    let ino = fs
+        .create_file_with_data("/", "atomic_root.txt", payload)
+        .expect("create file with data in root");
+
+    assert!(ino >= 256);
+    assert_eq!(fs.superblock().generation, initial_gen + 1);
+
+    // Verify content and metadata in single mount
+    let readback = fs.read_file("/atomic_root.txt").expect("read file");
+    assert_eq!(readback, payload);
+    let info = fs.file_info("/atomic_root.txt").expect("file info");
+    assert_eq!(info.size, payload.len() as u64);
+    assert_eq!(info.links, 1);
+
+    drop(fs);
+
+    // Verify persistence across remount
+    let dev_ro = FileDevice::open(&temp_img).expect("open ro");
+    let fs_ro = Btrfs::mount(dev_ro).expect("remount ro");
+    assert_eq!(fs_ro.superblock().generation, initial_gen + 1);
+    let readback_ro = fs_ro.read_file("/atomic_root.txt").expect("read file ro");
+    assert_eq!(readback_ro, payload);
+    drop(fs_ro);
+
+    // Grade with kernel oracle
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle failed on atomic create_file_with_data in root"
+    );
+}
+
+#[test]
+fn create_file_with_data_in_subdirectory_on_plain_img() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    let initial_gen = fs.superblock().generation;
+    let payload = b"Subdirectory atomic file write";
+
+    let ino = fs
+        .create_file_with_data("/docs", "atomic_sub.txt", payload)
+        .expect("create file with data in /docs");
+
+    assert!(ino >= 256);
+    assert_eq!(fs.superblock().generation, initial_gen + 1);
+
+    let readback = fs.read_file("/docs/atomic_sub.txt").expect("read file in /docs");
+    assert_eq!(readback, payload);
+
+    drop(fs);
+
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle failed on atomic create_file_with_data in subdir"
+    );
+}
+
+#[test]
+fn create_file_with_data_failure_leaves_no_orphan_file() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    let initial_gen = fs.superblock().generation;
+
+    // 1. First write succeeds
+    fs.create_file_with_data("/", "taken.txt", b"original content")
+        .expect("first create");
+    assert_eq!(fs.superblock().generation, initial_gen + 1);
+
+    // 2. Second write with same name fails with AlreadyExists
+    let res = fs.create_file_with_data("/", "taken.txt", b"duplicate content");
+    match res {
+        Err(LuksError::AlreadyExists(_)) => {}
+        other => panic!("expected AlreadyExists, got: {other:?}"),
+    }
+
+    // Generation must NOT advance on failed transaction
+    assert_eq!(fs.superblock().generation, initial_gen + 1);
+
+    // Content must still be the original content
+    let readback = fs.read_file("/taken.txt").expect("read taken.txt");
+    assert_eq!(readback, b"original content");
+
+    drop(fs);
+
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle failed on create_file_with_data collision rollback"
+    );
+}
+
