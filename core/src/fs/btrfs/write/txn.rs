@@ -927,7 +927,7 @@ impl Transaction {
     }
 }
 
-fn record_cow_result(
+pub(crate) fn record_cow_result(
     res: &CowResult,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
     blocks_to_remove: &mut Vec<(u64, u8)>,
@@ -981,7 +981,7 @@ fn record_cow_result(
 /// `INODE_ITEM_KEY` only would still be correct, just costs more steps when
 /// an inode's non-INODE_ITEM items (e.g. a later DIR_ITEM/EXTENT_DATA,
 /// type > 1) sort after it.
-fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>) -> Result<u64> {
+pub(crate) fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>) -> Result<u64> {
     const MAX_REAL_INODE_KEY: Key = Key {
         objectid: 0xFFFF_FFFF_FFFF_FEFF,
         item_type: u8::MAX,
@@ -1001,7 +1001,7 @@ fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>) -> Result<u64> {
     }
 }
 
-fn converge_and_finalize<D: ReadAt>(
+pub(crate) fn converge_and_finalize<D: ReadAt>(
     fs: &Btrfs<D>,
     new_generation: u64,
     new_fs_tree: TreeRoot,

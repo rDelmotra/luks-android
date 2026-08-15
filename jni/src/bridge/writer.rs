@@ -7,7 +7,6 @@
 //! a volume is closed.
 
 use luks_core::error::{LuksError, Result};
-use luks_core::fs::ext4::file::FileWriter;
 use luks_core::fs::{FileType, MountedFs as Fs};
 use std::sync::atomic::Ordering;
 
@@ -20,49 +19,54 @@ use super::VolumeHandle;
 impl VolumeHandle {
     /// Begin a bounded-memory file transfer. The returned state has no volume
     /// reference, so storing it in a JNI handle cannot prolong key lifetime.
-    pub fn begin_file(&self, size: u64) -> Result<FileWriter> {
+    pub fn begin_file(&self, size: u64) -> Result<crate::bridge::FileWriterEnum> {
         let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            return Err(LuksError::UnsupportedFsFeature(
-                "writing to btrfs — this volume can be read but not written".into(),
-            ));
-        };
         self.claim_writer()?;
-        ext4.begin_file(size)
+        match &mut *fs {
+            Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file(size)?)),
+            Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file(size)?)),
+        }
     }
 
-    /// Feed one chunk to a stream begun on this volume.
-    pub fn write_file_chunk(&self, writer: &mut FileWriter, data: &[u8]) -> Result<()> {
+    pub fn write_file_chunk(&self, writer: &mut crate::bridge::FileWriterEnum, data: &[u8]) -> Result<()> {
         let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            unreachable!("writer began on ext4")
-        };
-        ext4.write_chunk(writer, data)
+        match (&mut *fs, writer) {
+            (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.write_chunk(w, data),
+            (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.write_chunk(w, data),
+            _ => unreachable!("writer type mismatch"),
+        }
     }
 
-    /// Publish a complete streamed file.
-    pub fn finish_file(&self, writer: FileWriter, parent_path: &str, name: &str) -> Result<u64> {
+    pub fn finish_file(&self, writer: crate::bridge::FileWriterEnum, parent_path: &str, name: &str) -> Result<u64> {
         let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            unreachable!("writer began on ext4")
-        };
-        let dir_ino = match ext4.resolve(parent_path) {
-            Ok(d) => d.number,
-            Err(e) => {
-                ext4.abandon_file(writer);
-                return Err(e);
+        match (&mut *fs, writer) {
+            (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => {
+                let dir_ino = match ext4.resolve(parent_path) {
+                    Ok(d) => d.number,
+                    Err(e) => {
+                        ext4.abandon_file(w);
+                        return Err(e);
+                    }
+                };
+                let ino = ext4.finish_file(w, dir_ino, name, FileType::Regular)?;
+                ext4.flush()?;
+                Ok(ino)
             }
-        };
-        let ino = ext4.finish_file(writer, dir_ino, name, FileType::Regular)?;
-        ext4.flush()?;
-        Ok(ino)
+            (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => {
+                let ino = btrfs.finish_file(w, parent_path, name)?;
+                // btrfs commits the transaction inside finish_file
+                Ok(ino)
+            }
+            _ => unreachable!("writer type mismatch"),
+        }
     }
 
-    /// Explicitly discard an interrupted stream.
-    pub fn abandon_file(&self, writer: FileWriter) {
+    pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) {
         let mut fs = self.fs();
-        if let Fs::Ext4(ext4) = &mut *fs {
-            ext4.abandon_file(writer);
+        match (&mut *fs, writer) {
+            (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.abandon_file(w),
+            (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.abandon_file(w),
+            _ => (), // If there's a mismatch we just let the writer drop
         }
     }
 

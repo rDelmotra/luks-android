@@ -7,6 +7,7 @@ pub mod alloc;
 pub mod commit;
 pub mod cow;
 pub mod extent_tree;
+pub mod file;
 pub mod gate;
 pub mod node;
 pub mod txn;

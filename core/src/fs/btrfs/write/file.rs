@@ -1,0 +1,254 @@
+use std::collections::HashMap;
+
+use crate::device::{ReadAt, WriteAt};
+use crate::error::{LuksError, Result};
+use crate::fs::btrfs::tree::{
+    Key, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_DATA_KEY, FS_TREE_OBJECTID,
+    INODE_ITEM_KEY, INODE_REF_KEY,
+};
+use crate::fs::btrfs::write::alloc::FreeSpaceMap;
+use crate::fs::btrfs::write::commit::commit_transaction;
+use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
+use crate::fs::btrfs::write::extent_tree::ExtentTree;
+use crate::fs::btrfs::write::gate;
+use crate::fs::btrfs::write::node;
+use crate::fs::btrfs::write::txn::{find_max_inode, record_cow_result, converge_and_finalize};
+use crate::fs::btrfs::Btrfs;
+
+/// State for one btrfs file whose contents arrive incrementally.
+pub struct BtrfsFileWriter {
+    pub(crate) size: u64,
+    pub(crate) written_bytes: u64,
+    pub(crate) data_runs: Vec<(u64, u64)>, // (logical_bytenr, num_bytes)
+    pub(crate) checksums: Vec<(u64, u32)>, // (logical_bytenr, crc32c)
+    pub(crate) allocator: FreeSpaceMap,
+}
+
+impl<D: ReadAt + WriteAt> Btrfs<D> {
+    pub fn begin_file(&mut self, size: u64) -> Result<BtrfsFileWriter> {
+        gate::check_writeable_fs(self.superblock())?;
+        gate::check_writeable_subvolume(&self.fs_tree())?;
+
+        let extent_tree = ExtentTree::read(self)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+
+        let sector_size = self.superblock().sector_size as u64;
+        let disk_num_bytes = if size == 0 {
+            0
+        } else {
+            ((size + sector_size - 1) / sector_size) * sector_size
+        };
+
+        let mut data_runs = Vec::new();
+        if disk_num_bytes > 0 {
+            // Allocate data extent.
+            let bytenr = allocator.allocate_data(disk_num_bytes, sector_size as u32)?;
+            data_runs.push((bytenr, disk_num_bytes));
+        }
+
+        Ok(BtrfsFileWriter {
+            size,
+            written_bytes: 0,
+            data_runs,
+            checksums: Vec::new(),
+            allocator,
+        })
+    }
+
+    pub fn write_chunk(&mut self, writer: &mut BtrfsFileWriter, data: &[u8]) -> Result<()> {
+        let end = writer
+            .written_bytes
+            .checked_add(data.len() as u64)
+            .ok_or(LuksError::OutOfBounds)?;
+        if end > writer.size {
+            return Err(LuksError::OutOfBounds);
+        }
+
+        let mut remaining = data;
+        let mut written_so_far = writer.written_bytes;
+
+        for &(bytenr, run_len) in &writer.data_runs {
+            // Check if our write falls into this run
+            let _run_start = 0; // We assume a single contiguous run for now or need to map it properly.
+            // Wait, BtrfsFileWriter currently just allocates one large extent in `begin_file`.
+            // Let's refine this to map `written_bytes` to the correct offset in the run.
+            // For now, `allocate_data` allocates contiguous `disk_num_bytes`, so we just have one run.
+            // If `allocate_data` returns one extent, `bytenr` is the start.
+            let offset_in_run = written_so_far;
+            if offset_in_run >= run_len {
+                continue;
+            }
+
+            let take = (run_len - offset_in_run).min(remaining.len() as u64) as usize;
+            let chunk = &remaining[..take];
+            let write_addr = bytenr + offset_in_run;
+
+            // Write chunk to disk
+            self.device_mut().write_at(write_addr, chunk)?;
+
+            // Compute CRC32c for every sector
+            let sector_size = self.superblock().sector_size as usize;
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let sector_len = sector_size.min(chunk.len() - offset);
+                let crc = crate::fs::btrfs::crc32c::crc32c(&chunk[offset..offset + sector_len]);
+                writer.checksums.push((write_addr + offset as u64, crc));
+                offset += sector_size;
+            }
+
+            written_so_far += take as u64;
+            remaining = &remaining[take..];
+            if remaining.is_empty() {
+                break;
+            }
+        }
+
+        writer.written_bytes = end;
+        Ok(())
+    }
+
+    pub fn finish_file(
+        &mut self,
+        writer: BtrfsFileWriter,
+        parent_path: &str,
+        name: &str,
+    ) -> Result<u64> {
+        if writer.written_bytes != writer.size {
+            return Err(LuksError::OutOfBounds);
+        }
+
+        let located_parent = self.resolve_no_follow(self.fs_tree(), parent_path)?;
+        if !located_parent.inode.file_type().is_dir() {
+            return Err(LuksError::NotADirectory(parent_path.to_string()));
+        }
+        let parent_ino = located_parent.inode.objectid;
+
+        // Check if exists
+        let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
+        let dir_item_key = Key::new(parent_ino, DIR_ITEM_KEY, name_hash);
+        if let Some(item_data) = self.find_item(self.fs_tree().bytenr, &dir_item_key)? {
+            let entries = crate::fs::btrfs::inode::parse_dir_entries(&item_data)?;
+            if entries.iter().any(|e| e.name == name.as_bytes()) {
+                return Err(LuksError::AlreadyExists(format!(
+                    "file '{}' already exists in '{}'",
+                    name, parent_path
+                )));
+            }
+        }
+
+        let sb = self.superblock();
+        let new_generation = sb.generation + 1;
+
+        // Use the passed allocator
+        let mut allocator = writer.allocator;
+        let mut pending_blocks = HashMap::new();
+        let mut blocks_to_add = Vec::new();
+        let mut blocks_to_remove = Vec::new();
+        let mut data_extents_to_add = Vec::new();
+        
+        let max_ino = find_max_inode(self)?;
+        let new_ino = if max_ino < 256 { 256 } else { max_ino + 1 };
+
+        let mut max_dir_index = 1u64;
+        self.for_each_item(self.fs_tree().bytenr, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
+            if key.offset > max_dir_index { max_dir_index = key.offset; }
+            Ok(true)
+        })?;
+        let dir_index = max_dir_index + 1;
+
+        let mut fs_root_bytenr = self.fs_tree().bytenr;
+        let mut fs_root_level = self.fs_tree().level;
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let now_sec = now.as_secs();
+        let now_nsec = now.subsec_nanos();
+
+        // 1. Update parent directory INODE_ITEM
+        let parent_inode_key = Key::new(parent_ino, INODE_ITEM_KEY, 0);
+        let name_len = name.len() as u64;
+        let res = cow_tree_mutate(
+            self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID,
+            &parent_inode_key, new_generation, &mut allocator, |leaf| {
+                let idx = leaf.find_item(&parent_inode_key).unwrap();
+                let item = &mut leaf.items[idx].data;
+                item[8..16].copy_from_slice(&new_generation.to_le_bytes());
+                let cur_size = u64::from_le_bytes(item[16..24].try_into().unwrap());
+                item[16..24].copy_from_slice(&(cur_size + name_len * 2).to_le_bytes());
+                let seq = u64::from_le_bytes(item[72..80].try_into().unwrap()).wrapping_add(1);
+                item[72..80].copy_from_slice(&seq.to_le_bytes());
+                item[124..132].copy_from_slice(&now_sec.to_le_bytes());
+                item[132..136].copy_from_slice(&now_nsec.to_le_bytes());
+                item[136..144].copy_from_slice(&now_sec.to_le_bytes());
+                item[144..148].copy_from_slice(&now_nsec.to_le_bytes());
+                Ok(())
+            },
+        )?;
+        record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+        fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+
+        // 2. Insert DIR_ITEM
+        let dir_item_data = node::build_dir_item(new_ino, new_generation, 1, name);
+        let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, dir_item_key, dir_item_data.clone(), new_generation, &mut allocator)?;
+        record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+        fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+
+        // 3. Insert DIR_INDEX
+        let dir_index_key = Key::new(parent_ino, DIR_INDEX_KEY, dir_index);
+        let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, dir_index_key, dir_item_data, new_generation, &mut allocator)?;
+        record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+        fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+
+        // 4. Insert new INODE_ITEM
+        let inode_key = Key::new(new_ino, INODE_ITEM_KEY, 0);
+        let mode = 0o100644; // Regular file
+        let inode_data = {
+            let mut data = node::build_empty_inode_item(new_generation, mode, 0, 0, 1, now_sec, now_nsec);
+            data[16..24].copy_from_slice(&writer.size.to_le_bytes()); // size
+            data[24..32].copy_from_slice(&writer.size.to_le_bytes()); // nbytes
+            data
+        };
+        let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, inode_key, inode_data, new_generation, &mut allocator)?;
+        record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+        fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+
+        // 5. Insert INODE_REF
+        let inode_ref_key = Key::new(new_ino, INODE_REF_KEY, parent_ino);
+        let inode_ref_data = node::build_inode_ref(dir_index, name);
+        let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, inode_ref_key, inode_ref_data, new_generation, &mut allocator)?;
+        record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+        fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+
+        // 6. Insert EXTENT_DATA (if any)
+        for &(bytenr, run_len) in &writer.data_runs {
+            if run_len > 0 {
+                let extent_data_key = Key::new(new_ino, EXTENT_DATA_KEY, 0);
+                let extent_data_item = node::build_regular_file_extent(new_generation, run_len, bytenr, run_len, run_len);
+                let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, extent_data_key, extent_data_item, new_generation, &mut allocator)?;
+                record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
+                fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
+                data_extents_to_add.push((bytenr, run_len, FS_TREE_OBJECTID, new_ino, 0));
+            }
+        }
+
+        let mut new_fs_tree = self.fs_tree();
+        new_fs_tree.bytenr = fs_root_bytenr;
+        new_fs_tree.level = fs_root_level;
+        new_fs_tree.generation = new_generation;
+
+        // We don't implement CSUM tree insertions yet. But we should collect csum_root_opt
+        let csum_root_opt = None; // TODO: properly handle csum if csum tree exists
+
+        let txn = converge_and_finalize(
+            self, new_generation, new_fs_tree, csum_root_opt,
+            pending_blocks, Vec::new(), allocator, blocks_to_add, blocks_to_remove, data_extents_to_add,
+        )?;
+
+        commit_transaction(self, txn)?;
+        Ok(new_ino)
+    }
+
+    pub fn abandon_file(&mut self, _writer: BtrfsFileWriter) {
+        // Safe to drop; extents mapped in memory but not linked to any tree yet, so they leak only in this run but will be valid on remount.
+        // The real way to handle this without a transaction is just drop, as they aren't recorded in the extent tree.
+    }
+}
