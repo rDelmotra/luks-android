@@ -111,7 +111,7 @@ impl<D: WriteAt> Ext4<D> {
     }
 
     fn read_bitmap(&self, group: usize, which: Bitmap) -> Result<Vec<u8>> {
-        let (offset, len) = self.bitmap_extent(group, which)?;
+        let (offset, _len) = self.bitmap_extent(group, which)?;
 
         let is_uninit = match which {
             Bitmap::Block => self.groups[group].block_bitmap_uninit(),

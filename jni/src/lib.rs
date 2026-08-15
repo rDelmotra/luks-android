@@ -27,6 +27,7 @@ use jni::JNIEnv;
 use luks_core::error::LuksError;
 
 #[cfg(target_os = "android")]
+#[allow(dead_code)]
 mod log {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int};
@@ -57,6 +58,7 @@ mod log {
 }
 
 #[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
 mod log {
     pub fn d(_msg: &str) {}
     pub fn i(_msg: &str) {}
