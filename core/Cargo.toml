@@ -70,3 +70,7 @@ dangerous-write-support = []
 [[example]]
 name = "write_btrfs_to_drive"
 required-features = ["dangerous-write-support"]
+
+[[example]]
+name = "space_probe"
+required-features = ["dangerous-write-support"]
