@@ -38,7 +38,7 @@ pub mod tree;
 #[cfg(feature = "dangerous-write-support")]
 pub mod write;
 
-pub use chunk::{Chunk, ChunkMap};
+pub use chunk::{Chunk, ChunkMap, DevExtent, Stripe};
 pub use csum::Verified;
 pub use cursor::Cursor;
 pub use dir::Located;
@@ -340,6 +340,12 @@ impl<D: ReadAt> Btrfs<D> {
 
     pub fn fsid(&self) -> [u8; 16] {
         self.sb.fsid
+    }
+
+    /// Chunk tree UUID from the chunk tree root node.
+    pub fn chunk_tree_uuid(&self) -> Result<[u8; 16]> {
+        let node = self.read_node(self.sb.chunk_root)?;
+        Ok(node.chunk_tree_uuid())
     }
 
     pub fn sector_size(&self) -> u32 {

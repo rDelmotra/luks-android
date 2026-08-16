@@ -110,16 +110,16 @@ mod tests {
         let chunk = Chunk {
             logical: 30_408_704,
             length: 268_435_456,
+            owner: 2,
+            stripe_len: 65536,
             chunk_type: BLOCK_GROUP_METADATA | BLOCK_GROUP_DUP,
+            io_align: 65536,
+            io_width: 65536,
+            sector_size: 4096,
+            sub_stripes: 1,
             stripes: vec![
-                Stripe {
-                    devid: 1,
-                    offset: 38_797_312,
-                },
-                Stripe {
-                    devid: 1,
-                    offset: 307_232_768,
-                },
+                Stripe::new(1, 38_797_312, [0; 16]),
+                Stripe::new(1, 307_232_768, [0; 16]),
             ],
         };
 
@@ -138,15 +138,7 @@ mod tests {
         // Leading case excludes [0, 65536).
         // Mirror 0 (65536) falls at offset 65536 in stripe 0 -> logical 65536..131072.
         // Merged exclusion: 0..131072.
-        let chunk = Chunk {
-            logical: 0,
-            length: 8_388_608,
-            chunk_type: BLOCK_GROUP_DATA,
-            stripes: vec![Stripe {
-                devid: 1,
-                offset: 0,
-            }],
-        };
+        let chunk = Chunk::new_single(0, 8_388_608, BLOCK_GROUP_DATA, 1, 0, [0; 16]);
 
         let mut map = ChunkMap::default();
         map.insert(chunk);
@@ -163,15 +155,14 @@ mod tests {
         // Stripe physical: 274_877_000_000.
         // Offset in stripe: 274877906944 - 274877000000 = 906944.
         // Excluded logical: (1_000_000_000 + 906944)..(1_000_000_000 + 906944 + 65536).
-        let chunk = Chunk {
-            logical: 1_000_000_000,
-            length: 1_073_741_824,
-            chunk_type: BLOCK_GROUP_DATA,
-            stripes: vec![Stripe {
-                devid: 1,
-                offset: 274_877_000_000,
-            }],
-        };
+        let chunk = Chunk::new_single(
+            1_000_000_000,
+            1_073_741_824,
+            BLOCK_GROUP_DATA,
+            1,
+            274_877_000_000,
+            [0; 16],
+        );
 
         let mut map = ChunkMap::default();
         map.insert(chunk);
@@ -189,15 +180,14 @@ mod tests {
         // Chunk logical: 10_000_000, chunk end: 10_065_536.
         // Logical start: 10_032_768. Logical start + 65536 = 10_098_304 > chunk end.
         // Clamped excluded range: 10_032_768..10_065_536 (32 KiB).
-        let chunk = Chunk {
-            logical: 10_000_000,
-            length: 65_536,
-            chunk_type: BLOCK_GROUP_DATA,
-            stripes: vec![Stripe {
-                devid: 1,
-                offset: 67_076_096,
-            }],
-        };
+        let chunk = Chunk::new_single(
+            10_000_000,
+            65_536,
+            BLOCK_GROUP_DATA,
+            1,
+            67_076_096,
+            [0; 16],
+        );
 
         let mut map = ChunkMap::default();
         map.insert(chunk);
@@ -211,15 +201,14 @@ mod tests {
     #[test]
     fn test_no_mirrors_in_stripes() {
         // Chunk far away from any mirror (e.g. physical 10_000_000..18_388_608, logical 500_000_000).
-        let chunk = Chunk {
-            logical: 500_000_000,
-            length: 8_388_608,
-            chunk_type: BLOCK_GROUP_DATA,
-            stripes: vec![Stripe {
-                devid: 1,
-                offset: 10_000_000,
-            }],
-        };
+        let chunk = Chunk::new_single(
+            500_000_000,
+            8_388_608,
+            BLOCK_GROUP_DATA,
+            1,
+            10_000_000,
+            [0; 16],
+        );
 
         let mut map = ChunkMap::default();
         map.insert(chunk);
