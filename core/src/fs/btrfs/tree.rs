@@ -51,6 +51,7 @@ pub const SHARED_DATA_REF_KEY: u8 = 184;
 pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
 pub const FREE_SPACE_INFO_KEY: u8 = 198;
 pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
+pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
 pub const DEV_EXTENT_KEY: u8 = 204;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
@@ -83,6 +84,7 @@ pub fn item_type_name(item_type: u8) -> &'static str {
         BLOCK_GROUP_ITEM_KEY => "block group item",
         FREE_SPACE_INFO_KEY => "free space info",
         FREE_SPACE_EXTENT_KEY => "free space extent",
+        FREE_SPACE_BITMAP_KEY => "free space bitmap",
         DEV_EXTENT_KEY => "device extent",
         DEV_ITEM_KEY => "device item",
         CHUNK_ITEM_KEY => "chunk item",

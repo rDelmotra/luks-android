@@ -75,7 +75,7 @@ pub fn cow_tree_insert<D: ReadAt>(
         // The root itself split! We must create a new interior root node at level root_level + 1
         let sb = fs.superblock();
         let new_root_level = root_level + 1;
-        let new_root_bytenr = allocator.allocate_metadata(sb.node_size)?;
+        let new_root_bytenr = allocator.allocate_metadata_for_owner(sb.node_size, owner)?;
         allocated.push((new_root_bytenr, new_root_level));
 
         let root_node = read_node(fs, pending, root_bytenr)?;
@@ -230,7 +230,7 @@ fn cow_descend_insert<D: ReadAt>(
             let target_bytenr = if is_already_new {
                 bytenr
             } else {
-                let b = allocator.allocate_metadata(node_size)?;
+                let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                 allocated.push((b, 0));
                 freed.push((bytenr, 0));
                 b
@@ -279,13 +279,13 @@ fn cow_descend_insert<D: ReadAt>(
                     if is_already_new {
                         bytenr
                     } else {
-                        let b = allocator.allocate_metadata(node_size)?;
+                        let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                         allocated.push((b, 0));
                         freed.push((bytenr, 0));
                         b
                     }
                 } else {
-                    let b = allocator.allocate_metadata(node_size)?;
+                    let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                     allocated.push((b, 0));
                     b
                 };
@@ -368,7 +368,7 @@ fn cow_descend_insert<D: ReadAt>(
                 let target_bytenr = if is_already_new {
                     bytenr
                 } else {
-                    let b = allocator.allocate_metadata(node_size)?;
+                    let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                     allocated.push((b, level));
                     freed.push((bytenr, level));
                     b
@@ -385,7 +385,7 @@ fn cow_descend_insert<D: ReadAt>(
                 Ok((target_bytenr, first_key, Vec::new(), emitted_blocks))
             } else {
                 // Interior node is full: split interior node
-                let right_int_bytenr = allocator.allocate_metadata(node_size)?;
+                let right_int_bytenr = allocator.allocate_metadata_for_owner(node_size, owner)?;
                 allocated.push((right_int_bytenr, level));
 
                 let (mut left_int, mut right_int, pivot_key) = interior.split(right_int_bytenr)?;
@@ -393,7 +393,7 @@ fn cow_descend_insert<D: ReadAt>(
                 let left_target_bytenr = if is_already_new {
                     bytenr
                 } else {
-                    let b = allocator.allocate_metadata(node_size)?;
+                    let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                     allocated.push((b, level));
                     freed.push((bytenr, level));
                     b
@@ -426,7 +426,7 @@ fn cow_descend_insert<D: ReadAt>(
             let target_bytenr = if is_already_new {
                 bytenr
             } else {
-                let b = allocator.allocate_metadata(node_size)?;
+                let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
                 allocated.push((b, level));
                 freed.push((bytenr, level));
                 b
@@ -519,7 +519,7 @@ where
         let target_bytenr = if is_already_new {
             bytenr
         } else {
-            let b = allocator.allocate_metadata(node_size)?;
+            let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
             allocated.push((b, 0));
             freed.push((bytenr, 0));
             b
@@ -562,7 +562,7 @@ where
         let target_bytenr = if is_already_new {
             bytenr
         } else {
-            let b = allocator.allocate_metadata(node_size)?;
+            let b = allocator.allocate_metadata_for_owner(node_size, owner)?;
             allocated.push((b, level));
             freed.push((bytenr, level));
             b

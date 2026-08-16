@@ -8,10 +8,22 @@
 //!
 //! Also provides [`read_dev_extents`] to retrieve existing physical extents from DEV_TREE.
 
+use std::collections::HashMap;
+
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::chunk::{ChunkMap, DevExtent};
-use crate::fs::btrfs::tree::{DEV_EXTENT_KEY, DEV_TREE_OBJECTID};
+use crate::fs::btrfs::chunk::{Chunk, ChunkMap, DevExtent, BLOCK_GROUP_DATA};
+use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
+use crate::fs::btrfs::tree::{
+    Key, CHUNK_TREE_OBJECTID, DEV_EXTENT_KEY, DEV_ITEMS_OBJECTID, DEV_ITEM_KEY, DEV_TREE_OBJECTID,
+    EXTENT_TREE_OBJECTID, FIRST_CHUNK_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID,
+};
+use crate::fs::btrfs::write::alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
+use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
+use crate::fs::btrfs::write::exclude::compute_sb_exclusions;
+use crate::fs::btrfs::write::extent_tree::{BlockGroupItem, ExtentTree};
+use crate::fs::btrfs::write::gate;
+use crate::fs::btrfs::write::txn::{converge_and_finalize, record_cow_result, Transaction};
 use crate::fs::btrfs::Btrfs;
 
 /// 64 KiB alignment / minimum stripe boundary.
@@ -148,6 +160,254 @@ pub fn read_dev_extents<D: ReadAt>(fs: &Btrfs<D>, devid: u64) -> Result<Vec<(u64
 
     extents.sort_by_key(|(offset, _)| *offset);
     Ok(extents)
+}
+
+/// Prepare the in-memory CoW transaction to allocate a new single DATA chunk.
+///
+/// Implements §7 steps 4-10:
+/// 1. Runs refusal gates (§8).
+/// 2. Executes read-only search algorithms (§7 steps 1-3) to find next logical address,
+///    decide chunk size, and find a physical hole on the device.
+/// 3. CoW mutates `DEV_TREE` (Root 4) to insert `DEV_EXTENT`.
+/// 4. CoW mutates `CHUNK_TREE` (Root 3) to increment `DEV_ITEM.bytes_used` and insert `CHUNK_ITEM`.
+/// 5. CoW mutates `EXTENT_TREE` (Root 2) to insert `BLOCK_GROUP_ITEM`.
+/// 6. Seeds `FreeSpaceMap` with the new block group and recomputes superblock mirror exclusions.
+/// 7. Calls `converge_and_finalize` to update root tree & extent tree.
+///
+/// Returns `Ok((Transaction, Chunk))`.
+pub fn allocate_data_chunk_transaction<D: ReadAt>(
+    fs: &Btrfs<D>,
+) -> Result<(Transaction, Chunk)> {
+    // 1. Refusal gates (§8)
+    gate::check_writeable_fs(fs.superblock())?;
+    gate::check_chunk_allocation_profile(BLOCK_GROUP_DATA)?;
+    gate::check_free_space_tree_no_bitmaps(fs)?;
+    let sb = fs.superblock();
+    if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
+        if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+            gate::check_free_space_tree_shape(&fst_root)?;
+        }
+    }
+
+    // 2. Search (§7 steps 1-3)
+    let logical = next_logical(fs.chunk_map());
+    let devid = sb.dev_id;
+    let dev_extents = read_dev_extents(fs, devid)?;
+    let decided_size = decide_data_chunk_size(sb.total_bytes);
+    let (physical, alloc_len) = find_free_dev_extent(
+        &dev_extents,
+        sb.total_bytes,
+        decided_size,
+        MIN_STRIPE_SIZE_FLOOR,
+    )?;
+
+    if alloc_len < MIN_STRIPE_SIZE_FLOOR {
+        return Err(LuksError::FilesystemFull);
+    }
+
+    let chunk_tree_uuid = fs.chunk_tree_uuid()?;
+    let dev_uuid = fs
+        .chunk_map()
+        .chunks()
+        .iter()
+        .find_map(|c| c.stripes.iter().find(|s| s.devid == devid).map(|s| s.dev_uuid))
+        .ok_or_else(|| LuksError::CorruptFs("no existing chunk found for device id"))?;
+
+    let new_chunk = Chunk::new_single(
+        logical,
+        alloc_len,
+        BLOCK_GROUP_DATA,
+        devid,
+        physical,
+        dev_uuid,
+    );
+
+    let new_generation = sb.generation + 1;
+    let extent_tree = ExtentTree::read(fs)?;
+    let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
+    let mut pending_blocks = HashMap::new();
+    let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
+    let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+
+    // 3. DEV_TREE (Root 4): insert DEV_EXTENT
+    let dev_tree = fs.tree_root(DEV_TREE_OBJECTID)?;
+    let mut dev_tree_bytenr = dev_tree.bytenr;
+    let mut dev_tree_level = dev_tree.level;
+
+    let dev_extent = DevExtent::new(devid, physical, logical, alloc_len, chunk_tree_uuid);
+    let (dev_ext_key, dev_ext_payload) = dev_extent.emit();
+    let dev_res = cow_tree_insert(
+        fs,
+        &pending_blocks,
+        dev_tree_bytenr,
+        dev_tree_level,
+        DEV_TREE_OBJECTID,
+        dev_ext_key,
+        dev_ext_payload,
+        new_generation,
+        &mut allocator,
+    )?;
+    record_cow_result(
+        &dev_res,
+        &mut blocks_to_add,
+        &mut blocks_to_remove,
+        &mut allocator,
+        &mut pending_blocks,
+        sb.node_size,
+        DEV_TREE_OBJECTID,
+    )?;
+    dev_tree_bytenr = dev_res.new_root_bytenr;
+    dev_tree_level = dev_res.new_root_level;
+
+    // 4. CHUNK_TREE (Root 3):
+    let mut chunk_root_bytenr = sb.chunk_root;
+    let mut chunk_root_level = sb.chunk_root_level;
+
+    // 4a. Update DEV_ITEM in CHUNK_TREE: bytes_used += alloc_len
+    let dev_item_key = Key::new(DEV_ITEMS_OBJECTID, DEV_ITEM_KEY, devid);
+    let chunk_res1 = cow_tree_mutate(
+        fs,
+        &pending_blocks,
+        chunk_root_bytenr,
+        chunk_root_level,
+        CHUNK_TREE_OBJECTID,
+        &dev_item_key,
+        new_generation,
+        &mut allocator,
+        |leaf| {
+            let idx = leaf
+                .find_item(&dev_item_key)
+                .ok_or_else(|| LuksError::NotFound("dev item not found in chunk tree".into()))?;
+            let data = &mut leaf.items[idx].data;
+            if data.len() < 24 {
+                return Err(LuksError::CorruptFs("dev item truncated"));
+            }
+            let cur_used = u64::from_le_bytes(data[0x10..0x18].try_into().unwrap());
+            let new_used = cur_used
+                .checked_add(alloc_len)
+                .ok_or(LuksError::CorruptFs("dev item bytes_used overflow"))?;
+            data[0x10..0x18].copy_from_slice(&new_used.to_le_bytes());
+            Ok(())
+        },
+    )?;
+    record_cow_result(
+        &chunk_res1,
+        &mut blocks_to_add,
+        &mut blocks_to_remove,
+        &mut allocator,
+        &mut pending_blocks,
+        sb.node_size,
+        CHUNK_TREE_OBJECTID,
+    )?;
+    chunk_root_bytenr = chunk_res1.new_root_bytenr;
+    chunk_root_level = chunk_res1.new_root_level;
+
+    // 4b. Insert CHUNK_ITEM in CHUNK_TREE
+    let (chunk_key, chunk_payload) = new_chunk.emit();
+    let chunk_res2 = cow_tree_insert(
+        fs,
+        &pending_blocks,
+        chunk_root_bytenr,
+        chunk_root_level,
+        CHUNK_TREE_OBJECTID,
+        chunk_key,
+        chunk_payload,
+        new_generation,
+        &mut allocator,
+    )?;
+    record_cow_result(
+        &chunk_res2,
+        &mut blocks_to_add,
+        &mut blocks_to_remove,
+        &mut allocator,
+        &mut pending_blocks,
+        sb.node_size,
+        CHUNK_TREE_OBJECTID,
+    )?;
+    chunk_root_bytenr = chunk_res2.new_root_bytenr;
+    chunk_root_level = chunk_res2.new_root_level;
+
+    // 5. EXTENT_TREE (Root 2): insert BLOCK_GROUP_ITEM
+    let extent_root = fs.tree_root(EXTENT_TREE_OBJECTID)?;
+    let mut extent_root_bytenr = extent_root.bytenr;
+    let mut extent_root_level = extent_root.level;
+
+    let chunk_objectid = extent_tree
+        .block_groups
+        .first()
+        .map(|bg| bg.chunk_objectid)
+        .unwrap_or(FIRST_CHUNK_TREE_OBJECTID);
+
+    let new_bg_item = BlockGroupItem {
+        start: logical,
+        length: alloc_len,
+        used: 0,
+        chunk_objectid,
+        flags: BLOCK_GROUP_DATA,
+    };
+    let (bg_key, bg_payload) = new_bg_item.emit();
+    let ext_res = cow_tree_insert(
+        fs,
+        &pending_blocks,
+        extent_root_bytenr,
+        extent_root_level,
+        EXTENT_TREE_OBJECTID,
+        bg_key,
+        bg_payload,
+        new_generation,
+        &mut allocator,
+    )?;
+    record_cow_result(
+        &ext_res,
+        &mut blocks_to_add,
+        &mut blocks_to_remove,
+        &mut allocator,
+        &mut pending_blocks,
+        sb.node_size,
+        EXTENT_TREE_OBJECTID,
+    )?;
+    extent_root_bytenr = ext_res.new_root_bytenr;
+    extent_root_level = ext_res.new_root_level;
+
+    // 6. FreeSpaceMap seeding and exclusion calculation (§2.7, §3.3)
+    let new_bg_free = BlockGroupFreeSpace {
+        block_group: new_bg_item,
+        allocated_extents: Vec::new(),
+        free_ranges: vec![FreeRange {
+            start: logical,
+            length: alloc_len,
+        }],
+        pinned_freed: Vec::new(),
+        excluded_ranges: Vec::new(),
+        total_allocated_bytes: 0,
+        total_free_bytes: alloc_len,
+    };
+    allocator.block_groups.push(new_bg_free);
+
+    let mut temp_chunk_map = fs.chunk_map().clone();
+    temp_chunk_map.insert(new_chunk.clone());
+    let exclusions = compute_sb_exclusions(&temp_chunk_map);
+    allocator.exclude_ranges(&exclusions);
+
+    // 7. Converge and finalize transaction
+    let txn = converge_and_finalize(
+        fs,
+        new_generation,
+        fs.fs_tree(),
+        None,
+        Some((dev_tree_bytenr, dev_tree_level)),
+        Some((chunk_root_bytenr, chunk_root_level)),
+        Some((extent_root_bytenr, extent_root_level)),
+        pending_blocks,
+        Vec::new(),
+        allocator,
+        blocks_to_add,
+        blocks_to_remove,
+        Vec::new(),
+        Vec::new(),
+    )?;
+
+    Ok((txn, new_chunk))
 }
 
 #[cfg(test)]

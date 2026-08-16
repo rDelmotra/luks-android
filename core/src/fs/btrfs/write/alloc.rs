@@ -232,22 +232,27 @@ impl FreeSpaceMap {
         None
     }
 
-    /// Allocate a metadata block of `size` bytes.
+    /// Allocate a metadata block of `size` bytes for the tree with the given `owner` objectid.
     ///
-    /// Finds a metadata (or mixed data/metadata) block group with sufficient space,
-    /// carves out the range, updates the free space accounting, and returns the
-    /// logical start address.
-    pub fn allocate_metadata(&mut self, size: u32) -> Result<u64> {
+    /// For `CHUNK_TREE_OBJECTID` (3), allocates from a SYSTEM block group so that the chunk
+    /// tree remains addressable via `sys_chunk_array` at mount time.
+    /// For all other trees, allocates from a METADATA (or MIXED) block group.
+    pub fn allocate_metadata_for_owner(&mut self, size: u32, owner: u64) -> Result<u64> {
         let needed = size as u64;
         let alignment = size as u64;
+        let target_flag = if owner == crate::fs::btrfs::tree::CHUNK_TREE_OBJECTID {
+            crate::fs::btrfs::chunk::BLOCK_GROUP_SYSTEM
+        } else {
+            crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA
+        };
 
         for bg in &mut self.block_groups {
-            // Check for metadata or mixed block group
-            let is_metadata = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA != 0)
+            let is_match = (bg.block_group.flags & target_flag != 0)
                 || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
-                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                    && target_flag == crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA);
 
-            if !is_metadata {
+            if !is_match {
                 continue;
             }
 
@@ -290,6 +295,11 @@ impl FreeSpaceMap {
         }
 
         Err(LuksError::FilesystemFull)
+    }
+
+    /// Allocate a metadata block of `size` bytes from a METADATA (or MIXED) block group.
+    pub fn allocate_metadata(&mut self, size: u32) -> Result<u64> {
+        self.allocate_metadata_for_owner(size, 0)
     }
 
     /// Allocate a data chunk of up to `max_size` bytes from a DATA (or MIXED) block group,

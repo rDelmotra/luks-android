@@ -26,6 +26,7 @@ pub struct Transaction {
     pub new_generation: u64,
     pub final_root_bytenr: u64,
     pub final_root_level: u8,
+    pub final_chunk_root: Option<(u64, u8)>,
     pub final_bytes_used: u64,
     pub new_fs_tree: TreeRoot,
     pub pending_blocks: HashMap<u64, Vec<u8>>,
@@ -105,6 +106,9 @@ impl Transaction {
             fs,
             new_generation,
             new_fs_tree,
+            None,
+            None,
+            None,
             None,
             pending_blocks,
             Vec::new(),
@@ -351,6 +355,9 @@ impl Transaction {
             new_generation,
             new_fs_tree,
             None,
+            None,
+            None,
+            None,
             pending_blocks,
             Vec::new(),
             allocator,
@@ -565,6 +572,9 @@ impl Transaction {
             new_generation,
             new_fs_tree,
             csum_root_opt,
+            None,
+            None,
+            None,
             pending_blocks,
             pending_data,
             allocator,
@@ -921,6 +931,9 @@ impl Transaction {
             new_generation,
             new_fs_tree,
             csum_root_opt,
+            None,
+            None,
+            None,
             pending_blocks,
             pending_data,
             allocator,
@@ -1317,6 +1330,9 @@ impl Transaction {
             new_generation,
             new_fs_tree,
             csum_root_opt,
+            None,
+            None,
+            None,
             pending_blocks,
             Vec::new(),
             allocator,
@@ -1325,6 +1341,13 @@ impl Transaction {
             Vec::new(),
             data_extents_to_free,
         )
+    }
+
+    /// Prepare a transaction that allocates a new single DATA chunk.
+    pub fn allocate_data_chunk<D: ReadAt>(
+        fs: &Btrfs<D>,
+    ) -> Result<(Self, crate::fs::btrfs::chunk::Chunk)> {
+        crate::fs::btrfs::write::chunk_alloc::allocate_data_chunk_transaction(fs)
     }
 }
 
@@ -1407,6 +1430,9 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     new_generation: u64,
     new_fs_tree: TreeRoot,
     csum_root_opt: Option<(u64, u8)>,
+    dev_root_opt: Option<(u64, u8)>,
+    chunk_root_opt: Option<(u64, u8)>,
+    extent_root_opt: Option<(u64, u8)>,
     mut pending_blocks: HashMap<u64, Vec<u8>>,
     pending_data: Vec<(u64, Vec<u8>)>,
     mut allocator: FreeSpaceMap,
@@ -1418,50 +1444,56 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     let sb = fs.superblock();
     let mut root_tree_bytenr = sb.root;
     let mut root_tree_level = sb.root_level;
-    let extent_root = fs.tree_root(EXTENT_TREE_OBJECTID)?;
-    let mut extent_root_bytenr = extent_root.bytenr;
-    let mut extent_root_level = extent_root.level;
+    let (mut extent_root_bytenr, mut extent_root_level) = match extent_root_opt {
+        Some((b, l)) => (b, l),
+        None => {
+            let extent_root = fs.tree_root(EXTENT_TREE_OBJECTID)?;
+            (extent_root.bytenr, extent_root.level)
+        }
+    };
 
-    // 1. Update FS_TREE root item in ROOT_TREE.
-    let fs_root_key = Key::new(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
-    let fs_root_bytenr = new_fs_tree.bytenr;
-    let fs_root_level = new_fs_tree.level;
+    // 1. Update FS_TREE root item in ROOT_TREE if modified.
+    if new_fs_tree.bytenr != fs.fs_tree().bytenr {
+        let fs_root_key = Key::new(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+        let fs_root_bytenr = new_fs_tree.bytenr;
+        let fs_root_level = new_fs_tree.level;
 
-    let root_res = cow_tree_mutate(
-        fs,
-        &pending_blocks,
-        root_tree_bytenr,
-        root_tree_level,
-        ROOT_TREE_OBJECTID,
-        &fs_root_key,
-        new_generation,
-        &mut allocator,
-        |leaf| {
-            let idx = leaf
-                .find_item(&fs_root_key)
-                .ok_or_else(|| LuksError::NotFound("fs root item not found".into()))?;
-            let data = &mut leaf.items[idx].data;
-            if data.len() < 239 {
-                return Err(LuksError::CorruptFs("root item truncated"));
-            }
-            data[160..168].copy_from_slice(&new_generation.to_le_bytes());
-            data[176..184].copy_from_slice(&fs_root_bytenr.to_le_bytes());
-            data[238] = fs_root_level;
-            Ok(())
-        },
-    )?;
+        let root_res = cow_tree_mutate(
+            fs,
+            &pending_blocks,
+            root_tree_bytenr,
+            root_tree_level,
+            ROOT_TREE_OBJECTID,
+            &fs_root_key,
+            new_generation,
+            &mut allocator,
+            |leaf| {
+                let idx = leaf
+                    .find_item(&fs_root_key)
+                    .ok_or_else(|| LuksError::NotFound("fs root item not found".into()))?;
+                let data = &mut leaf.items[idx].data;
+                if data.len() < 239 {
+                    return Err(LuksError::CorruptFs("root item truncated"));
+                }
+                data[160..168].copy_from_slice(&new_generation.to_le_bytes());
+                data[176..184].copy_from_slice(&fs_root_bytenr.to_le_bytes());
+                data[238] = fs_root_level;
+                Ok(())
+            },
+        )?;
 
-    record_cow_result(
-        &root_res,
-        &mut blocks_to_add,
-        &mut blocks_to_remove,
-        &mut allocator,
-        &mut pending_blocks,
-        sb.node_size,
-        ROOT_TREE_OBJECTID,
-    )?;
-    root_tree_bytenr = root_res.new_root_bytenr;
-    root_tree_level = root_res.new_root_level;
+        record_cow_result(
+            &root_res,
+            &mut blocks_to_add,
+            &mut blocks_to_remove,
+            &mut allocator,
+            &mut pending_blocks,
+            sb.node_size,
+            ROOT_TREE_OBJECTID,
+        )?;
+        root_tree_bytenr = root_res.new_root_bytenr;
+        root_tree_level = root_res.new_root_level;
+    }
 
     // 2. Update CSUM_TREE root item in ROOT_TREE if modified
     if let Some((csum_bytenr, csum_level)) = csum_root_opt {
@@ -1486,6 +1518,46 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 data[160..168].copy_from_slice(&new_generation.to_le_bytes());
                 data[176..184].copy_from_slice(&csum_bytenr.to_le_bytes());
                 data[238] = csum_level;
+                Ok(())
+            },
+        )?;
+
+        record_cow_result(
+            &root_res,
+            &mut blocks_to_add,
+            &mut blocks_to_remove,
+            &mut allocator,
+            &mut pending_blocks,
+            sb.node_size,
+            ROOT_TREE_OBJECTID,
+        )?;
+        root_tree_bytenr = root_res.new_root_bytenr;
+        root_tree_level = root_res.new_root_level;
+    }
+
+    // 2b. Update DEV_TREE root item in ROOT_TREE if modified
+    if let Some((dev_bytenr, dev_level)) = dev_root_opt {
+        let dev_root_key = Key::new(crate::fs::btrfs::tree::DEV_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+        let root_res = cow_tree_mutate(
+            fs,
+            &pending_blocks,
+            root_tree_bytenr,
+            root_tree_level,
+            ROOT_TREE_OBJECTID,
+            &dev_root_key,
+            new_generation,
+            &mut allocator,
+            |leaf| {
+                let idx = leaf
+                    .find_item(&dev_root_key)
+                    .ok_or_else(|| LuksError::NotFound("dev root item not found in root tree".into()))?;
+                let data = &mut leaf.items[idx].data;
+                if data.len() < 239 {
+                    return Err(LuksError::CorruptFs("dev root item truncated"));
+                }
+                data[160..168].copy_from_slice(&new_generation.to_le_bytes());
+                data[176..184].copy_from_slice(&dev_bytenr.to_le_bytes());
+                data[238] = dev_level;
                 Ok(())
             },
         )?;
@@ -1868,6 +1940,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         new_generation,
         final_root_bytenr: root_tree_bytenr,
         final_root_level: root_tree_level,
+        final_chunk_root: chunk_root_opt,
         final_bytes_used,
         new_fs_tree,
         pending_blocks,

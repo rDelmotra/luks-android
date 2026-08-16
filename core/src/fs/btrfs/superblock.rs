@@ -157,6 +157,7 @@ pub struct Superblock {
     /// Logical address of the chunk tree — the one address that is bootstrapped
     /// from `sys_chunk_array` rather than mapped.
     pub chunk_root: u64,
+    pub chunk_root_generation: u64,
     pub log_root: u64,
     pub total_bytes: u64,
     pub bytes_used: u64,
@@ -316,6 +317,7 @@ impl Superblock {
             generation: u64le(b, 0x48),
             root: u64le(b, 0x50),
             chunk_root: u64le(b, 0x58),
+            chunk_root_generation: u64le(b, 0xa4),
             log_root: u64le(b, 0x60),
             total_bytes: u64le(b, 0x70),
             bytes_used: u64le(b, 0x78),
@@ -380,6 +382,7 @@ impl Superblock {
         buf[0x94..0x98].copy_from_slice(&self.node_size.to_le_bytes());
         buf[0x98..0x9c].copy_from_slice(&self.node_size.to_le_bytes()); // leafsize
         buf[0x9c..0xa0].copy_from_slice(&self.stripe_size.to_le_bytes());
+        buf[0xa4..0xac].copy_from_slice(&self.chunk_root_generation.to_le_bytes());
 
         buf[0xb4..0xbc].copy_from_slice(&self.compat_ro_flags.to_le_bytes());
         buf[0xbc..0xc4].copy_from_slice(&self.incompat_flags.to_le_bytes());

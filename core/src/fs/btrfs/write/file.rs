@@ -295,7 +295,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         }
 
         let txn = converge_and_finalize(
-            self, new_generation, new_fs_tree, csum_root_opt,
+            self, new_generation, new_fs_tree, csum_root_opt, None, None, None,
             pending_blocks, Vec::new(), allocator, blocks_to_add, blocks_to_remove, data_extents_to_add,
             Vec::new(),
         )?;

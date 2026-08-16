@@ -16,7 +16,8 @@ pub mod txn;
 
 pub use alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
 pub use chunk_alloc::{
-    decide_data_chunk_size, find_free_dev_extent, next_logical, read_dev_extents,
+    allocate_data_chunk_transaction, decide_data_chunk_size, find_free_dev_extent, next_logical,
+    read_dev_extents,
 };
 pub use commit::commit_transaction;
 pub use cow::cow_tree_mutate;
@@ -99,5 +100,15 @@ impl<D: WriteAt> Btrfs<D> {
         let txn = Transaction::delete_file(self, path, now_sec, now_nsec)?;
         commit_transaction(self, txn)?;
         Ok(())
+    }
+
+    /// Allocate a new single DATA chunk, commit the transaction,
+    /// and return the new logical start address.
+    pub fn allocate_data_chunk(&mut self) -> Result<u64> {
+        let (txn, new_chunk) = Transaction::allocate_data_chunk(self)?;
+        self.chunks.insert(new_chunk.clone());
+        let logical = new_chunk.logical;
+        commit_transaction(self, txn)?;
+        Ok(logical)
     }
 }

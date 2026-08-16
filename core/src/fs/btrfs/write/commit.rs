@@ -48,6 +48,11 @@ pub fn commit_transaction<D: WriteAt>(
     new_sb.generation = txn.new_generation;
     new_sb.root = txn.final_root_bytenr;
     new_sb.root_level = txn.final_root_level;
+    if let Some((chunk_root_bytenr, chunk_root_level)) = txn.final_chunk_root {
+        new_sb.chunk_root = chunk_root_bytenr;
+        new_sb.chunk_root_level = chunk_root_level;
+        new_sb.chunk_root_generation = txn.new_generation;
+    }
     new_sb.bytes_used = txn.final_bytes_used;
     // Keep compat_ro_flags consistent with the emitted Free Space Tree.
 

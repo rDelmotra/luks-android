@@ -85,3 +85,65 @@ pub fn check_free_space_tree_shape(fst_root: &TreeRoot) -> Result<()> {
     }
     Ok(())
 }
+
+/// Refuse chunk allocations for profiles other than `DATA|single`.
+///
+/// Refuses METADATA, SYSTEM, DUP, RAID0, RAID1, RAID10, RAID5, RAID6, etc.
+pub fn check_chunk_allocation_profile(flags: u64) -> Result<()> {
+    if flags != crate::fs::btrfs::chunk::BLOCK_GROUP_DATA {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "btrfs chunk allocation only supports DATA|single profile (0x1), got flags 0x{flags:x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse a free-space tree that contains `FREE_SPACE_BITMAP` (key type 200) items.
+///
+/// Our free-space tree emitter only produces extent items (`FREE_SPACE_EXTENT`).
+/// If bitmap items are present, rewriting the tree would lose fine-grained allocation state.
+pub fn check_free_space_tree_no_bitmaps<D: crate::device::ReadAt>(
+    fs: &crate::fs::btrfs::Btrfs<D>,
+) -> Result<()> {
+    if fs.superblock().compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
+        if let Ok(fst_root) = fs.tree_root(crate::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID) {
+            fs.walk_tree(fst_root.bytenr, &mut |key, _| {
+                if key.item_type == crate::fs::btrfs::tree::FREE_SPACE_BITMAP_KEY {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "btrfs free-space tree bitmap items (key type 200) not supported".into(),
+                    ));
+                }
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::FileDevice;
+    use crate::fs::btrfs::chunk::{BLOCK_GROUP_DATA, BLOCK_GROUP_DUP, BLOCK_GROUP_METADATA, BLOCK_GROUP_SYSTEM};
+    use crate::fs::btrfs::Btrfs;
+
+    #[test]
+    fn test_chunk_allocation_profile_gate() {
+        assert!(check_chunk_allocation_profile(BLOCK_GROUP_DATA).is_ok());
+        assert!(check_chunk_allocation_profile(BLOCK_GROUP_METADATA).is_err());
+        assert!(check_chunk_allocation_profile(BLOCK_GROUP_SYSTEM).is_err());
+        assert!(check_chunk_allocation_profile(BLOCK_GROUP_DATA | BLOCK_GROUP_DUP).is_err());
+        assert!(check_chunk_allocation_profile(0).is_err());
+    }
+
+    #[test]
+    fn test_free_space_tree_no_bitmaps_on_fixtures() {
+        let fixtures = ["plain.img", "compress.img", "mixed-4k.img", "subvol.img"];
+        for name in fixtures {
+            let path = format!("{}/../fixtures/btrfs/{name}", env!("CARGO_MANIFEST_DIR"));
+            let dev = FileDevice::open(&path).expect("open fixture");
+            let fs = Btrfs::mount(dev).expect("mount fixture");
+            assert!(check_free_space_tree_no_bitmaps(&fs).is_ok());
+        }
+    }
+}

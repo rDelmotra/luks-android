@@ -20,6 +20,7 @@ fn dummy_superblock() -> Superblock {
         generation: 1,
         root: 1048576,
         chunk_root: 2097152,
+        chunk_root_generation: 1,
         log_root: 0,
         total_bytes: 104857600,
         bytes_used: 1048576,
