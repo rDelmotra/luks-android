@@ -24,6 +24,20 @@ pub struct BtrfsFileWriter {
     pub(crate) allocator: FreeSpaceMap,
 }
 
+impl BtrfsFileWriter {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn written_bytes(&self) -> u64 {
+        self.written_bytes
+    }
+
+    pub fn data_runs(&self) -> &[(u64, u64)] {
+        &self.data_runs
+    }
+}
+
 impl<D: ReadAt + WriteAt> Btrfs<D> {
     pub fn begin_file(&mut self, size: u64) -> Result<BtrfsFileWriter> {
         gate::check_writeable_fs(self.superblock())?;
@@ -39,13 +53,62 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             ((size + sector_size - 1) / sector_size) * sector_size
         };
 
+        let mut total_free_data: u64 = allocator
+            .block_groups
+            .iter()
+            .filter(|bg| {
+                (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
+                    || (bg.block_group.flags
+                        & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA
+                            | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                        != 0)
+            })
+            .map(|bg| bg.total_free_bytes)
+            .sum();
+
+        while total_free_data < disk_num_bytes {
+            self.allocate_data_chunk()?;
+            let extent_tree = ExtentTree::read(self)?;
+            allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
+                &extent_tree,
+                self.chunk_map(),
+            )?;
+            total_free_data = allocator
+                .block_groups
+                .iter()
+                .filter(|bg| {
+                    (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
+                        || (bg.block_group.flags
+                            & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA
+                                | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                            != 0)
+                })
+                .map(|bg| bg.total_free_bytes)
+                .sum();
+        }
+
         let mut data_runs = Vec::new();
         let mut allocated = 0u64;
         while allocated < disk_num_bytes {
             let remaining = disk_num_bytes - allocated;
-            let (bytenr, chunk_len) = allocator.allocate_data_chunk(remaining, sector_size as u32)?;
-            data_runs.push((bytenr, chunk_len));
-            allocated += chunk_len;
+            match allocator.allocate_data_chunk(remaining, sector_size as u32) {
+                Ok((bytenr, chunk_len)) => {
+                    data_runs.push((bytenr, chunk_len));
+                    allocated += chunk_len;
+                }
+                Err(LuksError::FilesystemFull) => {
+                    self.allocate_data_chunk()?;
+                    let extent_tree = ExtentTree::read(self)?;
+                    allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
+                        &extent_tree,
+                        self.chunk_map(),
+                    )?;
+                    for &(run_bytenr, run_len) in &data_runs {
+                        allocator.mark_allocated(run_bytenr, run_len)?;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         Ok(BtrfsFileWriter {
@@ -85,8 +148,21 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             let chunk = &remaining[..take];
             let write_addr = bytenr + offset_in_run;
 
-            // Write chunk to disk
-            self.device_mut().write_at(write_addr, chunk)?;
+            // Write chunk to disk mapping logical -> physical stripes
+            let mut chunk_done = 0usize;
+            while chunk_done < chunk.len() {
+                let logical_cur = write_addr + chunk_done as u64;
+                let (_, run) = self.chunk_map().map(logical_cur)?;
+                let chunk_take = (chunk.len() - chunk_done).min(run as usize);
+                let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                for phys_stripe in stripes {
+                    self.device_mut().write_at(
+                        phys_stripe,
+                        &chunk[chunk_done..chunk_done + chunk_take],
+                    )?;
+                }
+                chunk_done += chunk_take;
+            }
 
             // Compute CRC32c for every sector
             let sector_size = self.superblock().sector_size as usize;
@@ -122,6 +198,11 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let located_parent = self.resolve_no_follow(self.fs_tree(), parent_path)?;
         if !located_parent.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
+        }
+        if located_parent.tree.objectid != FS_TREE_OBJECTID {
+            return Err(LuksError::UnsupportedFsFeature(
+                "subvolume file creation not yet supported".into(),
+            ));
         }
         let parent_ino = located_parent.inode.objectid;
 
@@ -205,7 +286,15 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let mode = 0o100644; // Regular file
         let total_disk_bytes: u64 = writer.data_runs.iter().map(|(_, len)| *len).sum();
         let inode_data = {
-            let mut data = node::build_empty_inode_item(new_generation, mode, 0, 0, 1, now_sec, now_nsec);
+            let mut data = node::build_empty_inode_item(
+                new_generation,
+                mode,
+                located_parent.inode.uid,
+                located_parent.inode.gid,
+                1,
+                now_sec,
+                now_nsec,
+            );
             data[16..24].copy_from_slice(&writer.size.to_le_bytes()); // size
             data[24..32].copy_from_slice(&total_disk_bytes.to_le_bytes()); // nbytes
             data
@@ -251,7 +340,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     continue;
                 }
                 let mut extent_data = vec![0u8; run_len as usize];
-                self.device().read_at(bytenr, &mut extent_data)?;
+                self.read_logical(bytenr, &mut extent_data)?;
                 let csum_items = node::build_extent_csum_items(
                     sb.csum_type,
                     sb.node_size,

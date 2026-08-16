@@ -470,6 +470,74 @@ impl FreeSpaceMap {
         Err(LuksError::FilesystemFull)
     }
 
+    /// Mark a specific `[bytenr, bytenr + length)` range as allocated in this map.
+    ///
+    /// Carves the specified range out of the containing block group's `free_ranges`,
+    /// updating `total_allocated_bytes`, `total_free_bytes`, and `block_group.used`.
+    ///
+    /// Returns `Err(LuksError::OutOfBounds)` if the range does not fall within any block group,
+    /// or `Err(LuksError::CorruptFs)` if the range is not currently recorded as free.
+    pub fn mark_allocated(&mut self, bytenr: u64, length: u64) -> Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = bytenr
+            .checked_add(length)
+            .ok_or(LuksError::OutOfBounds)?;
+
+        for bg in &mut self.block_groups {
+            let bg_start = bg.block_group.start;
+            let bg_end = bg_start.saturating_add(bg.block_group.length);
+
+            if bytenr >= bg_start && end <= bg_end {
+                // Found containing block group. Look for matching free range.
+                for i in 0..bg.free_ranges.len() {
+                    let range = bg.free_ranges[i];
+                    let r_start = range.start;
+                    let r_end = range.start.saturating_add(range.length);
+
+                    if bytenr >= r_start && end <= r_end {
+                        let before_len = bytenr - r_start;
+                        let after_len = r_end - end;
+
+                        bg.free_ranges.remove(i);
+                        let insert_pos = i;
+                        if after_len > 0 {
+                            bg.free_ranges.insert(
+                                insert_pos,
+                                FreeRange {
+                                    start: end,
+                                    length: after_len,
+                                },
+                            );
+                        }
+                        if before_len > 0 {
+                            bg.free_ranges.insert(
+                                insert_pos,
+                                FreeRange {
+                                    start: r_start,
+                                    length: before_len,
+                                },
+                            );
+                        }
+
+                        bg.total_allocated_bytes += length;
+                        bg.total_free_bytes -= length;
+                        bg.block_group.used += length;
+
+                        return Ok(());
+                    }
+                }
+
+                return Err(LuksError::CorruptFs(
+                    "range to mark allocated was not present in block group free ranges",
+                ));
+            }
+        }
+
+        Err(LuksError::OutOfBounds)
+    }
+
     /// Mark a data extent of `size` bytes starting at `bytenr` as freed in this transaction.
     ///
     /// The extent is recorded in `pinned_freed` rather than returned to `free_ranges`
@@ -896,5 +964,76 @@ mod tests {
                 "allocation {bytenr:#x} must not overlap excluded mirror [58720256, 58785792)"
             );
         }
+    }
+
+    #[test]
+    fn test_mark_allocated() {
+        let bg = create_test_data_bg(
+            10_000_000,
+            20_000_000,
+            vec![
+                FreeRange {
+                    start: 10_000_000,
+                    length: 1_000_000,
+                },
+                FreeRange {
+                    start: 15_000_000,
+                    length: 2_000_000,
+                },
+            ],
+        );
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // Initially: length = 20M, free = 3M, allocated = 17M
+        assert_eq!(map.block_groups[0].total_allocated_bytes, 17_000_000);
+        assert_eq!(map.block_groups[0].total_free_bytes, 3_000_000);
+
+        // 1. Carve from middle of second range (16_000_000..16_500_000)
+        map.mark_allocated(16_000_000, 500_000).expect("mark allocated middle");
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 10_000_000,
+                    length: 1_000_000,
+                },
+                FreeRange {
+                    start: 15_000_000,
+                    length: 1_000_000,
+                },
+                FreeRange {
+                    start: 16_500_000,
+                    length: 500_000,
+                },
+            ]
+        );
+        assert_eq!(map.block_groups[0].total_allocated_bytes, 17_500_000);
+        assert_eq!(map.block_groups[0].total_free_bytes, 2_500_000);
+        assert_eq!(map.block_groups[0].block_group.used, 17_500_000);
+
+        // 2. Carve entire first range (10_000_000..11_000_000)
+        map.mark_allocated(10_000_000, 1_000_000).expect("mark allocated exact");
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 15_000_000,
+                    length: 1_000_000,
+                },
+                FreeRange {
+                    start: 16_500_000,
+                    length: 500_000,
+                },
+            ]
+        );
+        assert_eq!(map.block_groups[0].total_allocated_bytes, 18_500_000);
+        assert_eq!(map.block_groups[0].total_free_bytes, 1_500_000);
+
+        // 3. Mark already allocated range -> error
+        assert!(map.mark_allocated(10_000_000, 1_000_000).is_err());
+        // 4. Mark out of bounds range -> error
+        assert!(map.mark_allocated(50_000_000, 1_000_000).is_err());
     }
 }

@@ -69,26 +69,31 @@ impl<D: WriteAt> Btrfs<D> {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),
         };
-        let txn = Transaction::write_file_data(self, path, data, now_sec, now_nsec)?;
+        let txn = match Transaction::write_file_data(self, path, data, now_sec, now_nsec) {
+            Ok(txn) => txn,
+            Err(LuksError::FilesystemFull) => {
+                self.allocate_data_chunk()?;
+                Transaction::write_file_data(self, path, data, now_sec, now_nsec)?
+            }
+            Err(e) => return Err(e),
+        };
         commit_transaction(self, txn)?;
         Ok(())
     }
 
     /// Create a regular file named `filename` in `parent_dir_path` containing `data`.
-    /// Performs this in a single atomic transaction and returns the new inode number.
+    /// Performs this in a transaction and returns the new inode number.
     pub fn create_file_with_data(
         &mut self,
         parent_dir_path: &str,
         filename: &str,
         data: &[u8],
     ) -> Result<u64> {
-        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => (d.as_secs(), d.subsec_nanos()),
-            Err(_) => (0, 0),
-        };
-        let (txn, new_ino) = Transaction::create_file_with_data(self, parent_dir_path, filename, data, now_sec, now_nsec)?;
-        commit_transaction(self, txn)?;
-        Ok(new_ino)
+        let mut writer = self.begin_file(data.len() as u64)?;
+        if !data.is_empty() {
+            self.write_chunk(&mut writer, data)?;
+        }
+        self.finish_file(writer, parent_dir_path, filename)
     }
 
     /// Delete the regular file at `path`.
