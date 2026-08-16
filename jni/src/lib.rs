@@ -20,7 +20,7 @@ pub mod bridge;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JByteArray, JClass, JString, JValue, JByteBuffer};
+use jni::objects::{JByteArray, JByteBuffer, JClass, JString, JValue};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 

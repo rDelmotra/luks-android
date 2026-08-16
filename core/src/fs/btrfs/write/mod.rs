@@ -4,6 +4,7 @@
 //! `dangerous-write-support` so a default shipping build contains no write code.
 
 pub mod alloc;
+pub mod chunk_alloc;
 pub mod commit;
 pub mod cow;
 pub mod exclude;
@@ -14,6 +15,9 @@ pub mod node;
 pub mod txn;
 
 pub use alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
+pub use chunk_alloc::{
+    decide_data_chunk_size, find_free_dev_extent, next_logical, read_dev_extents,
+};
 pub use commit::commit_transaction;
 pub use cow::cow_tree_mutate;
 pub use exclude::compute_sb_exclusions;

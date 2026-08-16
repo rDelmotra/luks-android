@@ -376,4 +376,10 @@ impl<D: ReadAt> Btrfs<D> {
         self.nodes.clear();
         self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
     }
+
+    /// Read all `DEV_EXTENT` items for `devid` from the `DEV_TREE`.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn read_dev_extents(&self, devid: u64) -> Result<Vec<(u64, u64)>> {
+        write::chunk_alloc::read_dev_extents(self, devid)
+    }
 }
