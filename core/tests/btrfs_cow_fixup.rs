@@ -83,7 +83,7 @@ fn leftmost_insert_fixes_up_parent_key() {
     assert!(below_min_key < current_min);
 
     let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
-    let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree).expect("build allocator");
+    let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map()).expect("build allocator");
 
     let pending: HashMap<u64, Vec<u8>> = HashMap::new();
     let res = cow_tree_insert(

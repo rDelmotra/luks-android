@@ -75,7 +75,7 @@ fn report<D: luks_core::device::ReadAt>(fs: &Btrfs<D>) {
     println!("node_size {node_size}  sector_size {sector_size}");
 
     let extent_tree = ExtentTree::read(fs).expect("read extent tree");
-    let map = FreeSpaceMap::from_extent_tree(&extent_tree).expect("derive free space map");
+    let map = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map()).expect("derive free space map");
 
     let mut total_free = 0u64;
     for bg in &map.block_groups {

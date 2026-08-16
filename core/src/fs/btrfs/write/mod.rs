@@ -6,6 +6,7 @@
 pub mod alloc;
 pub mod commit;
 pub mod cow;
+pub mod exclude;
 pub mod extent_tree;
 pub mod file;
 pub mod gate;
@@ -15,6 +16,7 @@ pub mod txn;
 pub use alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
 pub use commit::commit_transaction;
 pub use cow::cow_tree_mutate;
+pub use exclude::compute_sb_exclusions;
 pub use extent_tree::{
     AllocatedExtent, BlockGroupItem, ExtentItem, ExtentTree, InlineBackref, MetadataItem,
 };

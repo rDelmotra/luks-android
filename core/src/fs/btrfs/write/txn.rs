@@ -47,7 +47,7 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new(); // (bytenr, level, owner)
         let mut blocks_to_remove = Vec::<(u64, u8)>::new(); // (bytenr, level)
@@ -156,7 +156,7 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
@@ -388,7 +388,7 @@ impl Transaction {
         let sector_size = sb.sector_size;
 
         let extent_tree = ExtentTree::read(fs)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
@@ -617,7 +617,7 @@ impl Transaction {
         let sector_size = sb.sector_size;
 
         let extent_tree = ExtentTree::read(fs)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
@@ -1066,7 +1066,7 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();

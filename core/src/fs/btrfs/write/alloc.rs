@@ -28,6 +28,7 @@ pub struct BlockGroupFreeSpace {
     pub allocated_extents: Vec<AllocatedExtent>,
     pub free_ranges: Vec<FreeRange>,
     pub pinned_freed: Vec<FreeRange>,
+    pub excluded_ranges: Vec<FreeRange>,
     pub total_allocated_bytes: u64,
     pub total_free_bytes: u64,
 }
@@ -99,6 +100,7 @@ impl FreeSpaceMap {
                 allocated_extents: bg_extents,
                 free_ranges,
                 pinned_freed: Vec::new(),
+                excluded_ranges: Vec::new(),
                 total_allocated_bytes: total_allocated,
                 total_free_bytes: total_free,
             });
@@ -107,6 +109,94 @@ impl FreeSpaceMap {
         Ok(FreeSpaceMap {
             block_groups: bg_free_spaces,
         })
+    }
+
+    /// Derive the free space map from the extent tree and subtract superblock mirror exclusions.
+    pub fn from_extent_tree_and_chunk_map(
+        extent_tree: &ExtentTree,
+        chunk_map: &crate::fs::btrfs::chunk::ChunkMap,
+    ) -> Result<Self> {
+        let mut map = Self::from_extent_tree(extent_tree)?;
+        let exclusions = crate::fs::btrfs::write::exclude::compute_sb_exclusions(chunk_map);
+        map.exclude_ranges(&exclusions);
+        Ok(map)
+    }
+
+    /// Subtract excluded logical ranges (e.g. superblock mirrors) from available free ranges.
+    ///
+    /// The excluded bytes will not be handed out by `allocate_metadata` or `allocate_data_chunk`.
+    pub fn exclude_ranges(&mut self, exclusions: &[std::ops::Range<u64>]) {
+        for excl in exclusions {
+            if excl.start >= excl.end {
+                continue;
+            }
+            for bg in &mut self.block_groups {
+                let bg_start = bg.block_group.start;
+                let bg_end = bg_start.saturating_add(bg.block_group.length);
+                if excl.end <= bg_start || excl.start >= bg_end {
+                    continue;
+                }
+
+                let e_start = excl.start.max(bg_start);
+                let e_end = excl.end.min(bg_end);
+                if e_start >= e_end {
+                    continue;
+                }
+
+                let mut new_free = Vec::new();
+                for r in &bg.free_ranges {
+                    let r_start = r.start;
+                    let r_end = r.start.saturating_add(r.length);
+
+                    if e_end <= r_start || e_start >= r_end {
+                        // No overlap
+                        new_free.push(*r);
+                    } else {
+                        // Overlap: record the excluded slice that overlapped with this free range
+                        let overlap_start = e_start.max(r_start);
+                        let overlap_end = e_end.min(r_end);
+                        if overlap_start < overlap_end {
+                            bg.excluded_ranges.push(FreeRange {
+                                start: overlap_start,
+                                length: overlap_end - overlap_start,
+                            });
+                        }
+
+                        // Keep part before e_start if any
+                        if r_start < e_start {
+                            new_free.push(FreeRange {
+                                start: r_start,
+                                length: e_start - r_start,
+                            });
+                        }
+                        // Keep part after e_end if any
+                        if r_end > e_end {
+                            new_free.push(FreeRange {
+                                start: e_end,
+                                length: r_end - e_end,
+                            });
+                        }
+                    }
+                }
+                bg.free_ranges = new_free;
+                bg.total_free_bytes = bg.free_ranges.iter().map(|r| r.length).sum();
+
+                // Maintain excluded_ranges sorted and merged
+                bg.excluded_ranges.sort_by_key(|r| r.start);
+                let mut merged_excl: Vec<FreeRange> = Vec::new();
+                for r in bg.excluded_ranges.drain(..) {
+                    if let Some(last) = merged_excl.last_mut() {
+                        if last.start + last.length >= r.start {
+                            let end = (last.start + last.length).max(r.start + r.length);
+                            last.length = end - last.start;
+                            continue;
+                        }
+                    }
+                    merged_excl.push(r);
+                }
+                bg.excluded_ranges = merged_excl;
+            }
+        }
     }
 
     /// All free ranges flattened across all block groups, sorted by address.
@@ -458,13 +548,15 @@ impl FreeSpaceMap {
             let mut combined = Vec::new();
             combined.extend_from_slice(&bg.free_ranges);
             combined.extend_from_slice(&bg.pinned_freed);
+            combined.extend_from_slice(&bg.excluded_ranges);
             combined.sort_by_key(|r| r.start);
 
             let mut merged: Vec<FreeRange> = Vec::new();
             for r in combined {
                 if let Some(last) = merged.last_mut() {
-                    if last.start + last.length == r.start {
-                        last.length += r.length;
+                    if last.start + last.length >= r.start {
+                        let end = (last.start + last.length).max(r.start + r.length);
+                        last.length = end - last.start;
                         continue;
                     }
                 }
@@ -528,7 +620,7 @@ pub fn read_free_space_tree<D: ReadAt>(fs: &Btrfs<D>) -> Result<Option<Vec<FreeR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::btrfs::chunk::BLOCK_GROUP_DATA;
+    use crate::fs::btrfs::chunk::{BLOCK_GROUP_DATA, BLOCK_GROUP_METADATA};
     use crate::fs::btrfs::write::extent_tree::BlockGroupItem;
 
     fn create_test_data_bg(start: u64, length: u64, free_ranges: Vec<FreeRange>) -> BlockGroupFreeSpace {
@@ -544,6 +636,7 @@ mod tests {
             allocated_extents: Vec::new(),
             free_ranges,
             pinned_freed: Vec::new(),
+            excluded_ranges: Vec::new(),
             total_allocated_bytes: length - total_free,
             total_free_bytes: total_free,
         }
@@ -696,5 +789,102 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn test_exclude_ranges_split_and_trim() {
+        let bg = create_test_data_bg(
+            0,
+            1_000_000,
+            vec![FreeRange {
+                start: 10_000,
+                length: 20_000, // 10_000..30_000
+            }],
+        );
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // Exclude 18_000..22_000 (split) and 28_000..35_000 (trim end)
+        map.exclude_ranges(&[18_000..22_000, 28_000..35_000]);
+
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 10_000,
+                    length: 8000, // 10_000..18_000
+                },
+                FreeRange {
+                    start: 22_000,
+                    length: 6000, // 22_000..28_000
+                },
+            ]
+        );
+        assert_eq!(map.block_groups[0].total_free_bytes, 14_000);
+        assert_eq!(
+            map.block_groups[0].excluded_ranges,
+            vec![
+                FreeRange {
+                    start: 18_000,
+                    length: 4000,
+                },
+                FreeRange {
+                    start: 28_000,
+                    length: 2000, // clamped to free range end 30_000
+                },
+            ]
+        );
+
+        // Verify emit_free_space_tree_items merges them back cleanly to 10_000..30_000
+        let items = map.emit_free_space_tree_items();
+        // 1 info item + 1 extent item
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].key.objectid, 10_000);
+        assert_eq!(items[1].key.offset, 20_000);
+    }
+
+    #[test]
+    fn test_exclude_ranges_prevents_allocation_on_mirror() {
+        let mut bg = create_test_data_bg(
+            30_000_000,
+            40_000_000,
+            vec![FreeRange {
+                start: 58_000_000,
+                length: 2_000_000, // 58_000_000..60_000_000
+            }],
+        );
+        bg.block_group.flags = BLOCK_GROUP_METADATA;
+
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // Exclude Mirror 1 range at 58_720_256..58_785_792 (64 KiB)
+        map.exclude_ranges(&[58_720_256..58_785_792]);
+
+        // Range before mirror is 58_000_000..58_720_256 (720_256 bytes)
+        // Range after mirror is 58_785_792..60_000_000 (1_214_208 bytes)
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 58_000_000,
+                    length: 720_256,
+                },
+                FreeRange {
+                    start: 58_785_792,
+                    length: 1_214_208,
+                },
+            ]
+        );
+
+        // Exhaust the first range with metadata allocations
+        while let Ok(bytenr) = map.allocate_metadata(16384) {
+            assert!(
+                bytenr + 16384 <= 58_720_256 || bytenr >= 58_785_792,
+                "allocation {bytenr:#x} must not overlap excluded mirror [58720256, 58785792)"
+            );
+        }
     }
 }

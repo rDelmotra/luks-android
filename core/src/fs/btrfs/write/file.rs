@@ -30,7 +30,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
         let extent_tree = ExtentTree::read(self)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree)?;
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, self.chunk_map())?;
 
         let sector_size = self.superblock().sector_size as u64;
         let disk_num_bytes = if size == 0 {
@@ -351,7 +351,7 @@ mod tests {
 
         // 1. Read extent tree to derive base allocator
         let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
-        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree).expect("derive allocator");
+        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map()).expect("derive allocator");
 
         // 2. Simulate fragmented free space in the DATA block group (plain.img DATA bg is 13_631_488..22_020_096):
         // Split free space into 3 small disjoint ranges:
