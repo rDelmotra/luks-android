@@ -368,5 +368,6 @@ impl<D: ReadAt> Btrfs<D> {
         self.sb = sb;
         self.fs_tree = fs_tree;
         self.nodes.clear();
+        self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
     }
 }

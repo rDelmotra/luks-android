@@ -139,13 +139,11 @@ impl VolumeHandle {
     /// Delete a file by path from the encrypted volume.
     pub fn delete_file(&self, path: &str) -> Result<()> {
         let mut fs = self.fs();
-        let Fs::Ext4(ext4) = &mut *fs else {
-            return Err(LuksError::UnsupportedFsFeature(
-                "deleting from btrfs — this volume can be read but not written".into(),
-            ));
-        };
         self.claim_writer()?;
-        ext4.delete_file(path)
+        match &mut *fs {
+            Fs::Ext4(ext4) => ext4.delete_file(path),
+            Fs::Btrfs(btrfs) => btrfs.delete_file(path),
+        }
     }
 
     fn claim_writer(&self) -> Result<()> {

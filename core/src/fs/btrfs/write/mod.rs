@@ -83,4 +83,15 @@ impl<D: WriteAt> Btrfs<D> {
         commit_transaction(self, txn)?;
         Ok(new_ino)
     }
+
+    /// Delete the regular file at `path`.
+    pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let txn = Transaction::delete_file(self, path, now_sec, now_nsec)?;
+        commit_transaction(self, txn)?;
+        Ok(())
+    }
 }

@@ -297,4 +297,53 @@ fn write_multi_item_csum_on_mixed_4k_img() {
     );
 }
 
+#[test]
+fn write_file_streamed_chunks_on_plain_img() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    let size = 65536; // 64 KiB
+    let mut test_data = vec![0u8; size];
+    for (i, b) in test_data.iter_mut().enumerate() {
+        *b = ((i * 43 + 19) & 0xFF) as u8;
+    }
+
+    let mut writer = fs.begin_file(size as u64).expect("begin_file");
+    fs.write_chunk(&mut writer, &test_data[..15000])
+        .expect("write chunk 1");
+    fs.write_chunk(&mut writer, &test_data[15000..45000])
+        .expect("write chunk 2");
+    fs.write_chunk(&mut writer, &test_data[45000..])
+        .expect("write chunk 3");
+
+    let ino = fs
+        .finish_file(writer, "/", "streamed_file.bin")
+        .expect("finish_file");
+    assert!(ino >= 256);
+
+    let readback = fs.read_file("/streamed_file.bin").expect("readback");
+    assert_eq!(readback, test_data);
+
+    drop(fs);
+
+    let dev_ro = FileDevice::open(&temp_img).expect("open ro");
+    let fs_ro = Btrfs::mount(dev_ro).expect("remount btrfs");
+    let readback_ro = fs_ro
+        .read_file("/streamed_file.bin")
+        .expect("readback ro");
+    assert_eq!(readback_ro, test_data);
+    drop(fs_ro);
+
+    let oracle_clean = run_verify_script(&temp_img);
+    let _ = fs::remove_file(&temp_img);
+    assert!(
+        oracle_clean,
+        "kernel oracle verification failed on streaming chunked file write"
+    );
+}
+
+
 

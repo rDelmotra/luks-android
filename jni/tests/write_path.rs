@@ -829,4 +829,37 @@ fn writing_into_nonexistent_directory_on_btrfs_is_refused() {
     assert_eq!(error_code(&err), code::NOT_FOUND);
 }
 
+#[test]
+fn a_btrfs_file_deleted_through_the_bridge_is_gone_and_clean() {
+    let path = scratch_btrfs("bridge-delete");
+
+    {
+        let vol = unlock(&path);
+        // Create a file through the bridge
+        vol.write_file("/", "btrfs_del.txt", b"temporary btrfs bridge file")
+            .expect("write_file");
+        // Verify it was created and delete it through the bridge
+        vol.delete_file("/btrfs_del.txt").expect("delete_file");
+    }
+
+    if let Some(script) = tool("verify-image.sh") {
+        let out = Command::new("bash")
+            .arg(&script)
+            .arg(&path)
+            .arg(PASSWORD_STR)
+            .output()
+            .expect("run verify-image");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        assert!(
+            out.status.success() && text.contains("VERDICT: clean"),
+            "delete_file on btrfs through the bridge left the filesystem unclean:\n{text}"
+        );
+    }
+}
+
 

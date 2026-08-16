@@ -40,10 +40,12 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         };
 
         let mut data_runs = Vec::new();
-        if disk_num_bytes > 0 {
-            // Allocate data extent.
-            let bytenr = allocator.allocate_data(disk_num_bytes, sector_size as u32)?;
-            data_runs.push((bytenr, disk_num_bytes));
+        let mut allocated = 0u64;
+        while allocated < disk_num_bytes {
+            let remaining = disk_num_bytes - allocated;
+            let (bytenr, chunk_len) = allocator.allocate_data_chunk(remaining, sector_size as u32)?;
+            data_runs.push((bytenr, chunk_len));
+            allocated += chunk_len;
         }
 
         Ok(BtrfsFileWriter {
@@ -66,20 +68,20 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
 
         let mut remaining = data;
         let mut written_so_far = writer.written_bytes;
+        let mut file_cursor = 0u64;
 
         for &(bytenr, run_len) in &writer.data_runs {
-            // Check if our write falls into this run
-            let _run_start = 0; // We assume a single contiguous run for now or need to map it properly.
-            // Wait, BtrfsFileWriter currently just allocates one large extent in `begin_file`.
-            // Let's refine this to map `written_bytes` to the correct offset in the run.
-            // For now, `allocate_data` allocates contiguous `disk_num_bytes`, so we just have one run.
-            // If `allocate_data` returns one extent, `bytenr` is the start.
-            let offset_in_run = written_so_far;
-            if offset_in_run >= run_len {
+            let run_file_start = file_cursor;
+            let run_file_end = file_cursor + run_len;
+            file_cursor = run_file_end;
+
+            if written_so_far >= run_file_end {
                 continue;
             }
 
-            let take = (run_len - offset_in_run).min(remaining.len() as u64) as usize;
+            let offset_in_run = written_so_far - run_file_start;
+            let space_in_run = run_len - offset_in_run;
+            let take = (space_in_run.min(remaining.len() as u64)) as usize;
             let chunk = &remaining[..take];
             let write_addr = bytenr + offset_in_run;
 
@@ -201,10 +203,11 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         // 4. Insert new INODE_ITEM
         let inode_key = Key::new(new_ino, INODE_ITEM_KEY, 0);
         let mode = 0o100644; // Regular file
+        let total_disk_bytes: u64 = writer.data_runs.iter().map(|(_, len)| *len).sum();
         let inode_data = {
             let mut data = node::build_empty_inode_item(new_generation, mode, 0, 0, 1, now_sec, now_nsec);
             data[16..24].copy_from_slice(&writer.size.to_le_bytes()); // size
-            data[24..32].copy_from_slice(&writer.size.to_le_bytes()); // nbytes
+            data[24..32].copy_from_slice(&total_disk_bytes.to_le_bytes()); // nbytes
             data
         };
         let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, inode_key, inode_data, new_generation, &mut allocator)?;
@@ -219,14 +222,16 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
 
         // 6. Insert EXTENT_DATA (if any)
+        let mut file_offset = 0u64;
         for &(bytenr, run_len) in &writer.data_runs {
             if run_len > 0 {
-                let extent_data_key = Key::new(new_ino, EXTENT_DATA_KEY, 0);
+                let extent_data_key = Key::new(new_ino, EXTENT_DATA_KEY, file_offset);
                 let extent_data_item = node::build_regular_file_extent(new_generation, run_len, bytenr, run_len, run_len);
                 let res = cow_tree_insert(self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID, extent_data_key, extent_data_item, new_generation, &mut allocator)?;
                 record_cow_result(&res, &mut blocks_to_add, &mut blocks_to_remove, &mut allocator, &mut pending_blocks, sb.node_size, FS_TREE_OBJECTID)?;
                 fs_root_bytenr = res.new_root_bytenr; fs_root_level = res.new_root_level;
-                data_extents_to_add.push((bytenr, run_len, FS_TREE_OBJECTID, new_ino, 0));
+                data_extents_to_add.push((bytenr, run_len, FS_TREE_OBJECTID, new_ino, file_offset));
+                file_offset += run_len;
             }
         }
 
@@ -235,12 +240,64 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
 
-        // We don't implement CSUM tree insertions yet. But we should collect csum_root_opt
-        let csum_root_opt = None; // TODO: properly handle csum if csum tree exists
+        // 7. CoW CSUM_TREE: insert the EXTENT_CSUM items covering all data runs (if CSUM tree is present)
+        let mut csum_root_opt = None;
+        if let Ok(csum_root) = self.tree_root(crate::fs::btrfs::tree::CSUM_TREE_OBJECTID) {
+            let mut csum_root_bytenr = csum_root.bytenr;
+            let mut csum_root_level = csum_root.level;
+
+            for &(bytenr, run_len) in &writer.data_runs {
+                if run_len == 0 {
+                    continue;
+                }
+                let mut extent_data = vec![0u8; run_len as usize];
+                self.device().read_at(bytenr, &mut extent_data)?;
+                let csum_items = node::build_extent_csum_items(
+                    sb.csum_type,
+                    sb.node_size,
+                    sb.sector_size,
+                    bytenr,
+                    run_len,
+                    &extent_data,
+                )?;
+
+                for (range_start, csum_payload) in csum_items {
+                    let csum_key = Key::new(
+                        crate::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
+                        crate::fs::btrfs::tree::EXTENT_CSUM_KEY,
+                        range_start,
+                    );
+                    let res = cow_tree_insert(
+                        self,
+                        &pending_blocks,
+                        csum_root_bytenr,
+                        csum_root_level,
+                        crate::fs::btrfs::tree::CSUM_TREE_OBJECTID,
+                        csum_key,
+                        csum_payload,
+                        new_generation,
+                        &mut allocator,
+                    )?;
+                    record_cow_result(
+                        &res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        crate::fs::btrfs::tree::CSUM_TREE_OBJECTID,
+                    )?;
+                    csum_root_bytenr = res.new_root_bytenr;
+                    csum_root_level = res.new_root_level;
+                }
+            }
+            csum_root_opt = Some((csum_root_bytenr, csum_root_level));
+        }
 
         let txn = converge_and_finalize(
             self, new_generation, new_fs_tree, csum_root_opt,
             pending_blocks, Vec::new(), allocator, blocks_to_add, blocks_to_remove, data_extents_to_add,
+            Vec::new(),
         )?;
 
         commit_transaction(self, txn)?;
@@ -250,5 +307,159 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     pub fn abandon_file(&mut self, _writer: BtrfsFileWriter) {
         // Safe to drop; extents mapped in memory but not linked to any tree yet, so they leak only in this run but will be valid on remount.
         // The real way to handle this without a transaction is just drop, as they aren't recorded in the extent tree.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::FileDevice;
+    use crate::fs::btrfs::extent::ExtentKind;
+    use crate::fs::btrfs::write::alloc::FreeRange;
+
+    fn fixture_path(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("fixtures")
+            .join("btrfs")
+            .join(name)
+    }
+
+    fn copy_scratch(name: &str) -> std::path::PathBuf {
+        let src = fixture_path(name);
+        let temp_dir = std::env::temp_dir();
+        let dst = temp_dir.join(format!(
+            "btrfs-file-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::copy(&src, &dst).expect("copy fixture");
+        dst
+    }
+
+    #[test]
+    fn write_file_across_fragmented_extents_in_file_writer() {
+        let temp_img = copy_scratch("plain.img");
+        let file_len = std::fs::metadata(&temp_img).unwrap().len();
+
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount writable");
+
+        // 1. Read extent tree to derive base allocator
+        let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
+        let mut allocator = FreeSpaceMap::from_extent_tree(&extent_tree).expect("derive allocator");
+
+        // 2. Simulate fragmented free space in the DATA block group (plain.img DATA bg is 13_631_488..22_020_096):
+        // Split free space into 3 small disjoint ranges:
+        // Range 1: 16_777_216 .. 16_793_600 (16 KB)
+        // Range 2: 17_825_792 .. 17_858_560 (32 KB)
+        // Range 3: 18_874_368 .. 18_890_752 (16 KB)
+        allocator.block_groups[0].free_ranges = vec![
+            FreeRange {
+                start: 16_777_216,
+                length: 16_384,
+            },
+            FreeRange {
+                start: 17_825_792,
+                length: 32_768,
+            },
+            FreeRange {
+                start: 18_874_368,
+                length: 16_384,
+            },
+        ];
+        allocator.block_groups[0].total_free_bytes = 16_384 + 32_768 + 16_384;
+
+        let total_file_size = 49_152u64; // 48 KB: requires 32 KB from Range 2 + 16 KB from Range 1
+        let sector_size = fs.superblock().sector_size;
+
+        // Allocate chunks for the file
+        let mut data_runs = Vec::new();
+        let mut allocated = 0u64;
+        while allocated < total_file_size {
+            let remaining = total_file_size - allocated;
+            let (bytenr, chunk_len) = allocator
+                .allocate_data_chunk(remaining, sector_size)
+                .expect("allocate chunk");
+            data_runs.push((bytenr, chunk_len));
+            allocated += chunk_len;
+        }
+
+        // Verify that allocation fragmented across 2 separate ranges
+        assert_eq!(data_runs.len(), 2);
+        assert_eq!(data_runs[0], (17_825_792, 32_768));
+        assert_eq!(data_runs[1], (16_777_216, 16_384));
+
+        let mut writer = BtrfsFileWriter {
+            size: total_file_size,
+            written_bytes: 0,
+            data_runs,
+            checksums: Vec::new(),
+            allocator,
+        };
+
+        // Prepare test payload (48 KB)
+        let mut payload = vec![0u8; total_file_size as usize];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = ((i * 41 + 7) & 0xFF) as u8;
+        }
+
+        // Write across boundaries in odd chunk sizes (10_000, 25_000, remaining)
+        fs.write_chunk(&mut writer, &payload[0..10_000])
+            .expect("write chunk 1");
+        assert_eq!(writer.written_bytes, 10_000);
+
+        // Chunk 2 spans the boundary between run 0 (ends at 32768) and run 1
+        fs.write_chunk(&mut writer, &payload[10_000..35_000])
+            .expect("write chunk 2 (spanning boundary)");
+        assert_eq!(writer.written_bytes, 35_000);
+
+        fs.write_chunk(&mut writer, &payload[35_000..49_152])
+            .expect("write chunk 3");
+        assert_eq!(writer.written_bytes, 49_152);
+
+        // Finish file
+        let ino = fs
+            .finish_file(writer, "/", "fragmented_test.bin")
+            .expect("finish file");
+        assert!(ino >= 256);
+
+        // Verify reader sees correct file content
+        let readback = fs.read_file("/fragmented_test.bin").expect("read file");
+        assert_eq!(readback, payload);
+
+        // Verify extents in fs_tree
+        let found = fs
+            .resolve_no_follow(fs.fs_tree(), "/fragmented_test.bin")
+            .expect("resolve");
+        let extents = fs
+            .file_extents(found.tree.bytenr, found.inode.objectid)
+            .expect("file extents");
+        assert_eq!(extents.len(), 2);
+        assert_eq!(extents[0].file_offset, 0);
+        assert_eq!(extents[0].disk_bytenr, 17_825_792);
+        assert_eq!(extents[0].num_bytes, 32_768);
+        assert_eq!(extents[0].kind, ExtentKind::Regular);
+
+        assert_eq!(extents[1].file_offset, 32_768);
+        assert_eq!(extents[1].disk_bytenr, 16_777_216);
+        assert_eq!(extents[1].num_bytes, 16_384);
+        assert_eq!(extents[1].kind, ExtentKind::Regular);
+
+        drop(fs);
+
+        // Remount and check persistence
+        let dev_ro = FileDevice::open(&temp_img).expect("open ro");
+        let fs_ro = Btrfs::mount(dev_ro).expect("mount ro");
+        let readback_ro = fs_ro
+            .read_file("/fragmented_test.bin")
+            .expect("read file ro");
+        assert_eq!(readback_ro, payload);
+
+        let _ = std::fs::remove_file(&temp_img);
     }
 }

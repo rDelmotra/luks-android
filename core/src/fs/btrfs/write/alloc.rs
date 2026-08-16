@@ -202,6 +202,110 @@ impl FreeSpaceMap {
         Err(LuksError::FilesystemFull)
     }
 
+    /// Allocate a data chunk of up to `max_size` bytes from a DATA (or MIXED) block group,
+    /// aligned to `sector_size` (e.g. 4096).
+    ///
+    /// Finds the best/largest available free range in a `BLOCK_GROUP_DATA` (or MIXED) block group,
+    /// carves out up to `max_size` (aligned to `sector_size`), updating free ranges,
+    /// `total_allocated_bytes`, `total_free_bytes`, and `block_group.used`.
+    ///
+    /// Returns `Ok((bytenr, allocated_len))`.
+    /// Returns `Err(LuksError::FilesystemFull)` only if 0 bytes could be allocated across all data block groups.
+    pub fn allocate_data_chunk(&mut self, max_size: u64, sector_size: u32) -> Result<(u64, u64)> {
+        if max_size == 0 {
+            return Err(LuksError::FilesystemFull);
+        }
+        let alignment = sector_size as u64;
+        let max_aligned = (max_size / alignment) * alignment;
+        if max_aligned == 0 {
+            return Err(LuksError::FilesystemFull);
+        }
+
+        let mut best_choice: Option<(usize, usize, u64, u64)> = None; // (bg_idx, range_idx, aligned_start, alloc_len)
+
+        for (bg_idx, bg) in self.block_groups.iter().enumerate() {
+            // Check for data or mixed block group
+            let is_data = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
+                || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
+                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+
+            if !is_data {
+                continue;
+            }
+
+            for (range_idx, range) in bg.free_ranges.iter().enumerate() {
+                let aligned_start = (range.start + alignment - 1) & !(alignment - 1);
+                let range_end = range.start.saturating_add(range.length);
+                if aligned_start >= range_end {
+                    continue;
+                }
+                let avail = range_end - aligned_start;
+                let usable = (avail / alignment) * alignment;
+                if usable == 0 {
+                    continue;
+                }
+                let alloc_len = usable.min(max_aligned);
+
+                match best_choice {
+                    None => {
+                        best_choice = Some((bg_idx, range_idx, aligned_start, alloc_len));
+                        if alloc_len == max_aligned {
+                            break;
+                        }
+                    }
+                    Some((_, _, _, best_len)) => {
+                        if alloc_len > best_len {
+                            best_choice = Some((bg_idx, range_idx, aligned_start, alloc_len));
+                            if alloc_len == max_aligned {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((_, _, _, best_len)) = best_choice {
+                if best_len == max_aligned {
+                    break;
+                }
+            }
+        }
+
+        let (bg_idx, range_idx, allocated_start, alloc_len) =
+            best_choice.ok_or(LuksError::FilesystemFull)?;
+
+        let bg = &mut self.block_groups[bg_idx];
+        let range = bg.free_ranges[range_idx];
+        let before_len = allocated_start - range.start;
+        let after_len = (range.start + range.length) - (allocated_start + alloc_len);
+
+        bg.free_ranges.remove(range_idx);
+        let insert_pos = range_idx;
+        if after_len > 0 {
+            bg.free_ranges.insert(
+                insert_pos,
+                FreeRange {
+                    start: allocated_start + alloc_len,
+                    length: after_len,
+                },
+            );
+        }
+        if before_len > 0 {
+            bg.free_ranges.insert(
+                insert_pos,
+                FreeRange {
+                    start: range.start,
+                    length: before_len,
+                },
+            );
+        }
+
+        bg.total_allocated_bytes += alloc_len;
+        bg.total_free_bytes -= alloc_len;
+        bg.block_group.used += alloc_len;
+
+        Ok((allocated_start, alloc_len))
+    }
+
     /// Allocate a data extent of `size` bytes from a DATA (or MIXED) block group,
     /// aligned to `sector_size` (e.g. 4096).
     ///
@@ -264,6 +368,47 @@ impl FreeSpaceMap {
         }
 
         Err(LuksError::FilesystemFull)
+    }
+
+    /// Mark a data extent of `size` bytes starting at `bytenr` as freed in this transaction.
+    ///
+    /// The extent is recorded in `pinned_freed` rather than returned to `free_ranges`
+    /// to avoid reusing it within the same transaction.
+    pub fn free_data(&mut self, bytenr: u64, size: u64) -> Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let freed_len = size;
+        for bg in &mut self.block_groups {
+            if bytenr >= bg.block_group.start
+                && bytenr + freed_len <= bg.block_group.start + bg.block_group.length
+            {
+                let pos = bg.pinned_freed.partition_point(|r| r.start < bytenr);
+                bg.pinned_freed.insert(
+                    pos,
+                    FreeRange {
+                        start: bytenr,
+                        length: freed_len,
+                    },
+                );
+
+                let mut merged: Vec<FreeRange> = Vec::new();
+                for r in bg.pinned_freed.drain(..) {
+                    if let Some(last) = merged.last_mut() {
+                        if last.start + last.length == r.start {
+                            last.length += r.length;
+                            continue;
+                        }
+                    }
+                    merged.push(r);
+                }
+                bg.pinned_freed = merged;
+
+                bg.block_group.used = bg.block_group.used.saturating_sub(freed_len);
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     /// Mark a metadata block of `size` bytes starting at `bytenr` as freed in this transaction.
@@ -378,4 +523,178 @@ pub fn read_free_space_tree<D: ReadAt>(fs: &Btrfs<D>) -> Result<Option<Vec<FreeR
 
     ranges.sort_by_key(|r| r.start);
     Ok(Some(ranges))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::btrfs::chunk::BLOCK_GROUP_DATA;
+    use crate::fs::btrfs::write::extent_tree::BlockGroupItem;
+
+    fn create_test_data_bg(start: u64, length: u64, free_ranges: Vec<FreeRange>) -> BlockGroupFreeSpace {
+        let total_free: u64 = free_ranges.iter().map(|r| r.length).sum();
+        BlockGroupFreeSpace {
+            block_group: BlockGroupItem {
+                start,
+                length,
+                used: length - total_free,
+                chunk_objectid: 256,
+                flags: BLOCK_GROUP_DATA,
+            },
+            allocated_extents: Vec::new(),
+            free_ranges,
+            pinned_freed: Vec::new(),
+            total_allocated_bytes: length - total_free,
+            total_free_bytes: total_free,
+        }
+    }
+
+    #[test]
+    fn allocate_data_chunk_picks_largest_available_range() {
+        let bg = create_test_data_bg(
+            0,
+            1_000_000,
+            vec![
+                FreeRange {
+                    start: 16_384,
+                    length: 16_384,
+                },
+                FreeRange {
+                    start: 65_536,
+                    length: 65_536,
+                },
+                FreeRange {
+                    start: 262_144,
+                    length: 32_768,
+                },
+            ],
+        );
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // 1. Request 48KB: should allocate from 64KB range at 65,536
+        let (bytenr, len) = map.allocate_data_chunk(49_152, 4096).unwrap();
+        assert_eq!(bytenr, 65_536);
+        assert_eq!(len, 49_152);
+        assert_eq!(map.block_groups[0].total_free_bytes, 114_688 - 49_152);
+
+        // 2. Request 48KB: largest remaining is 32KB at 262,144, so it returns 32KB
+        let (bytenr, len) = map.allocate_data_chunk(49_152, 4096).unwrap();
+        assert_eq!(bytenr, 262_144);
+        assert_eq!(len, 32_768);
+
+        // 3. Request 32KB: remaining ranges are two 16KB ranges (16,384 and 114,688).
+        // It should return 16KB from the first one.
+        let (bytenr, len) = map.allocate_data_chunk(32_768, 4096).unwrap();
+        assert_eq!(bytenr, 16_384);
+        assert_eq!(len, 16_384);
+
+        // 4. Request remaining 16KB
+        let (bytenr, len) = map.allocate_data_chunk(16_384, 4096).unwrap();
+        assert_eq!(bytenr, 114_688);
+        assert_eq!(len, 16_384);
+
+        // 5. Total free space exhausted
+        assert_eq!(map.block_groups[0].total_free_bytes, 0);
+        assert!(map.block_groups[0].free_ranges.is_empty());
+        assert!(matches!(
+            map.allocate_data_chunk(4096, 4096).unwrap_err(),
+            LuksError::FilesystemFull
+        ));
+    }
+
+    #[test]
+    fn free_data_and_merging() {
+        let bg = create_test_data_bg(0, 1_000_000, Vec::new());
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        map.free_data(10_000, 4096).unwrap();
+        assert_eq!(
+            map.block_groups[0].pinned_freed,
+            vec![FreeRange {
+                start: 10_000,
+                length: 4096
+            }]
+        );
+
+        // Adjacent free should merge
+        map.free_data(14_096, 4096).unwrap();
+        assert_eq!(
+            map.block_groups[0].pinned_freed,
+            vec![FreeRange {
+                start: 10_000,
+                length: 8192
+            }]
+        );
+
+        // Disjoint free
+        map.free_data(30_000, 4096).unwrap();
+        assert_eq!(
+            map.block_groups[0].pinned_freed,
+            vec![
+                FreeRange {
+                    start: 10_000,
+                    length: 8192
+                },
+                FreeRange {
+                    start: 30_000,
+                    length: 4096
+                }
+            ]
+        );
+
+        // Bridge or prepend to second range
+        map.free_data(25_904, 4096).unwrap();
+        assert_eq!(
+            map.block_groups[0].pinned_freed,
+            vec![
+                FreeRange {
+                    start: 10_000,
+                    length: 8192
+                },
+                FreeRange {
+                    start: 25_904,
+                    length: 8192
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn allocate_data_chunk_unaligned_free_range() {
+        let bg = create_test_data_bg(
+            0,
+            1_000_000,
+            vec![FreeRange {
+                start: 4000,
+                length: 10_000, // 4000..14000
+            }],
+        );
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // Aligned start at 4096, usable is 8192 (4096..12288)
+        let (bytenr, len) = map.allocate_data_chunk(4096, 4096).unwrap();
+        assert_eq!(bytenr, 4096);
+        assert_eq!(len, 4096);
+
+        // Before fragment 4000..4096 (len 96) and after fragment 8192..14000 (len 5808)
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 4000,
+                    length: 96
+                },
+                FreeRange {
+                    start: 8192,
+                    length: 5808
+                },
+            ]
+        );
+    }
 }
