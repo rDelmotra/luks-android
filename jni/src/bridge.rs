@@ -23,7 +23,7 @@
 //!   bulk pipe and desynchronise the device.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use luks_core::device::ReadAt;
@@ -91,6 +91,11 @@ pub mod code {
     /// The remedies are unrelated — 12 means "free something up", 17 means
     /// "this file's shape does not fit this filesystem's geometry".
     pub const ITEM_TOO_LARGE: i32 = 17;
+    /// A previous write panicked, poisoning the volume mutex. Further writes
+    /// on this volume handle are refused to protect disk state.
+    pub const MUTEX_POISONED: i32 = 18;
+    /// An operation was cancelled via cancellation token.
+    pub const CANCELLED: i32 = 19;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -118,6 +123,8 @@ pub fn error_code(e: &LuksError) -> i32 {
         WriterBusy => code::WRITER_BUSY,
         WrongWriteTarget { .. } => code::WRONG_TARGET,
         UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
+        SessionPoisoned => code::MUTEX_POISONED,
+        Cancelled => code::CANCELLED,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,
@@ -376,14 +383,21 @@ impl Drop for VolumeHandle {
 }
 
 impl VolumeHandle {
-    /// A poisoned lock means an earlier call panicked partway through a
-    /// filesystem operation. Unlike the device, this *does* have invariants a
-    /// panic could have broken, so recovering the guard is a considered
-    /// trade: the alternative is a permanently dead volume handle for the rest
-    /// of the session, and the filesystem's real state is on the disk to be
-    /// re-checked either way.
-    fn fs(&self) -> std::sync::MutexGuard<'_, MountedFs> {
+    /// A poisoned lock on a read operation is recovered via `.into_inner()`
+    /// because read operations do not mutate disk state or corrupt in-memory allocators.
+    pub fn fs_for_reading(&self) -> std::sync::MutexGuard<'_, MountedFs> {
         self.fs.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A poisoned lock on a write operation fails immediately with `SessionPoisoned`
+    /// (code 18 `MUTEX_POISONED`) to prevent mutating or flushing partially-broken state.
+    pub fn fs_for_writing(&self) -> Result<std::sync::MutexGuard<'_, MountedFs>> {
+        self.fs.lock().map_err(|_| LuksError::SessionPoisoned)
+    }
+
+    #[inline]
+    pub fn fs(&self) -> std::sync::MutexGuard<'_, MountedFs> {
+        self.fs_for_reading()
     }
 }
 
@@ -697,7 +711,7 @@ impl VolumeHandle {
     /// empty string would make "unnamed" indistinguishable from "named with an
     /// empty string".
     pub fn info_json(&self) -> String {
-        let fs = self.fs();
+        let fs = self.fs_for_reading();
         json!({
             "partitionOffset": self.partition_offset,
             "fsType": fs.kind().name(),
@@ -715,7 +729,7 @@ impl VolumeHandle {
     }
 
     pub fn list_dir_json(&self, path: &str) -> Result<String> {
-        let mut entries = self.fs().list_dir(path)?;
+        let mut entries = self.fs_for_reading().list_dir(path)?;
         // "." and ".." are real dirents; the UI never wants them, and filtering
         // here keeps every future shell from re-deciding it.
         entries.retain(|e| e.name != "." && e.name != "..");
@@ -747,8 +761,51 @@ impl VolumeHandle {
         Ok(json!({ "path": path, "entries": items }).to_string())
     }
 
+    pub fn list_directory_paged(&self, path: &str, offset: usize, limit: usize) -> Result<String> {
+        let mut entries = self.fs_for_reading().list_dir(path)?;
+        entries.retain(|e| e.name != "." && e.name != "..");
+        entries.sort_by(|a, b| {
+            b.file_type
+                .is_dir()
+                .cmp(&a.file_type.is_dir())
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+
+        let total_count = entries.len();
+        let start = offset.min(total_count);
+        let end = if limit == 0 {
+            total_count
+        } else {
+            (start + limit).min(total_count)
+        };
+        let page_entries = &entries[start..end];
+        let has_more = end < total_count;
+        let next_offset = end;
+
+        let items: Vec<Value> = page_entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "name": e.name,
+                    "inode": e.inode,
+                    "type": type_name(e.file_type),
+                    "isSubvolume": e.is_subvolume,
+                })
+            })
+            .collect();
+
+        Ok(json!({
+            "path": path,
+            "entries": items,
+            "next_offset": next_offset,
+            "has_more": has_more,
+            "total_count": total_count,
+        })
+        .to_string())
+    }
+
     pub fn file_info_json(&self, path: &str) -> Result<String> {
-        let info = self.fs().file_info(path)?;
+        let info = self.fs_for_reading().file_info(path)?;
         Ok(json!({
             "path": path,
             "size": info.size,
@@ -765,7 +822,7 @@ impl VolumeHandle {
     }
 
     pub fn statfs_json(&self) -> Result<String> {
-        let stat = self.fs().statfs()?;
+        let stat = self.fs_for_reading().statfs()?;
         Ok(json!({
             "totalBytes": stat.total_bytes,
             "freeBytes": stat.free_bytes,
@@ -783,7 +840,7 @@ impl VolumeHandle {
     /// gigabyte file would blow the app heap long before the read finished.
     /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
     pub fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let fs = self.fs();
+        let fs = self.fs_for_reading();
         let info = fs.file_info(path)?;
         if info.size > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
@@ -806,23 +863,59 @@ impl VolumeHandle {
     /// Fill `buf` from `offset`, returning how many bytes were written.
     /// A short return means end of file.
     pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let file = self.fs().open(path)?;
+        let file = self.fs_for_reading().open(path)?;
         if !file.file_type().is_file() {
             return Err(LuksError::IsADirectory(path.to_string()));
         }
-        self.fs().read_open(&file, offset, buf)
+        self.fs_for_reading().read_open(&file, offset, buf)
     }
 
-    /// Hash a file without ever holding it in memory.
-    ///
-    /// This is the acceptance test for the whole stack: it is how the phone
-    /// checks a 1 GiB file against `STICK-MANIFEST.txt` without a 1 GiB
-    /// allocation, and the throughput it reports is the first real end-to-end
-    /// number from USB through SCSI, LUKS and ext4.
-    pub fn sha256_json(&self, path: &str, chunk_bytes: usize) -> Result<String> {
+    /// Stream a file to an `io::Write` destination in chunks, checking for cancellation between chunks.
+    pub fn read_file_stream<W: std::io::Write>(
+        &self,
+        path: &str,
+        mut writer: W,
+        chunk_bytes: usize,
+        cancel_token: u64,
+    ) -> Result<u64> {
+        let file = self.fs_for_reading().open(path)?;
+        let size = file.size();
+        let chunk = if chunk_bytes == 0 {
+            1024 * 1024
+        } else {
+            chunk_bytes.clamp(8, 8 * 1024 * 1024)
+        };
+        let mut buf = vec![0u8; chunk];
+        let mut done = 0u64;
+
+        while done < size {
+            if cancel_token != 0 && is_cancelled(cancel_token) {
+                return Err(LuksError::Cancelled);
+            }
+            let want = std::cmp::min(chunk as u64, size - done) as usize;
+            let got = self.fs_for_reading().read_open(&file, done, &mut buf[..want])?;
+            if got == 0 {
+                break;
+            }
+            writer.write_all(&buf[..got]).map_err(|e| LuksError::Io {
+                path: path.to_string(),
+                source: e,
+            })?;
+            done += got as u64;
+        }
+
+        if cancel_token != 0 && is_cancelled(cancel_token) {
+            return Err(LuksError::Cancelled);
+        }
+
+        Ok(done)
+    }
+
+    /// Hash a file without ever holding it in memory, checking for cancellation between chunks.
+    pub fn sha256_json_with_cancel(&self, path: &str, chunk_bytes: usize, cancel_token: u64) -> Result<String> {
         use sha2::{Digest, Sha256};
 
-        let file = self.fs().open(path)?;
+        let file = self.fs_for_reading().open(path)?;
         let size = file.size();
         // 0 means "pick something sensible". An explicit value is honoured down
         // to 8 bytes so the streaming loop can be tested against the small
@@ -840,16 +933,23 @@ impl VolumeHandle {
         let started = std::time::Instant::now();
 
         while done < size {
+            if cancel_token != 0 && is_cancelled(cancel_token) {
+                return Err(LuksError::Cancelled);
+            }
             let want = std::cmp::min(chunk as u64, size - done) as usize;
             // Re-locked each iteration rather than held across the whole hash: a
             // 1 GiB file is minutes of USB, and holding it would stall every
             // other call on the volume for that long.
-            let got = self.fs().read_open(&file, done, &mut buf[..want])?;
+            let got = self.fs_for_reading().read_open(&file, done, &mut buf[..want])?;
             if got == 0 {
                 break;
             }
             hasher.update(&buf[..got]);
             done += got as u64;
+        }
+
+        if cancel_token != 0 && is_cancelled(cancel_token) {
+            return Err(LuksError::Cancelled);
         }
 
         let elapsed = started.elapsed();
@@ -866,6 +966,16 @@ impl VolumeHandle {
             } else { 0 },
         })
         .to_string())
+    }
+
+    /// Hash a file without ever holding it in memory.
+    ///
+    /// This is the acceptance test for the whole stack: it is how the phone
+    /// checks a 1 GiB file against `STICK-MANIFEST.txt` without a 1 GiB
+    /// allocation, and the throughput it reports is the first real end-to-end
+    /// number from USB through SCSI, LUKS and ext4.
+    pub fn sha256_json(&self, path: &str, chunk_bytes: usize) -> Result<String> {
+        self.sha256_json_with_cancel(path, chunk_bytes, 0)
     }
 }
 
@@ -946,6 +1056,58 @@ fn format_uuid(u: &[u8; 16]) -> String {
         &h[16..20],
         &h[20..32]
     )
+}
+
+// ------------------------------------------------------------ cancellation registry
+
+static CANCEL_TOKENS: Mutex<Option<HashMap<u64, Arc<AtomicBool>>>> = Mutex::new(None);
+static NEXT_CANCEL_TOKEN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Register a new cancellation token and return its unique token ID.
+pub fn register_cancel_token() -> u64 {
+    let id = NEXT_CANCEL_TOKEN_ID.fetch_add(1, Ordering::Relaxed);
+    let mut lock = CANCEL_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    let map = lock.get_or_insert_with(HashMap::new);
+    map.insert(id, Arc::new(AtomicBool::new(false)));
+    id
+}
+
+/// Signal cancellation on the operation associated with `token_id`.
+pub fn cancel_operation(token_id: u64) {
+    if token_id == 0 {
+        return;
+    }
+    let lock = CANCEL_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(map) = lock.as_ref() {
+        if let Some(flag) = map.get(&token_id) {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Release / unregister the cancellation token.
+pub fn unregister_cancel_token(token_id: u64) {
+    if token_id == 0 {
+        return;
+    }
+    let mut lock = CANCEL_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(map) = lock.as_mut() {
+        map.remove(&token_id);
+    }
+}
+
+/// Query whether the operation associated with `token_id` has been cancelled.
+pub fn is_cancelled(token_id: u64) -> bool {
+    if token_id == 0 {
+        return false;
+    }
+    let lock = CANCEL_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(map) = lock.as_ref() {
+        if let Some(flag) = map.get(&token_id) {
+            return flag.load(Ordering::Acquire);
+        }
+    }
+    false
 }
 
 // ------------------------------------------------------------ handle registry glue
@@ -1422,5 +1584,73 @@ mod tests {
             error_code(&LuksError::BadMagic { found: [0; 6] }),
             code::NOT_LUKS
         );
+        assert_eq!(error_code(&LuksError::SessionPoisoned), code::MUTEX_POISONED);
+        assert_eq!(error_code(&LuksError::Cancelled), code::CANCELLED);
+    }
+
+    #[test]
+    fn cancel_registry_lifecycle_and_cancellation() {
+        let token = register_cancel_token();
+        assert!(token > 0);
+        assert!(!is_cancelled(token));
+
+        cancel_operation(token);
+        assert!(is_cancelled(token));
+
+        unregister_cancel_token(token);
+        assert!(!is_cancelled(token));
+    }
+
+    #[test]
+    fn paged_directory_listing_returns_pagination_metadata() {
+        let vol = unlock_fixture();
+        // Root dir has at least proof.txt, dir, lost+found
+        let v_all: Value = serde_json::from_str(&vol.list_directory_paged("/", 0, 0).unwrap()).unwrap();
+        let total = v_all["total_count"].as_u64().unwrap() as usize;
+        assert!(total >= 3);
+        assert_eq!(v_all["entries"].as_array().unwrap().len(), total);
+        assert_eq!(v_all["has_more"].as_bool().unwrap(), false);
+        assert_eq!(v_all["next_offset"].as_u64().unwrap() as usize, total);
+
+        // Page 1: limit 1
+        let v_page1: Value = serde_json::from_str(&vol.list_directory_paged("/", 0, 1).unwrap()).unwrap();
+        assert_eq!(v_page1["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(v_page1["total_count"].as_u64().unwrap() as usize, total);
+        assert_eq!(v_page1["has_more"].as_bool().unwrap(), true);
+        assert_eq!(v_page1["next_offset"].as_u64().unwrap(), 1);
+
+        // Page 2: offset 1, limit 1
+        let v_page2: Value = serde_json::from_str(&vol.list_directory_paged("/", 1, 1).unwrap()).unwrap();
+        assert_eq!(v_page2["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(v_page2["total_count"].as_u64().unwrap() as usize, total);
+        assert_eq!(v_page2["has_more"].as_bool().unwrap(), total > 2);
+        assert_eq!(v_page2["next_offset"].as_u64().unwrap(), 2);
+
+        // Verify entries do not overlap and match full listing
+        let name_p1 = v_page1["entries"][0]["name"].as_str().unwrap();
+        let name_p2 = v_page2["entries"][0]["name"].as_str().unwrap();
+        assert_ne!(name_p1, name_p2);
+        assert_eq!(name_p1, v_all["entries"][0]["name"].as_str().unwrap());
+        assert_eq!(name_p2, v_all["entries"][1]["name"].as_str().unwrap());
+    }
+
+    #[test]
+    fn streamed_sha256_and_read_stream_halt_when_cancelled() {
+        let vol = unlock_fixture();
+        let path = "/proof.txt";
+
+        let token = register_cancel_token();
+        cancel_operation(token);
+
+        // sha256_json_with_cancel with cancelled token
+        let err_sha = vol.sha256_json_with_cancel(path, 8, token).unwrap_err();
+        assert_eq!(error_code(&err_sha), code::CANCELLED);
+
+        // read_file_stream with cancelled token
+        let mut buf = Vec::new();
+        let err_stream = vol.read_file_stream(path, &mut buf, 8, token).unwrap_err();
+        assert_eq!(error_code(&err_stream), code::CANCELLED);
+
+        unregister_cancel_token(token);
     }
 }

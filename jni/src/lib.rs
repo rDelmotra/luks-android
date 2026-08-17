@@ -277,6 +277,47 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseVolume<'l>(
     })
 }
 
+// ----------------------------------------------------------- cancel tokens
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCreateCancelToken<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let token = bridge::register_cancel_token();
+        Ok(token as jlong)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCancelOperation<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    token_id: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        if token_id > 0 {
+            bridge::cancel_operation(token_id as u64);
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseCancelToken<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    token_id: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        if token_id > 0 {
+            bridge::unregister_cancel_token(token_id as u64);
+        }
+        Ok(())
+    })
+}
+
 // --------------------------------------------------------------------- device
 
 #[no_mangle]
@@ -373,6 +414,25 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeListDir<'l>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeListDirPaged<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    offset: jlong,
+    limit: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let offset_val = usize::try_from(offset.max(0)).unwrap_or(0);
+        let limit_val = usize::try_from(limit.max(0)).unwrap_or(0);
+        let json = vol.list_directory_paged(&path, offset_val, limit_val)?;
+        out_string(env, &json)
+    })
+}
+
+#[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileInfo<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
@@ -457,6 +517,43 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256<'l>(
         let path = jstr(env, &path)?;
         let json = vol.sha256_json(&path, chunk_bytes.max(0) as usize)?;
         out_string(env, &json)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256WithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    chunk_bytes: jint,
+    cancel_token: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let json = vol.sha256_json_with_cancel(&path, chunk_bytes.max(0) as usize, token)?;
+        out_string(env, &json)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFileStream<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    chunk_bytes: jint,
+    cancel_token: jlong,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let mut sink = std::io::sink();
+        let bytes = vol.read_file_stream(&path, &mut sink, chunk_bytes.max(0) as usize, token)?;
+        Ok(bytes as jlong)
     })
 }
 
@@ -631,6 +728,48 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
             .as_mut()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
         Ok(vol.write_file_chunk(state, slice)?)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunkWithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    writer: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+    cancel_token: jlong,
+) {
+    guard(&mut env, (), |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
+        if wh.volume_id != vol.id {
+            return Err(bad_handle("writer belongs to another volume"));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let state = slot
+            .as_mut()
+            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        Ok(vol.write_file_chunk_with_cancel(state, slice, token)?)
     })
 }
 

@@ -22,7 +22,11 @@ internal object LuksNative {
     init {
         // Loads libluks_jni.so from the APK's lib/arm64-v8a/. Built by
         // tools/build-android-libs.sh, not by Gradle.
-        System.loadLibrary("luks_jni")
+        try {
+            System.loadLibrary("luks_jni")
+        } catch (_: UnsatisfiedLinkError) {
+            // Expected in host JVM unit test environment
+        }
     }
 
     /** Version of the Rust core. The cheapest possible proof the .so loaded. */
@@ -64,6 +68,18 @@ internal object LuksNative {
 
     /** JSON: `{ path, entries: [{ name, inode, type }] }`, "." and ".." removed. */
     external fun nativeListDir(handle: Long, path: String): String
+
+    /** JSON: `{ path, entries: [{ name, inode, type }] }` with pagination. */
+    external fun nativeListDirPaged(handle: Long, path: String, offset: Long, limit: Long): String
+
+    /** Creates a cancel token for interrupting long-running native operations. */
+    external fun nativeCreateCancelToken(): Long
+
+    /** Signals cancellation on the operation associated with [tokenId]. */
+    external fun nativeCancelOperation(tokenId: Long)
+
+    /** Frees the native cancel token handle. */
+    external fun nativeCloseCancelToken(tokenId: Long)
 
     /** JSON: size, mode, uid, gid, links, type, times. */
     external fun nativeFileInfo(handle: Long, path: String): String

@@ -68,6 +68,9 @@ android {
             useLegacyPackaging = false
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 // Gradle has no idea Cargo exists. Rather than a plugin that breaks on every
@@ -162,7 +165,9 @@ dependencies {
 
     debugImplementation(libs.androidx.compose.ui.tooling)
 
+    testImplementation(libs.junit)
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
 }
+

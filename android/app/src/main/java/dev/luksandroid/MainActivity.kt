@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
-import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -34,6 +33,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -41,61 +41,14 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import dev.luksandroid.session.LuksSession
+import dev.luksandroid.session.SessionState
+import dev.luksandroid.session.UsbDetachReceiver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-/**
- * Diagnostic logging — **debug builds only**.
- *
- * The phone has one USB-C port, so attaching a drive means unplugging the
- * cable that carries `adb`. Wireless debugging (the Android 11+ pairing-code
- * flow — *not* `adb tcpip`, which opens an unauthenticated port) is set up on
- * the test Pixel and makes logcat watchable live with the drive attached. This
- * still earns its place without it: the ring buffer survives a disconnect, so
- * a dump taken after the drive comes off is a record of what happened while it
- * was on.
- *
- * ### What is deliberately not logged
- *
- * Never the passphrase, obviously — but also **never a file or directory name
- * from the encrypted drive**. The whole premise of the tool is that those
- * contents are private, and the system log is the wrong place for them: it
- * outlives the session, it is not encrypted, and on a debug build a bug report
- * would carry it off the device. So this logs *shapes* — counts, sizes, types,
- * timings, error codes — which is everything needed to diagnose a transport
- * failure and nothing that says what is on the drive.
- *
- * `BuildConfig.DEBUG` gates the lot, so a release build logs nothing at all
- * rather than relying on this file staying disciplined.
- */
-object Trace {
-    const val TAG = "luks"
-    const val TAG_ERR = "luks_err"
-
-    fun i(msg: String) {
-        if (BuildConfig.DEBUG) Log.i(TAG, msg)
-    }
-
-    fun e(msg: String, t: Throwable? = null) {
-        if (BuildConfig.DEBUG) Log.e(TAG, msg, t)
-    }
-
-    fun formatErr(code: Int, operation: String, detail: String = ""): String =
-        "code=$code op=$operation ${detail.take(128)}"
-
-    /**
-     * Production-safe error logging: logs error codes, operations, opcodes, sizes.
-     * NEVER logs passphrases, filenames, or directory paths from the encrypted drive.
-     */
-    fun err(code: Int, operation: String, detail: String = "") {
-        Log.e(TAG_ERR, "code=$code op=$operation ${detail.take(128)}")
-    }
-}
 
 /**
  * Pass 3: unlock and browse.
@@ -133,6 +86,8 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        UsbDetachReceiver.register(this)
+
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -142,6 +97,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        LuksSession.onTrimMemory(level)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        UsbDetachReceiver.unregister(this)
+    }
 }
 
 /** What's shown for one detected [UsbMassStorage.Target]. */
@@ -152,25 +116,11 @@ private sealed interface DeviceState {
     data class Failed(val message: String) : DeviceState
 }
 
-/**
- * Unlock state for the screen as a whole, not per device.
- *
- * One partition is unlocked at a time by construction — each unlock costs a
- * full KDF run, so a UI that invited several at once would be inviting the user
- * to wait several times over.
- */
-private sealed interface VolumeState {
-    data object None : VolumeState
-    data class Prompting(val partition: PartitionInfo) : VolumeState
-    data class Unlocking(val partition: PartitionInfo) : VolumeState
-    data class Unlocked(val volume: LuksVolume, val entries: List<Entry>) : VolumeState
-    data class Failed(val partition: PartitionInfo, val message: String) : VolumeState
-}
-
 @Composable
 private fun DiagnosticsScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val sessionState by LuksSession.state.collectAsState()
 
     // Deliberately not in a try/catch: if the library fails to load there is no
     // app, and an UnsatisfiedLinkError in logcat names the missing .so.
@@ -181,7 +131,6 @@ private fun DiagnosticsScreen() {
     // `findTargets()` returns fresh UsbDevice instances on every rescan, so
     // object identity would forget every open device on the next scan.
     var states by remember { mutableStateOf(mapOf<String, DeviceState>()) }
-    var volume by remember { mutableStateOf<VolumeState>(VolumeState.None) }
     var selfTest by remember { mutableStateOf<String?>(null) }
 
     fun keyOf(t: UsbMassStorage.Target) =
@@ -189,21 +138,6 @@ private fun DiagnosticsScreen() {
 
     // Whether a native call is in flight, for the whole screen rather than for
     // one composable.
-    //
-    // This is what stands between "Close device" or "Lock" and a
-    // use-after-free. Both free a native handle — `nativeCloseVolume` and
-    // `nativeCloseDevice` reach `Box::from_raw` — and every long operation here
-    // (unlock, benchmark, listing, hashing, export, the debug write) is holding
-    // a `&VolumeHandle` or a `&DeviceHandle` on an IO thread while it runs.
-    // Freeing one underneath the other frees the cached superblock, the group
-    // descriptors and the master key.
-    //
-    // It lives here, not in `UnlockedBody`, because that is the mistake this
-    // replaces: `busy` was a `remember` local of `UnlockedBody`, so it could
-    // gate `Lock` and could not gate `Close device`, which sits a level up in
-    // `OpenDeviceBody` — and additionally closes the file descriptor Rust is
-    // reading through. Reads were exposed to this too, not only the write path;
-    // nothing enforced it at the level where both buttons could see it.
     var busy by remember { mutableStateOf(false) }
 
     Column(
@@ -287,14 +221,6 @@ private fun DiagnosticsScreen() {
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                             )
-                            // Set before Open, because the transport's limit is
-                            // fixed when the device is opened and cannot move
-                            // afterwards. Blank or 0 leaves the built-in 128 KiB.
-                            // Seeded from the object, never from "". The field
-                            // is recreated whenever this screen recomposes, and
-                            // `DebugTuning` is not — so a blank default made the
-                            // display disagree with what Open actually used, and
-                            // a run at 1 MiB looked like a run at the default.
                             var maxKib by remember {
                                 mutableStateOf(
                                     DebugTuning.maxTransferBytes
@@ -335,15 +261,15 @@ private fun DiagnosticsScreen() {
                         is DeviceState.Open -> {
                             OpenDeviceBody(
                                 device = state.device,
-                                volume = volume,
-                                onVolumeChange = { volume = it },
+                                sessionState = sessionState,
                                 busy = busy,
                                 onBusyChange = { busy = it },
                                 onClose = {
-                                    (volume as? VolumeState.Unlocked)?.volume?.close()
-                                    volume = VolumeState.None
-                                    state.device.close()
-                                    states = states + (key to DeviceState.Idle)
+                                    scope.launch {
+                                        LuksSession.lock()
+                                        state.device.close()
+                                        states = states + (key to DeviceState.Idle)
+                                    }
                                 },
                                 scope = scope,
                                 context = context,
@@ -369,8 +295,7 @@ private fun DiagnosticsScreen() {
 @Composable
 private fun OpenDeviceBody(
     device: LuksDevice,
-    volume: VolumeState,
-    onVolumeChange: (VolumeState) -> Unit,
+    sessionState: SessionState,
     busy: Boolean,
     onBusyChange: (Boolean) -> Unit,
     onClose: () -> Unit,
@@ -378,6 +303,7 @@ private fun OpenDeviceBody(
     context: Context,
 ) {
     val info = device.info
+    var promptingPartition by remember { mutableStateOf<PartitionInfo?>(null) }
 
     Text(
         "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} " +
@@ -393,8 +319,8 @@ private fun OpenDeviceBody(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text("  ${p.label}", style = MaterialTheme.typography.bodySmall)
-            if (p.isLuks && volume is VolumeState.None) {
-                TextButton(onClick = { onVolumeChange(VolumeState.Prompting(p)) }) {
+            if (p.isLuks && sessionState is SessionState.Locked && promptingPartition == null) {
+                TextButton(onClick = { promptingPartition = p }) {
                     Text("Unlock")
                 }
             }
@@ -404,17 +330,10 @@ private fun OpenDeviceBody(
         Text("No LUKS partition on this drive.", style = MaterialTheme.typography.bodySmall)
     }
 
-    // Raw transport throughput, with LUKS and ext4 out of the picture. Compare
-    // it against the full-stack SHA-256 rate: if they match, the link is the
-    // ceiling and the crypto/filesystem layers are free.
     var benchmark by remember { mutableStateOf<String?>(null) }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         TextButton(
             onClick = {
-                // The shared flag, not a local one: this reads through the
-                // device handle for 128 MiB, and "Close device" below frees
-                // that handle. A private `benchmarking` boolean could stop a
-                // second benchmark and could not stop that.
                 onBusyChange(true)
                 benchmark = "reading 128 MiB of raw blocks…"
                 scope.launch {
@@ -431,10 +350,6 @@ private fun OpenDeviceBody(
             Text("Benchmark raw read")
         }
 
-        // The other half of the comparison. Read and write go through the same
-        // Bulk-Only Transport, the same command size and the same three ioctls,
-        // so a gap between these two numbers is above the transport and a gap
-        // that is *not* here is the drive's or the bus's.
         if (LuksNative.nativeWriteSupported()) {
             TextButton(
                 onClick = {
@@ -459,26 +374,28 @@ private fun OpenDeviceBody(
 
     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
 
-    when (volume) {
-        is VolumeState.None -> Unit
+    when (sessionState) {
+        is SessionState.Locked -> {
+            promptingPartition?.let { partition ->
+                PasswordPrompt(
+                    partition = partition,
+                    onCancel = { promptingPartition = null },
+                    onSubmit = { passwordBuffer ->
+                        onBusyChange(true)
+                        val part = partition
+                        promptingPartition = null
+                        scope.launch {
+                            passwordBuffer.use { buf ->
+                                LuksSession.unlock(context, device, part, buf)
+                            }
+                            onBusyChange(false)
+                        }
+                    },
+                )
+            }
+        }
 
-        is VolumeState.Prompting -> PasswordPrompt(
-            partition = volume.partition,
-            onCancel = { onVolumeChange(VolumeState.None) },
-            onSubmit = { passwordBuffer ->
-                onVolumeChange(VolumeState.Unlocking(volume.partition))
-                onBusyChange(true)
-                scope.launch {
-                    val result = passwordBuffer.use { buf ->
-                        unlock(context, device, volume.partition, buf)
-                    }
-                    onVolumeChange(result)
-                    onBusyChange(false)
-                }
-            },
-        )
-
-        is VolumeState.Unlocking -> {
+        is SessionState.Unlocking -> {
             CircularProgressIndicator(modifier = Modifier.padding(4.dp))
             Text(
                 "Deriving the key. On a 1 GiB Argon2 keyslot this takes several " +
@@ -488,26 +405,49 @@ private fun OpenDeviceBody(
             )
         }
 
-        is VolumeState.Unlocked -> UnlockedBody(
-            state = volume,
-            onVolumeChange = onVolumeChange,
+        is SessionState.Unlocked -> UnlockedBody(
+            state = sessionState,
             busy = busy,
             onBusyChange = onBusyChange,
             scope = scope,
         )
 
-        is VolumeState.Failed -> {
-            Text("Unlock failed: ${volume.message}", style = MaterialTheme.typography.bodySmall)
-            Button(onClick = { onVolumeChange(VolumeState.Prompting(volume.partition)) }) {
-                Text("Try again")
+        is SessionState.Detached -> {
+            Text(
+                "Drive detached: ${sessionState.message}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Button(onClick = { scope.launch { LuksSession.reset() } }) {
+                Text("Reset")
+            }
+        }
+
+        is SessionState.Failed -> {
+            Text(
+                "Session failed: ${sessionState.message}",
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { scope.launch { LuksSession.reset() } }) {
+                    Text("Reset")
+                }
+                if (sessionState.partition != null) {
+                    val p = sessionState.partition
+                    TextButton(onClick = {
+                        scope.launch {
+                            LuksSession.reset()
+                            promptingPartition = p
+                        }
+                    }) {
+                        Text("Try again")
+                    }
+                }
             }
         }
     }
 
-    // Gated, which it was not before: this closes the volume *and* the device,
-    // and the device close also releases the USB interface and the file
-    // descriptor the Rust side reads through. Tapped during any of the above it
-    // frees a handle an IO thread is still using.
     Button(onClick = onClose, enabled = !busy) { Text("Close device") }
 }
 
@@ -547,8 +487,7 @@ private fun PasswordPrompt(
 
 @Composable
 private fun UnlockedBody(
-    state: VolumeState.Unlocked,
-    onVolumeChange: (VolumeState) -> Unit,
+    state: SessionState.Unlocked,
     busy: Boolean,
     onBusyChange: (Boolean) -> Unit,
     scope: kotlinx.coroutines.CoroutineScope,
@@ -559,18 +498,8 @@ private fun UnlockedBody(
     var path by remember { mutableStateOf("/") }
     var entries by remember { mutableStateOf(state.entries) }
     var status by remember { mutableStateOf<String?>(null) }
-    // Which file the pending "create document" dialog is for. The launcher
-    // callback carries only the destination Uri, not what we were exporting.
     var pendingExport by remember { mutableStateOf<String?>(null) }
 
-    /**
-     * Writes a file out through the Storage Access Framework.
-     *
-     * SAF rather than a WRITE_EXTERNAL_STORAGE permission: the user picks the
-     * destination themselves, the app gets access to exactly that one file, and
-     * nothing has to be granted broad storage access to copy a document off an
-     * encrypted drive.
-     */
     val exporter = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
     ) { uri ->
@@ -579,9 +508,7 @@ private fun UnlockedBody(
         if (uri == null || source == null) return@rememberLauncherForActivityResult
         onBusyChange(true)
         scope.launch {
-            status = exportFile(context, state.volume, source, uri) { done, total ->
-                // Compose snapshot state is safe to write from any thread, so
-                // progress can be reported straight from the IO dispatcher.
+            status = exportFile(context, source, uri) { done, total ->
                 val pct = if (total > 0) done * 100 / total else 0
                 status = "copying ${source.substringAfterLast('/')} — $pct% " +
                     "(${formatSize(done)} of ${formatSize(total)})"
@@ -598,7 +525,7 @@ private fun UnlockedBody(
         scope.launch {
             var lastUpdateMs = System.currentTimeMillis()
             var lastUpdateBytes = 0L
-            status = importFile(context, state.volume, path, uri) { done, total ->
+            status = importFile(context, path, uri) { done, total ->
                 val now = System.currentTimeMillis()
                 val dt = now - lastUpdateMs
                 if (dt >= 500 || done == total) {
@@ -612,7 +539,9 @@ private fun UnlockedBody(
                 }
             }
             try {
-                entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
+                entries = withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.listDir(path) }
+                }
             } catch (_: Exception) {}
             onBusyChange(false)
         }
@@ -623,7 +552,9 @@ private fun UnlockedBody(
         status = null
         scope.launch {
             try {
-                val listed = withContext(Dispatchers.IO) { state.volume.listDir(to) }
+                val listed = withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.listDir(to) }
+                }
                 entries = listed
                 path = to
             } catch (e: LuksException) {
@@ -640,9 +571,11 @@ private fun UnlockedBody(
     }
 
     var statFsInfo by remember { mutableStateOf<StatFsInfo?>(null) }
-    LaunchedEffect(state.volume, path) {
+    LaunchedEffect(state.partition, path) {
         try {
-            statFsInfo = withContext(Dispatchers.IO) { state.volume.statFs() }
+            statFsInfo = withContext(Dispatchers.IO) {
+                LuksSession.withLease { v -> v.statFs() }
+            }
         } catch (e: LuksException) {
             Trace.err(e.code, "statfs", "err=${e.message}")
             Trace.e("statfs: failed [${e.code}] ${e.message}")
@@ -657,12 +590,14 @@ private fun UnlockedBody(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    state.volume.createDirectory(path, name)
+                    LuksSession.withLease { v -> v.createDirectory(path, name) }
                 }
                 entries = withContext(Dispatchers.IO) {
-                    state.volume.listDir(path)
+                    LuksSession.withLease { v -> v.listDir(path) }
                 }
-                statFsInfo = withContext(Dispatchers.IO) { state.volume.statFs() }
+                statFsInfo = withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.statFs() }
+                }
                 status = "created folder $name"
             } catch (e: LuksException) {
                 Trace.err(e.code, "create_directory", "err=${e.message}")
@@ -682,10 +617,10 @@ private fun UnlockedBody(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    state.volume.rename(path, oldName, path, newName)
+                    LuksSession.withLease { v -> v.rename(path, oldName, path, newName) }
                 }
                 entries = withContext(Dispatchers.IO) {
-                    state.volume.listDir(path)
+                    LuksSession.withLease { v -> v.listDir(path) }
                 }
                 status = "renamed $oldName to $newName"
             } catch (e: LuksException) {
@@ -714,8 +649,6 @@ private fun UnlockedBody(
         )
     }
     if (info.subvolumes.isNotEmpty()) {
-        // Worth showing rather than hiding: on a Linux install these are where
-        // the actual content lives, and their paths are directly navigable.
         Text(
             "subvolumes: " + info.subvolumes.joinToString(", ") {
                 it.path + if (it.readOnly) " (ro)" else ""
@@ -764,7 +697,7 @@ private fun UnlockedBody(
                             status = "hashing ${entry.name}…"
                             onBusyChange(true)
                             scope.launch {
-                                status = hashFile(state.volume, full)
+                                status = hashFile(full)
                                 onBusyChange(false)
                             }
                         },
@@ -780,10 +713,10 @@ private fun UnlockedBody(
                                 scope.launch {
                                     try {
                                         withContext(Dispatchers.IO) {
-                                            state.volume.deleteFile(full)
+                                            LuksSession.withLease { v -> v.deleteFile(full) }
                                         }
                                         entries = withContext(Dispatchers.IO) {
-                                            state.volume.listDir(path)
+                                            LuksSession.withLease { v -> v.listDir(path) }
                                         }
                                         status = "deleted ${entry.name}"
                                     } catch (e: LuksException) {
@@ -812,30 +745,7 @@ private fun UnlockedBody(
         Text(it, style = MaterialTheme.typography.bodySmall)
     }
 
-    // A plumbing proof for the write path — debug builds only, and the only
-    // way a write is reachable from the app at all today.
-    //
-    // It replaces an `adb shell am start --ez` intent trigger, which was the
-    // wrong shape twice over. It never fired: the extra key in the code and
-    // the key in every documented command did not match, and nothing noticed
-    // because no hardware run had happened. And getting the signal from
-    // `onNewIntent` into a composable needed a StateFlow and a LaunchedEffect,
-    // which brought their own bugs — the effect cancelled on re-trigger while
-    // the blocking JNI call underneath carried on regardless, and rapid
-    // triggers conflated into one run. A button has none of that: it is a
-    // click handler in the composable that already holds the volume, and it
-    // sets the same `busy` flag every other operation here sets.
-    //
-    // It also closes the exported-activity question. `exported="true"` is
-    // required for `USB_DEVICE_ATTACHED`, so any installed app could send the
-    // trigger intent once the key was fixed; there is no longer an intent to
-    // send.
     if (BuildConfig.DEBUG) {
-        // Size is configurable (1-100 MB) rather than the fixed 28 bytes this
-        // proved the plumbing with on 2026-08-07: three limits sit between
-        // that and a real file (memory residency, the 4-extent ceiling on a
-        // new inode, BLOCK_UNINIT capacity) and nothing measures which binds
-        // first. This is how that gets measured, on hardware.
         var debugWriteSizeMb by remember { mutableStateOf("10") }
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             OutlinedTextField(
@@ -863,21 +773,17 @@ private fun UnlockedBody(
                             val content = withContext(Dispatchers.Default) { testPayload(sizeBytes) }
                             val startMs = System.currentTimeMillis()
                             val ino = withContext(Dispatchers.IO) {
-                                state.volume.writeFile(path, name, content)
+                                LuksSession.withLease { v -> v.writeFile(path, name, content) }
                             }
                             val elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1)
                             val mibPerSec = (content.size / 1_048_576.0) / (elapsedMs / 1000.0)
-                            // Shapes, not names — the file is on an encrypted
-                            // drive and this is the system log. Same rule as
-                            // everywhere else in this file.
                             Trace.i(
                                 "debug write: ok, inode=$ino, ${content.size} bytes " +
                                     "in ${elapsedMs}ms (${"%.2f".format(mibPerSec)} MiB/s)"
                             )
-                            // Re-listed so the write is visible without navigating
-                            // away and back. Re-listing is also the cheapest proof
-                            // available that it reached the volume at all.
-                            entries = withContext(Dispatchers.IO) { state.volume.listDir(path) }
+                            entries = withContext(Dispatchers.IO) {
+                                LuksSession.withLease { v -> v.listDir(path) }
+                            }
                             status = "wrote $name (inode $ino) — ${"%.2f".format(mibPerSec)} MiB/s"
                         } catch (e: LuksException) {
                             Trace.e("debug write: failed [${e.code}] ${e.message}")
@@ -911,8 +817,11 @@ private fun UnlockedBody(
         }
         Button(
             onClick = {
-                state.volume.close()
-                onVolumeChange(VolumeState.None)
+                scope.launch {
+                    onBusyChange(true)
+                    LuksSession.lock()
+                    onBusyChange(false)
+                }
             },
             enabled = !busy,
         ) {
@@ -941,20 +850,9 @@ private fun testPayload(sizeBytes: Int): ByteArray {
 }
 
 /**
- * Requests permission if needed, then opens the device and reads its
- * partition table. All of it runs off the main thread: `requestPermission`
- * suspends on user input, and `UsbMassStorage.open` blocks on real USB
- * transfers (INQUIRY, READ CAPACITY, the LUKS-magic probe of every partition).
- */
-/**
  * Transport settings a debug session needs to vary between runs.
- *
- * A plain object rather than state threaded through the screen: it is read
- * once, at open, and nothing recomposes on it. Debug-only — nothing in the
- * normal path sets it, so it stays 0 and the transport keeps its default.
  */
 private object DebugTuning {
-    /** Bytes per bulk transfer, or 0 for the built-in 128 KiB. */
     var maxTransferBytes: Int = 0
 }
 
@@ -971,9 +869,6 @@ private suspend fun openDevice(
     return try {
         val started = System.currentTimeMillis()
         val requested = DebugTuning.maxTransferBytes
-        // Logged unconditionally. "No line" would be ambiguous between "ran at
-        // the default" and "the log was not reached", and a run whose settings
-        // are inferred rather than recorded is not a measurement.
         Trace.i(
             "open: max transfer = " +
                 if (requested > 0) "$requested bytes (requested)" else "built-in default"
@@ -986,9 +881,6 @@ private suspend fun openDevice(
                 "${device.info.partitions.size} partitions, " +
                 "${device.luksPartitions.size} LUKS"
         )
-        // Only present in a write-enabled build. It is the answer to "why did
-        // the drive refuse WRITE(10)", and it has to be captured at open —
-        // asking after a failure is too late once the volume is gone.
         device.info.writeProbe?.let { Trace.i("write probe: $it") }
         DeviceState.Open(device)
     } catch (e: LuksException) {
@@ -1003,86 +895,40 @@ private suspend fun openDevice(
 }
 
 /**
- * The slow path: Argon2, then the AF-merge, digest check and ext4 mount.
- *
- * Wrapped in [UnlockService.holding] so the process is in the foreground class
- * for the whole derivation, and run on [Dispatchers.IO] so the UI thread stays
- * free to draw the spinner.
- */
-private suspend fun unlock(
-    context: Context,
-    device: LuksDevice,
-    partition: PartitionInfo,
-    password: dev.luksandroid.security.SecurePassphraseBuffer,
-): VolumeState = try {
-    Trace.i("unlock: partition at ${partition.offsetBytes} bytes")
-    val started = System.currentTimeMillis()
-    UnlockService.holding(context) {
-        withContext(Dispatchers.IO) {
-            val v = device.unlock(partition.offsetBytes, password)
-            val kdf = System.currentTimeMillis() - started
-            val info = v.info
-            Trace.i(
-                "unlock: ok in $kdf ms · fs=${info.fsType} " +
-                    "block=${info.blockSize} size=${info.sizeBytes} " +
-                    "subvolumes=${info.subvolumes.size}"
-            )
-            val entries = v.listDir("/")
-            Trace.i("unlock: root listed, ${entries.size} entries")
-            VolumeState.Unlocked(v, entries)
-        }
-    }
-} catch (e: LuksException) {
-    Trace.err(e.code, "unlock")
-    Trace.e("unlock: failed [${e.code}] ${e.message}")
-    VolumeState.Failed(
-        partition,
-        if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}",
-    )
-} catch (e: Exception) {
-    Trace.err(-1, "unlock")
-    Trace.e("unlock: failed", e)
-    VolumeState.Failed(partition, e.message ?: e.toString())
-}
-
-/**
  * Copies a file off the encrypted drive to a user-chosen destination,
  * streaming it a megabyte at a time.
- *
- * Never holds the whole file: the drive being read is expected to contain
- * things far larger than the app heap, and the entire point of `readChunk` is
- * that a 1 GiB file is copied with a 1 MiB buffer.
  */
 private suspend fun exportFile(
     context: Context,
-    volume: LuksVolume,
     path: String,
     uri: android.net.Uri,
     onProgress: (done: Long, total: Long) -> Unit,
 ): String = try {
     withContext(Dispatchers.IO) {
-        val total = volume.fileSize(path)
-        var done = 0L
-        val started = System.currentTimeMillis()
+        LuksSession.withLease { volume ->
+            val total = volume.fileSize(path)
+            var done = 0L
+            val started = System.currentTimeMillis()
 
-        val stream = context.contentResolver.openOutputStream(uri)
-            ?: throw IllegalStateException("could not open the destination for writing")
+            val stream = context.contentResolver.openOutputStream(uri)
+                ?: throw IllegalStateException("could not open the destination for writing")
 
-        stream.use { out ->
-            while (done < total) {
-                val chunk = volume.readChunk(path, done, EXPORT_CHUNK)
-                if (chunk.isEmpty()) break // short read: end of file
-                out.write(chunk)
-                done += chunk.size
-                onProgress(done, total)
+            stream.use { out ->
+                while (done < total) {
+                    val chunk = volume.readChunk(path, done, EXPORT_CHUNK)
+                    if (chunk.isEmpty()) break
+                    out.write(chunk)
+                    done += chunk.size
+                    onProgress(done, total)
+                }
+                out.flush()
             }
-            out.flush()
-        }
 
-        val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
-        Trace.i("export: %d bytes in %.1f s · %.1f MiB/s".format(done, secs, done / secs / (1L shl 20)))
-        "saved ${formatSize(done)} in %.1f s · %.1f MiB/s"
-            .format(secs, done / secs / (1L shl 20))
+            val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+            Trace.i("export: %d bytes in %.1f s · %.1f MiB/s".format(done, secs, done / secs / (1L shl 20)))
+            "saved ${formatSize(done)} in %.1f s · %.1f MiB/s"
+                .format(secs, done / secs / (1L shl 20))
+        }
     }
 } catch (e: LuksException) {
     Trace.err(e.code, "transfer")
@@ -1102,73 +948,74 @@ private const val EXPORT_CHUNK = 1 shl 20
  */
 private suspend fun importFile(
     context: Context,
-    volume: LuksVolume,
     parentPath: String,
     uri: android.net.Uri,
     onProgress: (done: Long, total: Long) -> Unit,
 ): String = try {
     withContext(Dispatchers.IO) {
-        val contentResolver = context.contentResolver
-        var fileName: String? = null
-        var fileSize: Long = -1L
+        LuksSession.withLease { volume ->
+            val contentResolver = context.contentResolver
+            var fileName: String? = null
+            var fileSize: Long = -1L
 
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) {
-                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
-                if (nameIndex != -1) fileName = cursor.getString(nameIndex)
-                if (sizeIndex != -1 && !cursor.isNull(sizeIndex)) fileSize = cursor.getLong(sizeIndex)
-            }
-        }
-
-        val name = fileName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}"
-        if (fileSize < 0L) {
-            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                fileSize = pfd.statSize
-            }
-        }
-
-        check(fileSize >= 0L) { "could not determine file size" }
-
-        val started = System.currentTimeMillis()
-        var done = 0L
-        val buffer = java.nio.ByteBuffer.allocateDirect(IMPORT_CHUNK)
-
-        val writer = volume.beginFile(fileSize)
-        try {
-            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                java.io.FileInputStream(pfd.fileDescriptor).channel.use { channel ->
-                    while (done < fileSize) {
-                        buffer.clear()
-                        val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
-                        buffer.limit(toRead)
-                        
-                        var read = 0
-                        while (buffer.hasRemaining()) {
-                            val r = channel.read(buffer)
-                            if (r <= 0) break
-                            read += r
-                        }
-                        if (read <= 0) break
-                        
-                        buffer.flip()
-                        writer.write(buffer, read)
-                        done += read
-                        onProgress(done, fileSize)
-                    }
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIndex != -1) fileName = cursor.getString(nameIndex)
+                    if (sizeIndex != -1 && !cursor.isNull(sizeIndex)) fileSize = cursor.getLong(sizeIndex)
                 }
-            } ?: throw IllegalStateException("could not open input file descriptor")
-
-            if (done < fileSize) {
-                throw IllegalStateException("short read: read $done bytes of $fileSize expected")
             }
 
-            val ino = writer.finish(parentPath, name)
-            val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
-            Trace.i("import: %d bytes in %.1f s · %.1f MiB/s (inode %d)".format(done, secs, done / secs / (1L shl 20), ino))
-            "uploaded $name (${formatSize(done)}) in %.1f s · %.1f MiB/s".format(secs, done / secs / (1L shl 20))
-        } finally {
-            writer.close()
+            val name = fileName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}"
+            if (fileSize < 0L) {
+                contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    fileSize = pfd.statSize
+                }
+            }
+
+            check(fileSize >= 0L) { "could not determine file size" }
+
+            val started = System.currentTimeMillis()
+            var done = 0L
+            val buffer = java.nio.ByteBuffer.allocateDirect(IMPORT_CHUNK)
+
+            val writer = volume.beginFile(fileSize)
+            try {
+                contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                    java.io.FileInputStream(pfd.fileDescriptor).channel.use { channel ->
+                        while (done < fileSize) {
+                            buffer.clear()
+                            val toRead = (fileSize - done).coerceAtMost(IMPORT_CHUNK.toLong()).toInt()
+                            buffer.limit(toRead)
+
+                            var read = 0
+                            while (buffer.hasRemaining()) {
+                                val r = channel.read(buffer)
+                                if (r <= 0) break
+                                read += r
+                            }
+                            if (read <= 0) break
+
+                            buffer.flip()
+                            writer.write(buffer, read)
+                            done += read
+                            onProgress(done, fileSize)
+                        }
+                    }
+                } ?: throw IllegalStateException("could not open input file descriptor")
+
+                if (done < fileSize) {
+                    throw IllegalStateException("short read: read $done bytes of $fileSize expected")
+                }
+
+                val ino = writer.finish(parentPath, name)
+                val secs = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
+                Trace.i("import: %d bytes in %.1f s · %.1f MiB/s (inode %d)".format(done, secs, done / secs / (1L shl 20), ino))
+                "uploaded $name (${formatSize(done)}) in %.1f s · %.1f MiB/s".format(secs, done / secs / (1L shl 20))
+            } finally {
+                writer.close()
+            }
         }
     }
 } catch (e: LuksException) {
@@ -1181,14 +1028,16 @@ private suspend fun importFile(
     "upload failed: ${e.message}"
 }
 
-private const val IMPORT_CHUNK = 1 shl 20 // 1 MiB (reduces Binder IPC & JNI switches while Rust handles 128 KiB SCSI chunking)
+private const val IMPORT_CHUNK = 1 shl 20
 
 /** Streams the file through SHA-256 and reports the throughput it managed. */
-private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
-    val d = withContext(Dispatchers.IO) { volume.sha256(path) }
+private suspend fun hashFile(path: String): String = try {
+    val d = withContext(Dispatchers.IO) {
+        LuksSession.withLease { volume ->
+            volume.sha256(path)
+        }
+    }
     val mbPerSec = d.bytesPerSec.toDouble() / (1L shl 20)
-    // Size and rate, not the path: this is the throughput measurement, and the
-    // name of the file being read off an encrypted drive is not part of it.
     Trace.i("hash: %d bytes in %d ms · %.1f MiB/s".format(d.bytes, d.elapsedMs, mbPerSec))
     "${d.sha256}\n${formatSize(d.bytes)} in ${d.elapsedMs} ms · %.1f MiB/s".format(mbPerSec)
 } catch (e: LuksException) {
@@ -1204,7 +1053,6 @@ private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
 private fun probeReflectionSurface(context: android.content.Context): String {
     val results = mutableListOf<String>()
 
-    // Control 1: Known Good (public method)
     try {
         val m = android.text.SpannableStringBuilder::class.java.getMethod("length")
         val ssb = android.text.SpannableStringBuilder("test")
@@ -1218,7 +1066,6 @@ private fun probeReflectionSurface(context: android.content.Context): String {
         results.add("PROBE: CONTROL_GOOD = FAIL (${t.javaClass.simpleName}: ${t.message})")
     }
 
-    // Control 2: Known Bad (non-existent field)
     try {
         android.text.SpannableStringBuilder::class.java.getDeclaredField("mNoSuchField")
         results.add("PROBE: CONTROL_BAD = FAIL (unexpectedly found field)")
@@ -1228,7 +1075,6 @@ private fun probeReflectionSurface(context: android.content.Context): String {
         results.add("PROBE: CONTROL_BAD = FAIL (${t.javaClass.simpleName}: ${t.message})")
     }
 
-    // Target 1: SpannableStringBuilder.mText
     try {
         val f = android.text.SpannableStringBuilder::class.java.getDeclaredField("mText").apply { isAccessible = true }
         val ssb = android.text.SpannableStringBuilder("hello")
@@ -1242,7 +1088,6 @@ private fun probeReflectionSurface(context: android.content.Context): String {
         results.add("PROBE: SSB_MTEXT = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
     }
 
-    // Targets 2, 3, 4: TextView.mEditor, Editor.mAllowUndo, Editor.mUndoManager
     try {
         val tv = android.widget.EditText(context)
         val fEditor = android.widget.TextView::class.java.getDeclaredField("mEditor").apply { isAccessible = true }
@@ -1251,7 +1096,6 @@ private fun probeReflectionSurface(context: android.content.Context): String {
             results.add("PROBE: TEXTVIEW_MEDITOR = OK")
             val editorClass = editor.javaClass
 
-            // Dump Editor fields and methods to find undo-related members
             try {
                 val fields = editorClass.declaredFields.map { it.name }
                 val undoFields = fields.filter { it.contains("undo", ignoreCase = true) }

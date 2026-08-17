@@ -23,7 +23,10 @@
 #![cfg(feature = "dangerous-write-support")]
 
 use luks_core::device::FileDevice;
-use luks_jni::bridge::{code, error_code, DeviceHandle, VolumeHandle};
+use luks_jni::bridge::{
+    cancel_operation, code, error_code, is_cancelled, register_cancel_token,
+    unregister_cancel_token, DeviceHandle, VolumeHandle,
+};
 use std::process::Command;
 
 const PASSWORD: &[u8] = b"test";
@@ -937,6 +940,165 @@ fn btrfs_volume_handle_statfs_mkdir_rename_and_read_cap() {
     assert!(vol.read_file("/btrfs_sub/renamed_b_data.txt", exact_len).is_ok());
     let err_capped = vol.read_file("/btrfs_sub/renamed_b_data.txt", exact_len - 1).unwrap_err();
     assert_eq!(error_code(&err_capped), code::UNSUPPORTED);
+}
+
+#[test]
+fn write_mutex_poison_fatal_to_writing_but_reads_survive_ext4() {
+    let path = scratch("mutex-poison-ext4");
+    let vol = unlock(&path);
+
+    // Initial write succeeds
+    vol.write_file("/", "before_poison.txt", b"safe data\n").expect("write_file");
+
+    // Simulate a panicked write holding the write lock
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = vol.fs_for_writing().unwrap();
+        panic!("simulated panic inside write transaction");
+    }));
+    assert!(panic_result.is_err(), "panic should have occurred");
+
+    // Subsequent write operations on this handle MUST be refused with MUTEX_POISONED (18)
+    let err_write = vol.write_file("/", "after_poison.txt", b"unsafe data\n").unwrap_err();
+    assert_eq!(error_code(&err_write), code::MUTEX_POISONED);
+
+    let err_mkdir = vol.create_directory("/", "poison_dir").unwrap_err();
+    assert_eq!(error_code(&err_mkdir), code::MUTEX_POISONED);
+
+    let err_rename = vol.rename("/", "before_poison.txt", "/", "renamed.txt").unwrap_err();
+    assert_eq!(error_code(&err_rename), code::MUTEX_POISONED);
+
+    let err_delete = vol.delete_file("/before_poison.txt").unwrap_err();
+    assert_eq!(error_code(&err_delete), code::MUTEX_POISONED);
+
+    let err_begin = vol.begin_file(1024).err().expect("begin_file should fail on poisoned handle");
+    assert_eq!(error_code(&err_begin), code::MUTEX_POISONED);
+
+    // BUT read operations survive because read lock recovers from poison!
+    let info = vol.info_json();
+    assert!(info.contains("DISKDATA"));
+
+    let list_json = vol.list_dir_json("/").expect("list_dir_json must survive");
+    let list_val: serde_json::Value = serde_json::from_str(&list_json).unwrap();
+    let entries = list_val["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["name"] == "before_poison.txt"));
+
+    let data = vol.read_file("/before_poison.txt", 1024).expect("read_file must survive");
+    assert_eq!(data, b"safe data\n");
+}
+
+#[test]
+fn write_mutex_poison_fatal_to_writing_but_reads_survive_btrfs() {
+    let path = scratch_btrfs("mutex-poison-btrfs");
+    let vol = unlock(&path);
+
+    vol.write_file("/", "btrfs_before.txt", b"btrfs safe data\n").expect("write_file");
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = vol.fs_for_writing().unwrap();
+        panic!("simulated panic inside btrfs write transaction");
+    }));
+    assert!(panic_result.is_err());
+
+    // Subsequent write operations MUST be refused with MUTEX_POISONED
+    let err_write = vol.write_file("/", "btrfs_after.txt", b"bad\n").unwrap_err();
+    assert_eq!(error_code(&err_write), code::MUTEX_POISONED);
+
+    let err_mkdir = vol.create_directory("/", "b_dir").unwrap_err();
+    assert_eq!(error_code(&err_mkdir), code::MUTEX_POISONED);
+
+    let err_rename = vol.rename("/", "btrfs_before.txt", "/", "renamed.txt").unwrap_err();
+    assert_eq!(error_code(&err_rename), code::MUTEX_POISONED);
+
+    let err_delete = vol.delete_file("/btrfs_before.txt").unwrap_err();
+    assert_eq!(error_code(&err_delete), code::MUTEX_POISONED);
+
+    let err_begin = vol.begin_file(1024).err().expect("begin_file should fail on poisoned handle");
+    assert_eq!(error_code(&err_begin), code::MUTEX_POISONED);
+
+    // Read operations survive
+    let list_json = vol.list_dir_json("/").expect("list_dir_json must survive");
+    let list_val: serde_json::Value = serde_json::from_str(&list_json).unwrap();
+    let entries = list_val["entries"].as_array().unwrap();
+    assert!(entries.iter().any(|e| e["name"] == "btrfs_before.txt"));
+
+    let data = vol.read_file("/btrfs_before.txt", 1024).expect("read_file must survive");
+    assert_eq!(data, b"btrfs safe data\n");
+}
+
+#[test]
+fn cancellation_token_halts_streaming_sha256_and_chunk_writes() {
+    let path = scratch("cancel-stream");
+    let vol = unlock(&path);
+
+    // 1. Test SHA256 cancellation
+    let token = register_cancel_token();
+    assert!(!is_cancelled(token));
+
+    // Cancel before or during streaming
+    cancel_operation(token);
+    assert!(is_cancelled(token));
+
+    let err_sha = vol.sha256_json_with_cancel("/proof.txt", 8, token).unwrap_err();
+    assert_eq!(error_code(&err_sha), code::CANCELLED);
+
+    // 2. Test streaming chunk write cancellation
+    let mut writer = vol.begin_file(1024).expect("begin_file");
+    let err_write = vol
+        .write_file_chunk_with_cancel(&mut writer, &[0x42u8; 128], token)
+        .unwrap_err();
+    assert_eq!(error_code(&err_write), code::CANCELLED);
+    vol.abandon_file(writer);
+
+    // 3. Test read_file_stream cancellation
+    let mut sink = Vec::new();
+    let err_read_stream = vol.read_file_stream("/proof.txt", &mut sink, 8, token).unwrap_err();
+    assert_eq!(error_code(&err_read_stream), code::CANCELLED);
+
+    unregister_cancel_token(token);
+    assert!(!is_cancelled(token));
+}
+
+#[test]
+fn paged_directory_listing_on_ext4_and_btrfs() {
+    // 1. ext4 paged listing
+    let ext4_path = scratch("paged-dir-ext4");
+    let ext4_vol = unlock(&ext4_path);
+
+    let ext4_paged_all: serde_json::Value = serde_json::from_str(
+        &ext4_vol.list_directory_paged("/", 0, 0).expect("list_directory_paged all")
+    ).unwrap();
+    let total_ext4 = ext4_paged_all["total_count"].as_u64().unwrap() as usize;
+    assert!(total_ext4 >= 3);
+    assert_eq!(ext4_paged_all["has_more"].as_bool().unwrap(), false);
+    assert_eq!(ext4_paged_all["next_offset"].as_u64().unwrap() as usize, total_ext4);
+
+    let ext4_p1: serde_json::Value = serde_json::from_str(
+        &ext4_vol.list_directory_paged("/", 0, 2).expect("page 1")
+    ).unwrap();
+    assert_eq!(ext4_p1["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(ext4_p1["has_more"].as_bool().unwrap(), total_ext4 > 2);
+    assert_eq!(ext4_p1["next_offset"].as_u64().unwrap(), 2);
+    assert_eq!(ext4_p1["total_count"].as_u64().unwrap() as usize, total_ext4);
+
+    let ext4_p2: serde_json::Value = serde_json::from_str(
+        &ext4_vol.list_directory_paged("/", 2, 2).expect("page 2")
+    ).unwrap();
+    let p2_count = ext4_p2["entries"].as_array().unwrap().len();
+    assert_eq!(p2_count, total_ext4 - 2);
+    assert_eq!(ext4_p2["has_more"].as_bool().unwrap(), false);
+    assert_eq!(ext4_p2["next_offset"].as_u64().unwrap() as usize, total_ext4);
+
+    // 2. btrfs paged listing
+    let btrfs_path = scratch_btrfs("paged-dir-btrfs");
+    let btrfs_vol = unlock(&btrfs_path);
+
+    let btrfs_p1: serde_json::Value = serde_json::from_str(
+        &btrfs_vol.list_directory_paged("/", 0, 1).expect("btrfs page 1")
+    ).unwrap();
+    assert_eq!(btrfs_p1["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(btrfs_p1["has_more"].as_bool().unwrap(), true);
+    assert_eq!(btrfs_p1["next_offset"].as_u64().unwrap(), 1);
+    assert!(btrfs_p1["total_count"].as_u64().unwrap() >= 2);
 }
 
 

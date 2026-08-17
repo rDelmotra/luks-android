@@ -246,6 +246,16 @@ pub enum LuksError {
         #[source]
         source: std::io::Error,
     },
+
+    // --- session lifecycle / cancellation ---
+    /// A previous write operation panicked while holding the volume lock.
+    /// Further writes are refused to prevent corrupting the on-disk state.
+    #[error("write mutex poisoned: a previous operation panicked")]
+    SessionPoisoned,
+
+    /// The operation was cancelled via cancellation token.
+    #[error("operation cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, LuksError>;

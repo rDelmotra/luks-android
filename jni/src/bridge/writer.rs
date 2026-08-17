@@ -20,7 +20,7 @@ impl VolumeHandle {
     /// Begin a bounded-memory file transfer. The returned state has no volume
     /// reference, so storing it in a JNI handle cannot prolong key lifetime.
     pub fn begin_file(&self, size: u64) -> Result<crate::bridge::FileWriterEnum> {
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         self.claim_writer()?;
         match &mut *fs {
             Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file(size)?)),
@@ -28,8 +28,16 @@ impl VolumeHandle {
         }
     }
 
-    pub fn write_file_chunk(&self, writer: &mut crate::bridge::FileWriterEnum, data: &[u8]) -> Result<()> {
-        let mut fs = self.fs();
+    pub fn write_file_chunk_with_cancel(
+        &self,
+        writer: &mut crate::bridge::FileWriterEnum,
+        data: &[u8],
+        cancel_token: u64,
+    ) -> Result<()> {
+        if cancel_token != 0 && crate::bridge::is_cancelled(cancel_token) {
+            return Err(LuksError::Cancelled);
+        }
+        let mut fs = self.fs_for_writing()?;
         match (&mut *fs, writer) {
             (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.write_chunk(w, data),
             (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.write_chunk(w, data),
@@ -37,8 +45,12 @@ impl VolumeHandle {
         }
     }
 
+    pub fn write_file_chunk(&self, writer: &mut crate::bridge::FileWriterEnum, data: &[u8]) -> Result<()> {
+        self.write_file_chunk_with_cancel(writer, data, 0)
+    }
+
     pub fn finish_file(&self, writer: crate::bridge::FileWriterEnum, parent_path: &str, name: &str) -> Result<u64> {
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         match (&mut *fs, writer) {
             (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => {
                 let dir_ino = match ext4.resolve(parent_path) {
@@ -62,7 +74,9 @@ impl VolumeHandle {
     }
 
     pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) {
-        let mut fs = self.fs();
+        let Ok(mut fs) = self.fs_for_writing() else {
+            return;
+        };
         match (&mut *fs, writer) {
             (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.abandon_file(w),
             (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.abandon_file(w),
@@ -79,34 +93,7 @@ impl VolumeHandle {
     /// file is one yanked cable away from never having existed — and pulling
     /// the cable is how a phone transfer normally ends.
     pub fn write_file(&self, parent_path: &str, name: &str, data: &[u8]) -> Result<u64> {
-        // One writer per *device*, not per volume.
-        //
-        // `nativeUnlock` can be called twice on one device handle, and nothing
-        // on the Kotlin side prevents it. Each call mounts its own filesystem
-        // state — ext4's superblock free counters and group descriptors, or
-        // btrfs's node cache — separately. Two of those allocating against one
-        // disk do not see each other's bookkeeping updates: measured on ext4,
-        // two volumes each writing one small file left `e2fsck` reporting
-        // wrong free counts, and racing them produced two files owning the
-        // same ten blocks — the one kind of damage `e2fsck` cannot repair
-        // without deleting something. Nothing about that argument is specific
-        // to ext4, so the same claim covers btrfs.
-        //
-        // A second *reader* is harmless and stays allowed: reads resolve
-        // through the disk, and only allocation depends on the cached state.
-        // So the claim is taken here, by the first write, rather than at
-        // unlock — refusing a second unlock outright would break a UI that
-        // re-prompts for a password without closing the first volume.
-        // Taken *under the filesystem lock*.
-        //
-        // Under the lock because the two-step "load, then compare_exchange"
-        // raced with itself otherwise: two threads writing through the *same*
-        // handle could both read `holds_writer == false`, both attempt the
-        // exchange, and the loser would be told another volume held the claim —
-        // a statement that was simply false. The `fs` mutex already serialises
-        // the work these two threads came to do, so it serialises the claim
-        // too, and the second one now sees the flag this one set.
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         self.claim_writer()?;
 
         match &mut *fs {
@@ -128,7 +115,7 @@ impl VolumeHandle {
 
     /// Delete a file by path from the encrypted volume.
     pub fn delete_file(&self, path: &str) -> Result<()> {
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         self.claim_writer()?;
         match &mut *fs {
             Fs::Ext4(ext4) => ext4.delete_file(path),
@@ -138,7 +125,7 @@ impl VolumeHandle {
 
     /// Create a directory at `parent_path` with name `name`.
     pub fn create_directory(&self, parent_path: &str, name: &str) -> Result<u64> {
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         self.claim_writer()?;
         match &mut *fs {
             Fs::Ext4(ext4) => {
@@ -156,7 +143,7 @@ impl VolumeHandle {
 
     /// Rename an item from `(old_parent, old_name)` to `(new_parent, new_name)`.
     pub fn rename(&self, old_parent: &str, old_name: &str, new_parent: &str, new_name: &str) -> Result<()> {
-        let mut fs = self.fs();
+        let mut fs = self.fs_for_writing()?;
         self.claim_writer()?;
         match &mut *fs {
             Fs::Ext4(ext4) => {

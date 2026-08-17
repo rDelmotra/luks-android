@@ -99,7 +99,11 @@ class LuksDevice internal constructor(
     private val usbInterface: UsbInterface,
 ) : AutoCloseable {
 
-    val info: DeviceInfo = parseDeviceInfo(LuksNative.nativeDeviceInfo(handle))
+    val info: DeviceInfo = if (handle == 0L) {
+        DeviceInfo("", "", 512, 0L, "", emptyList(), null)
+    } else {
+        parseDeviceInfo(LuksNative.nativeDeviceInfo(handle))
+    }
 
     /** Partitions carrying a LUKS header, found by probing, not by type GUID. */
     val luksPartitions: List<PartitionInfo> get() = info.partitions.filter { it.isLuks }
@@ -168,7 +172,9 @@ class LuksDevice internal constructor(
         // releasing the interface or closing the connection first would leave
         // Rust holding a descriptor the kernel may have reissued.
         if (handle != 0L) {
-            LuksNative.nativeCloseDevice(handle)
+            try {
+                LuksNative.nativeCloseDevice(handle)
+            } catch (_: UnsatisfiedLinkError) {}
             handle = 0
         }
         runCatching { connection.releaseInterface(usbInterface) }
@@ -180,31 +186,55 @@ class LuksDevice internal constructor(
 class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
     private val activeWriters = mutableSetOf<FileWriter>()
 
-    val info: VolumeInfo = JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
-        val subvols = it.optJSONArray("subvolumes")
+    val info: VolumeInfo = if (handle == 0L) {
         VolumeInfo(
-            // A volume with no label reports JSON null, and optString would
-            // turn that into the literal text "null" on screen.
-            label = if (it.isNull("label")) "" else it.optString("label"),
-            uuid = it.optString("uuid"),
-            blockSize = it.optInt("blockSize"),
-            sizeBytes = it.optLong("sizeBytes"),
-            fsType = it.optString("fsType"),
-            subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
-                val s = subvols!!.getJSONObject(i)
-                SubvolumeInfo(
-                    id = s.optLong("id"),
-                    name = s.optString("name"),
-                    path = s.optString("path"),
-                    readOnly = s.optBoolean("readOnly"),
-                )
-            },
+            label = "",
+            uuid = "",
+            blockSize = 4096,
+            sizeBytes = 0L,
+            fsType = "ext4",
+            subvolumes = emptyList(),
         )
+    } else {
+        JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
+            val subvols = it.optJSONArray("subvolumes")
+            VolumeInfo(
+                // A volume with no label reports JSON null, and optString would
+                // turn that into the literal text "null" on screen.
+                label = if (it.isNull("label")) "" else it.optString("label"),
+                uuid = it.optString("uuid"),
+                blockSize = it.optInt("blockSize"),
+                sizeBytes = it.optLong("sizeBytes"),
+                fsType = it.optString("fsType"),
+                subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
+                    val s = subvols!!.getJSONObject(i)
+                    SubvolumeInfo(
+                        id = s.optLong("id"),
+                        name = s.optString("name"),
+                        path = s.optString("path"),
+                        readOnly = s.optBoolean("readOnly"),
+                    )
+                },
+            )
+        }
     }
 
     fun listDir(path: String): List<Entry> {
         check(handle != 0L) { "volume is closed" }
         val entries = JSONObject(LuksNative.nativeListDir(handle, path)).getJSONArray("entries")
+        return (0 until entries.length()).map { i ->
+            val e = entries.getJSONObject(i)
+            Entry(
+                e.getString("name"),
+                e.getString("type"),
+                e.optBoolean("isSubvolume"),
+            )
+        }
+    }
+
+    fun listDirPaged(path: String, offset: Long, limit: Long): List<Entry> {
+        check(handle != 0L) { "volume is closed" }
+        val entries = JSONObject(LuksNative.nativeListDirPaged(handle, path, offset, limit)).getJSONArray("entries")
         return (0 until entries.length()).map { i ->
             val e = entries.getJSONObject(i)
             Entry(
@@ -335,7 +365,9 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
 
         override fun close() {
             if (writerHandle != 0L && handle != 0L) {
-                LuksNative.nativeCloseWriter(handle, writerHandle)
+                try {
+                    LuksNative.nativeCloseWriter(handle, writerHandle)
+                } catch (_: UnsatisfiedLinkError) {}
             }
             writerHandle = 0
             activeWriters -= this
@@ -346,7 +378,9 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
     override fun close() {
         if (handle != 0L) {
             activeWriters.toList().forEach { it.close() }
-            LuksNative.nativeCloseVolume(handle)
+            try {
+                LuksNative.nativeCloseVolume(handle)
+            } catch (_: UnsatisfiedLinkError) {}
             handle = 0
         }
     }

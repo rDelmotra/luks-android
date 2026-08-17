@@ -1,0 +1,286 @@
+package dev.luksandroid.session
+
+import dev.luksandroid.Entry
+import dev.luksandroid.PartitionInfo
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicInteger
+
+class LuksSessionTest {
+
+    private lateinit var testScope: CoroutineScope
+    private lateinit var session: SessionController
+
+    @Before
+    fun setUp() {
+        testScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        session = SessionController(scope = testScope)
+    }
+
+    @After
+    fun tearDown() {
+        testScope.cancel()
+    }
+
+    /**
+     * Test K.0: `withLease` allows concurrent readers and prevents `lock()` until leases drain.
+     */
+    @Test
+    fun testK0_concurrentReadersAndLockWaitsForDrain() = runBlocking {
+        val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+        val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+        val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+
+        session.startUnlockedForTest(
+            volume = null,
+            device = deviceStub,
+            volumeCloseable = volumeStub,
+        )
+
+        // Part 1: Verify concurrent readers can execute in parallel
+        val concurrentReaders = AtomicInteger(0)
+        val maxConcurrent = AtomicInteger(0)
+        val readyLatch = CompletableDeferred<Unit>()
+
+        val readerJobs = (1..5).map {
+            async(Dispatchers.Default) {
+                session.withLease {
+                    val count = concurrentReaders.incrementAndGet()
+                    maxConcurrent.updateAndGet { current -> maxOf(current, count) }
+                    readyLatch.await()
+                    concurrentReaders.decrementAndGet()
+                }
+            }
+        }
+
+        // Wait until all 5 readers have acquired their leases
+        while (concurrentReaders.get() < 5) {
+            delay(10)
+        }
+
+        assertTrue("Expected concurrent readers >= 2, got ${maxConcurrent.get()}", maxConcurrent.get() >= 2)
+        assertEquals(5, session.activeLeaseCount)
+
+        // Release reader latch
+        readyLatch.complete(Unit)
+        readerJobs.awaitAll()
+        assertEquals(0, session.activeLeaseCount)
+
+        // Part 2: Verify lock() waits for in-flight lease to drain and rejects new leases
+        val leaseInFlight = CompletableDeferred<Unit>()
+        val leaseCanFinish = CompletableDeferred<Unit>()
+        val leaseFinished = CompletableDeferred<Unit>()
+
+        val longLeaseJob = launch(Dispatchers.Default) {
+            session.withLease {
+                leaseInFlight.complete(Unit)
+                leaseCanFinish.await()
+            }
+            leaseFinished.complete(Unit)
+        }
+
+        leaseInFlight.await()
+        assertEquals(1, session.activeLeaseCount)
+
+        val lockFinished = CompletableDeferred<Unit>()
+        val lockJob = launch(Dispatchers.Default) {
+            session.lock()
+            lockFinished.complete(Unit)
+        }
+
+        // Give lock() a moment to initiate and wait
+        delay(50)
+
+        // Lock must still be waiting because lease is active
+        assertTrue("lock() must not finish while lease is active", !lockFinished.isCompleted)
+        assertTrue("State must not be Locked while lease is active", session.state.value !is SessionState.Locked)
+        assertTrue("Volume must not be closed while lease is active", closeOrder.isEmpty())
+
+        // Any new withLease call during locking must be rejected immediately
+        try {
+            session.withLease { }
+            fail("Expected IllegalStateException for withLease while locking")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message?.contains("locking") == true || e.message?.contains("not unlocked") == true)
+        }
+
+        // Finish the in-flight lease
+        leaseCanFinish.complete(Unit)
+        leaseFinished.await()
+        lockFinished.await()
+        lockJob.join()
+        longLeaseJob.join()
+
+        // Now lock() has completed
+        assertEquals(SessionState.Locked, session.state.value)
+        assertEquals(0, session.activeLeaseCount)
+        assertNull(session.volume)
+        assertNull(session.device)
+        assertTrue("Handles must be closed after lock", closeOrder.contains("VOLUME_CLOSED"))
+    }
+
+    /**
+     * Test K.1: Handle teardown ordering (volume closed before device).
+     */
+    @Test
+    fun testK1_handleTeardownOrdering_volumeClosedBeforeDevice() = runBlocking {
+        val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+        val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+        val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+
+        session.startUnlockedForTest(
+            volume = null,
+            device = deviceStub,
+            volumeCloseable = volumeStub,
+        )
+
+        session.lock()
+
+        assertEquals(listOf("VOLUME_CLOSED", "DEVICE_CLOSED"), closeOrder)
+        assertEquals(SessionState.Locked, session.state.value)
+    }
+
+    /**
+     * Test K.2: Detach event transitions state immediately to `Detached`.
+     */
+    @Test
+    fun testK2_detachEventTransitionsStateImmediatelyToDetached() = runBlocking {
+        val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+        val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+        val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+
+        session.startUnlockedForTest(
+            volume = null,
+            device = deviceStub,
+            volumeCloseable = volumeStub,
+            partition = PartitionInfo(1, "Data", 2048L, 1000000L, true, 2),
+        )
+
+        // Simulate USB unplug
+        session.onDeviceDetached("Hardware disconnect on USB port")
+
+        val state = session.state.value
+        assertTrue("State must be Detached", state is SessionState.Detached)
+        assertEquals("Hardware disconnect on USB port", (state as SessionState.Detached).message)
+
+        // Volume and device must be torn down
+        assertEquals(listOf("VOLUME_CLOSED", "DEVICE_CLOSED"), closeOrder)
+        assertNull(session.volume)
+        assertNull(session.device)
+
+        // Subsequent lease calls must be rejected
+        try {
+            session.withLease { }
+            fail("Expected IllegalStateException when in Detached state")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message?.contains("not unlocked") == true)
+        }
+
+        // Reset transitions back to Locked
+        session.reset()
+        assertEquals(SessionState.Locked, session.state.value)
+    }
+
+    /**
+     * Test K.4: Write poison moves session to `Failed`.
+     */
+    @Test
+    fun testK4_writePoisonMovesSessionToFailed() = runBlocking {
+        val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+        val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+        val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+
+        session.startUnlockedForTest(
+            volume = null,
+            device = deviceStub,
+            volumeCloseable = volumeStub,
+        )
+
+        // Simulate write poison
+        session.onWritePoison("btrfs allocator panic: poisoned mutex")
+
+        val state = session.state.value
+        assertTrue("State must be Failed", state is SessionState.Failed)
+        assertTrue(
+            "Message should describe write poison",
+            (state as SessionState.Failed).message.contains("Write poison: btrfs allocator panic: poisoned mutex")
+        )
+
+        // Teardown should have executed
+        assertEquals(listOf("VOLUME_CLOSED", "DEVICE_CLOSED"), closeOrder)
+        assertNull(session.volume)
+        assertNull(session.device)
+
+        // Subsequent withLease operations must be rejected
+        try {
+            session.withLease { }
+            fail("Expected IllegalStateException when in Failed state")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message?.contains("not unlocked") == true)
+        }
+
+        // Re-unlock recovery via reset
+        session.reset()
+        assertEquals(SessionState.Locked, session.state.value)
+    }
+
+    /**
+     * Test K.5: Idle timeout fires after period of inactivity and locks session.
+     */
+    @Test
+    fun testK5_idleTimeoutFiresAfterPeriodOfInactivityAndLocksSession() = runBlocking {
+        val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+        val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+        val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+
+        session.setIdleTimeout(100L) // 100ms idle timeout for test
+
+        session.startUnlockedForTest(
+            volume = null,
+            device = deviceStub,
+            volumeCloseable = volumeStub,
+        )
+
+        assertTrue(session.state.value is SessionState.Unlocked)
+
+        // Touch the session at 40ms to record activity
+        delay(40)
+        session.withLease { }
+
+        // At 80ms total (40ms since last activity), session must still be Unlocked
+        delay(40)
+        assertTrue("Session must remain unlocked before timeout", session.state.value is SessionState.Unlocked)
+
+        // Wait 150ms without activity (total idle time 150ms > 100ms timeout)
+        delay(150)
+
+        assertEquals("Session must lock after idle timeout", SessionState.Locked, session.state.value)
+        assertEquals(listOf("VOLUME_CLOSED", "DEVICE_CLOSED"), closeOrder)
+        assertNull(session.volume)
+        assertNull(session.device)
+
+        // Subsequent lease calls must be rejected
+        try {
+            session.withLease { }
+            fail("Expected IllegalStateException when locked")
+        } catch (e: IllegalStateException) {
+            assertTrue(e.message?.contains("not unlocked") == true)
+        }
+    }
+}

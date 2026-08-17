@@ -26,6 +26,8 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isAlreadyExists: Boolean get() = code == ALREADY_EXISTS
     val isWriterBusy: Boolean get() = code == WRITER_BUSY
     val isItemTooLarge: Boolean get() = code == ITEM_TOO_LARGE
+    val isMutexPoisoned: Boolean get() = code == MUTEX_POISONED
+    val isCancelled: Boolean get() = code == CANCELLED
 
     override fun toString(): String = "LuksException[$code] ${message.orEmpty()}"
 
@@ -69,5 +71,16 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * investigation at the hardware.
          */
         const val ITEM_TOO_LARGE = 17
+
+        /**
+         * A previous write operation panicked while holding the volume lock.
+         * Further writes on this volume are refused to protect disk state.
+         */
+        const val MUTEX_POISONED = 18
+
+        /**
+         * The operation was interrupted via a cancellation token.
+         */
+        const val CANCELLED = 19
     }
 }
