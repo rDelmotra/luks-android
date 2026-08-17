@@ -22,6 +22,8 @@
 //!   would otherwise interleave two SCSI command/data/status sequences on one
 //!   bulk pipe and desynchronise the device.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use luks_core::device::ReadAt;
@@ -249,7 +251,6 @@ impl luks_core::device::WriteAt for SharedDevice {
 /// pointer; no tagging scheme fixes that.
 const MAGIC: u64 = 0x4C55_4B53_5F48_4E31; // "LUKS_HN1"
 
-#[repr(C)]
 pub struct Handle {
     magic: u64,
     payload: Payload,
@@ -260,6 +261,47 @@ pub enum Payload {
     Volume(VolumeHandle),
     #[cfg(feature = "dangerous-write-support")]
     Writer(WriterHandle),
+}
+
+#[derive(Clone)]
+pub struct DeviceHandleRef(Arc<Handle>);
+
+impl std::ops::Deref for DeviceHandleRef {
+    type Target = DeviceHandle;
+    fn deref(&self) -> &DeviceHandle {
+        match &self.0.payload {
+            Payload::Device(d) => d,
+            _ => unreachable!("DeviceHandleRef invariant violated"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct VolumeHandleRef(Arc<Handle>);
+
+impl std::ops::Deref for VolumeHandleRef {
+    type Target = VolumeHandle;
+    fn deref(&self) -> &VolumeHandle {
+        match &self.0.payload {
+            Payload::Volume(v) => v,
+            _ => unreachable!("VolumeHandleRef invariant violated"),
+        }
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Clone)]
+pub struct WriterHandleRef(Arc<Handle>);
+
+#[cfg(feature = "dangerous-write-support")]
+impl std::ops::Deref for WriterHandleRef {
+    type Target = WriterHandle;
+    fn deref(&self) -> &WriterHandle {
+        match &self.0.payload {
+            Payload::Writer(w) => w,
+            _ => unreachable!("WriterHandleRef invariant violated"),
+        }
+    }
 }
 
 #[cfg(feature = "dangerous-write-support")]
@@ -885,44 +927,53 @@ fn format_uuid(u: &[u8; 16]) -> String {
     )
 }
 
-// ------------------------------------------------------------ raw handle glue
+// ------------------------------------------------------------ handle registry glue
+
+static REGISTRY: Mutex<Option<HashMap<u64, Arc<Handle>>>> = Mutex::new(None);
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Turn an owned payload into the opaque `long` Java holds.
 pub fn into_raw(payload: Payload) -> i64 {
-    Box::into_raw(Box::new(Handle {
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let handle = Arc::new(Handle {
         magic: MAGIC,
         payload,
-    })) as i64
+    });
+    let mut lock = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    let map = lock.get_or_insert_with(HashMap::new);
+    map.insert(id, handle);
+    id as i64
 }
 
-/// # Safety
-/// `handle` must be a value previously returned by [`into_raw`] and not yet
-/// freed. The magic check rejects zero and obvious garbage; it cannot detect a
-/// freed pointer, because reading freed memory to check it is already the bug.
-unsafe fn handle_ref<'a>(handle: i64) -> std::result::Result<&'a Handle, &'static str> {
-    match (handle as *const Handle).as_ref() {
-        None => Err("null handle"),
-        Some(h) if h.magic != MAGIC => Err("not a luks handle (already closed?)"),
-        Some(h) => Ok(h),
+fn handle_ref(handle: i64) -> std::result::Result<Arc<Handle>, &'static str> {
+    if handle <= 0 {
+        return Err("not a luks handle (already closed?)");
     }
+    let lock = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    let map = lock.as_ref().ok_or("not a luks handle (already closed?)")?;
+    let entry = map
+        .get(&(handle as u64))
+        .ok_or("not a luks handle (already closed?)")?;
+    if entry.magic != MAGIC {
+        return Err("not a luks handle (already closed?)");
+    }
+    Ok(Arc::clone(entry))
 }
 
-/// # Safety
-/// See [`handle_ref`].
-pub unsafe fn device_ref<'a>(handle: i64) -> std::result::Result<&'a DeviceHandle, &'static str> {
-    match &handle_ref(handle)?.payload {
-        Payload::Device(d) => Ok(d),
+pub fn device_ref(handle: i64) -> std::result::Result<DeviceHandleRef, &'static str> {
+    let h = handle_ref(handle)?;
+    match &h.payload {
+        Payload::Device(_) => Ok(DeviceHandleRef(h)),
         Payload::Volume(_) => Err("handle is a volume, not a device"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a device"),
     }
 }
 
-/// # Safety
-/// See [`handle_ref`].
-pub unsafe fn volume_ref<'a>(handle: i64) -> std::result::Result<&'a VolumeHandle, &'static str> {
-    match &handle_ref(handle)?.payload {
-        Payload::Volume(v) => Ok(v),
+pub fn volume_ref(handle: i64) -> std::result::Result<VolumeHandleRef, &'static str> {
+    let h = handle_ref(handle)?;
+    match &h.payload {
+        Payload::Volume(_) => Ok(VolumeHandleRef(h)),
         Payload::Device(_) => Err("handle is a device, not a volume"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a volume"),
@@ -930,42 +981,12 @@ pub unsafe fn volume_ref<'a>(handle: i64) -> std::result::Result<&'a VolumeHandl
 }
 
 #[cfg(feature = "dangerous-write-support")]
-pub unsafe fn writer_ref<'a>(handle: i64) -> std::result::Result<&'a WriterHandle, &'static str> {
-    match &handle_ref(handle)?.payload {
-        Payload::Writer(w) => Ok(w),
+pub fn writer_ref(handle: i64) -> std::result::Result<WriterHandleRef, &'static str> {
+    let h = handle_ref(handle)?;
+    match &h.payload {
+        Payload::Writer(_) => Ok(WriterHandleRef(h)),
         _ => Err("handle is not a file writer"),
     }
-}
-
-/// Free a handle, if it is one and it holds the expected kind.
-///
-/// The magic is cleared before the box is dropped so a double close is a no-op
-/// rather than a second `Box::from_raw` — though that only holds while the
-/// freed memory happens to be untouched, which is why Kotlin also nulls its
-/// copy. Closing a device handle with `close_volume` does nothing, deliberately:
-/// silently freeing the wrong thing would be worse than leaking.
-///
-/// # Safety
-/// See [`handle_ref`].
-unsafe fn drop_handle(handle: i64, want: HandleKind) {
-    if handle == 0 {
-        return;
-    }
-    let p = handle as *mut Handle;
-    if (*p).magic != MAGIC {
-        return;
-    }
-    let kind = match &(*p).payload {
-        Payload::Device(_) => HandleKind::Device,
-        Payload::Volume(_) => HandleKind::Volume,
-        #[cfg(feature = "dangerous-write-support")]
-        Payload::Writer(_) => HandleKind::Writer,
-    };
-    if kind != want {
-        return;
-    }
-    (*p).magic = 0;
-    drop(Box::from_raw(p));
 }
 
 #[derive(PartialEq, Eq)]
@@ -976,20 +997,41 @@ enum HandleKind {
     Writer,
 }
 
-/// # Safety
-/// See [`handle_ref`].
-pub unsafe fn drop_device(handle: i64) {
+fn drop_handle(handle: i64, want: HandleKind) {
+    if handle <= 0 {
+        return;
+    }
+    let mut lock = REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(map) = lock.as_mut() else {
+        return;
+    };
+    let id = handle as u64;
+    let should_remove = if let Some(entry) = map.get(&id) {
+        let kind = match &entry.payload {
+            Payload::Device(_) => HandleKind::Device,
+            Payload::Volume(_) => HandleKind::Volume,
+            #[cfg(feature = "dangerous-write-support")]
+            Payload::Writer(_) => HandleKind::Writer,
+        };
+        kind == want
+    } else {
+        false
+    };
+    if should_remove {
+        map.remove(&id);
+    }
+}
+
+pub fn drop_device(handle: i64) {
     drop_handle(handle, HandleKind::Device)
 }
 
-/// # Safety
-/// See [`handle_ref`]. Dropping a volume zeroes the master key it holds.
-pub unsafe fn drop_volume(handle: i64) {
+pub fn drop_volume(handle: i64) {
     drop_handle(handle, HandleKind::Volume)
 }
 
 #[cfg(feature = "dangerous-write-support")]
-pub unsafe fn drop_writer(handle: i64) {
+pub fn drop_writer(handle: i64) {
     drop_handle(handle, HandleKind::Writer)
 }
 
@@ -1194,27 +1236,25 @@ mod tests {
         let dev_handle = into_raw(Payload::Device(open()));
         let vol_handle = into_raw(Payload::Volume(unlock_fixture()));
 
-        unsafe {
-            assert!(device_ref(dev_handle).is_ok());
-            assert!(volume_ref(vol_handle).is_ok());
-            assert!(device_ref(vol_handle).is_err());
-            assert!(volume_ref(dev_handle).is_err());
-            assert!(device_ref(0).is_err());
+        assert!(device_ref(dev_handle).is_ok());
+        assert!(volume_ref(vol_handle).is_ok());
+        assert!(device_ref(vol_handle).is_err());
+        assert!(volume_ref(dev_handle).is_err());
+        assert!(device_ref(0).is_err());
 
-            // Closing with the wrong function must not free anything.
-            drop_volume(dev_handle);
-            assert!(device_ref(dev_handle).is_ok(), "wrong-type close freed it");
-            drop_device(vol_handle);
-            assert!(volume_ref(vol_handle).is_ok(), "wrong-type close freed it");
+        // Closing with the wrong function must not free anything.
+        drop_volume(dev_handle);
+        assert!(device_ref(dev_handle).is_ok(), "wrong-type close freed it");
+        drop_device(vol_handle);
+        assert!(volume_ref(vol_handle).is_ok(), "wrong-type close freed it");
 
-            drop_device(dev_handle);
-            drop_volume(vol_handle);
+        drop_device(dev_handle);
+        drop_volume(vol_handle);
 
-            // Now closed: the magic is cleared, so a second close is a no-op
-            // and a stale reference is refused rather than handed out.
-            assert!(device_ref(dev_handle).is_err());
-            drop_device(dev_handle);
-        }
+        // Now closed: entry was removed from the registry, so a second close
+        // is a no-op and a stale handle is refused rather than handed out.
+        assert!(device_ref(dev_handle).is_err());
+        drop_device(dev_handle);
     }
 
     // --- btrfs through the same bridge --------------------------------------

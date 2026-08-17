@@ -182,6 +182,7 @@ pub fn allocate_data_chunk_transaction<D: ReadAt>(
     gate::check_writeable_fs(fs.superblock())?;
     gate::check_chunk_allocation_profile(BLOCK_GROUP_DATA)?;
     gate::check_free_space_tree_no_bitmaps(fs)?;
+    gate::check_sys_chunk_array_capacity(fs.superblock())?;
     let sb = fs.superblock();
     if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
         if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {

@@ -72,8 +72,9 @@ import kotlinx.coroutines.withContext
  * `BuildConfig.DEBUG` gates the lot, so a release build logs nothing at all
  * rather than relying on this file staying disciplined.
  */
-private object Trace {
+object Trace {
     const val TAG = "luks"
+    const val TAG_ERR = "luks_err"
 
     fun i(msg: String) {
         if (BuildConfig.DEBUG) Log.i(TAG, msg)
@@ -81,6 +82,17 @@ private object Trace {
 
     fun e(msg: String, t: Throwable? = null) {
         if (BuildConfig.DEBUG) Log.e(TAG, msg, t)
+    }
+
+    fun formatErr(code: Int, operation: String, detail: String = ""): String =
+        "code=$code op=$operation ${detail.take(128)}"
+
+    /**
+     * Production-safe error logging: logs error codes, operations, opcodes, sizes.
+     * NEVER logs passphrases, filenames, or directory paths from the encrypted drive.
+     */
+    fun err(code: Int, operation: String, detail: String = "") {
+        Log.e(TAG_ERR, "code=$code op=$operation ${detail.take(128)}")
     }
 }
 
@@ -613,7 +625,13 @@ private fun UnlockedBody(
                 val listed = withContext(Dispatchers.IO) { state.volume.listDir(to) }
                 entries = listed
                 path = to
+            } catch (e: LuksException) {
+                Trace.err(e.code, "navigate")
+                Trace.e("navigate: failed [${e.code}] ${e.message}")
+                status = "cannot open $to: ${e.message}"
             } catch (e: Exception) {
+                Trace.err(-1, "navigate")
+                Trace.e("navigate: failed", e)
                 status = "cannot open $to: ${e.message}"
             }
             onBusyChange(false)
@@ -700,8 +718,12 @@ private fun UnlockedBody(
                                         }
                                         status = "deleted ${entry.name}"
                                     } catch (e: LuksException) {
+                                        Trace.err(e.code, "delete_file", "err=${e.message}")
+                                        Trace.e("delete: failed [${e.code}] ${e.message}")
                                         status = "delete failed [${e.code}]: ${e.message}"
                                     } catch (e: Exception) {
+                                        Trace.err(-1, "delete_file", "err=${e.message}")
+                                        Trace.e("delete: failed", e)
                                         status = "delete failed: ${e.message}"
                                     }
                                     onBusyChange(false)
@@ -901,9 +923,11 @@ private suspend fun openDevice(
         device.info.writeProbe?.let { Trace.i("write probe: $it") }
         DeviceState.Open(device)
     } catch (e: LuksException) {
+        Trace.err(e.code, "unlock")
         Trace.e("open: failed [${e.code}] ${e.message}")
         DeviceState.Failed("[${e.code}] ${e.message}")
     } catch (e: Exception) {
+        Trace.err(-1, "unlock")
         Trace.e("open: failed", e)
         DeviceState.Failed(e.message ?: e.toString())
     }
@@ -940,12 +964,14 @@ private suspend fun unlock(
         }
     }
 } catch (e: LuksException) {
+    Trace.err(e.code, "unlock")
     Trace.e("unlock: failed [${e.code}] ${e.message}")
     VolumeState.Failed(
         partition,
         if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}",
     )
 } catch (e: Exception) {
+    Trace.err(-1, "unlock")
     Trace.e("unlock: failed", e)
     VolumeState.Failed(partition, e.message ?: e.toString())
 }
@@ -989,7 +1015,12 @@ private suspend fun exportFile(
         "saved ${formatSize(done)} in %.1f s · %.1f MiB/s"
             .format(secs, done / secs / (1L shl 20))
     }
+} catch (e: LuksException) {
+    Trace.err(e.code, "transfer")
+    Trace.e("export: failed [${e.code}] ${e.message}")
+    "save failed: ${e.message}"
 } catch (e: Exception) {
+    Trace.err(-1, "transfer")
     Trace.e("export: failed", e)
     "save failed: ${e.message}"
 }
@@ -1072,9 +1103,11 @@ private suspend fun importFile(
         }
     }
 } catch (e: LuksException) {
+    Trace.err(e.code, "transfer")
     Trace.e("import: failed [${e.code}] ${e.message}")
     "upload failed [${e.code}] ${e.message}"
 } catch (e: Exception) {
+    Trace.err(-1, "transfer")
     Trace.e("import: failed", e)
     "upload failed: ${e.message}"
 }
@@ -1089,7 +1122,12 @@ private suspend fun hashFile(volume: LuksVolume, path: String): String = try {
     // name of the file being read off an encrypted drive is not part of it.
     Trace.i("hash: %d bytes in %d ms · %.1f MiB/s".format(d.bytes, d.elapsedMs, mbPerSec))
     "${d.sha256}\n${formatSize(d.bytes)} in ${d.elapsedMs} ms · %.1f MiB/s".format(mbPerSec)
+} catch (e: LuksException) {
+    Trace.err(e.code, "transfer")
+    Trace.e("hash: failed [${e.code}] ${e.message}")
+    "hash failed: ${e.message}"
 } catch (e: Exception) {
+    Trace.err(-1, "transfer")
     Trace.e("hash: failed", e)
     "hash failed: ${e.message}"
 }

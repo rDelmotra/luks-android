@@ -18,6 +18,9 @@ pub const SUPER_OFFSETS: [u64; 3] = [0x1_0000, 0x400_0000, 0x40_0000_0000];
 /// Bytes read and checksummed for one copy.
 pub const SUPER_SIZE: usize = 4096;
 
+/// Maximum capacity in bytes for `sys_chunk_array` in the btrfs superblock.
+pub const BTRFS_SYSTEM_CHUNK_ARRAY_SIZE: usize = 2048;
+
 /// The checksum covers everything after the checksum field itself.
 const CSUM_START: usize = 32;
 
@@ -295,7 +298,7 @@ impl Superblock {
         }
 
         let sys_array_size = u32le(b, 0xa0) as usize;
-        if sys_array_size > 2048 {
+        if sys_array_size > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE {
             return Err(LuksError::CorruptFs("btrfs sys_chunk_array overruns"));
         }
 

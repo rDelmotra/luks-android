@@ -48,12 +48,19 @@ fn tool(which: &str) -> Option<String> {
     if !std::path::Path::new(&script).exists() {
         return None;
     }
-    Command::new("colima")
+    let up = Command::new("colima")
         .arg("status")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(script)
+        .unwrap_or(false);
+    if !up {
+        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
+            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
+        }
+        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+        return None;
+    }
+    Some(script)
 }
 
 /// Open a scratch image exactly as the JNI layer opens a phone's drive:

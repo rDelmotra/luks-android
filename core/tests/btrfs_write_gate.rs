@@ -8,7 +8,8 @@
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::superblock::Superblock;
 use luks_core::fs::btrfs::write::gate::{
-    check_free_space_tree_shape, check_writeable_fs, check_writeable_subvolume,
+    check_free_space_tree_shape, check_sys_chunk_array_capacity, check_writeable_fs,
+    check_writeable_subvolume, BTRFS_SYSTEM_CHUNK_ARRAY_SIZE, BTRFS_SYSTEM_CHUNK_ENTRY_SIZE,
     SUPPORTED_WRITE_COMPAT_RO,
 };
 use luks_core::fs::btrfs::TreeRoot;
@@ -133,4 +134,32 @@ fn single_leaf_free_space_tree_is_allowed() {
     assert_eq!(fst_root.level, 0, "default TreeRoot must be a leaf for this control to mean anything");
     check_free_space_tree_shape(&fst_root)
         .expect("a single-leaf free-space tree is exactly what this writer supports");
+}
+
+#[test]
+fn sys_chunk_array_capacity_gate_allows_room_and_refuses_exhaustion() {
+    let mut sb = dummy_superblock();
+
+    // Default empty array passes
+    assert!(check_sys_chunk_array_capacity(&sb).is_ok());
+
+    // Max allowable size (1919 bytes) passes
+    sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE - BTRFS_SYSTEM_CHUNK_ENTRY_SIZE];
+    assert!(check_sys_chunk_array_capacity(&sb).is_ok());
+
+    // 1920 bytes fails (near 2048 capacity, deliberate break)
+    sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE - BTRFS_SYSTEM_CHUNK_ENTRY_SIZE + 1];
+    match check_sys_chunk_array_capacity(&sb).unwrap_err() {
+        LuksError::UnsupportedFsFeature(msg) => {
+            assert!(
+                msg.contains("sys_chunk_array capacity exhausted"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFsFeature, got {other:?}"),
+    }
+
+    // Full 2048 bytes fails
+    sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE];
+    assert!(check_sys_chunk_array_capacity(&sb).is_err());
 }

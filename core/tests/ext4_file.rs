@@ -236,7 +236,14 @@ fn verify_script() -> Option<String> {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    up.then_some(script)
+    if !up {
+        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
+            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
+        }
+        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+        return None;
+    }
+    Some(script)
 }
 
 /// The check the batched allocator was written for: a file of a size where

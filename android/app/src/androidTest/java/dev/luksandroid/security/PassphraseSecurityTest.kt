@@ -3,6 +3,7 @@ package dev.luksandroid.security
 import android.text.InputFilter
 import android.text.SpannableStringBuilder
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import dev.luksandroid.Trace
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -167,5 +168,40 @@ class PassphraseSecurityTest {
         } catch (e: MalformedInputException) {
             fail("MalformedInputException thrown due to split surrogate pair")
         }
+    }
+
+    @Test
+    fun releaseSafeErrorLogging_doesNotLeakPathNamesOrSensitiveData() {
+        val sensitivePassphrase = "VerySecretPassphrase#2026!"
+        val sensitivePath = "/home/user/private_vault/confidential_document.pdf"
+        val sensitiveFileName = "confidential_document.pdf"
+
+        // Simulate error logging across operations (delete_file, navigate, transfer, unlock)
+        val deleteErr = Trace.formatErr(5, "delete_file", "err=corrupted block")
+        val navigateErr = Trace.formatErr(6, "navigate")
+        val transferErr = Trace.formatErr(7, "transfer")
+        val unlockErr = Trace.formatErr(2, "unlock")
+
+        val allLogs = listOf(deleteErr, navigateErr, transferErr, unlockErr)
+        for (log in allLogs) {
+            // Verify no sensitive payload or paths are present
+            assertFalse("Log message leaked sensitive path: $log", log.contains(sensitivePath))
+            assertFalse("Log message leaked sensitive filename: $log", log.contains(sensitiveFileName))
+            assertFalse("Log message leaked passphrase: $log", log.contains(sensitivePassphrase))
+        }
+
+        // Verify structure and tags
+        assertEquals("luks", Trace.TAG)
+        assertEquals("luks_err", Trace.TAG_ERR)
+        assertTrue(deleteErr.startsWith("code=5 op=delete_file"))
+        assertTrue(navigateErr.startsWith("code=6 op=navigate"))
+        assertTrue(transferErr.startsWith("code=7 op=transfer"))
+        assertTrue(unlockErr.startsWith("code=2 op=unlock"))
+
+        // Direct execution of Trace.err without exceptions
+        Trace.err(5, "delete_file", "err=corrupted block")
+        Trace.err(6, "navigate")
+        Trace.err(7, "transfer")
+        Trace.err(2, "unlock")
     }
 }

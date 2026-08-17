@@ -334,6 +334,11 @@ impl<D: ReadAt> Btrfs<D> {
         &self.chunks
     }
 
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn chunk_map_mut(&mut self) -> &mut ChunkMap {
+        &mut self.chunks
+    }
+
     pub fn label(&self) -> &str {
         &self.sb.label
     }

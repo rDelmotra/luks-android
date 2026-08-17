@@ -22,6 +22,7 @@ use crate::fs::btrfs::write::node::Leaf;
 use crate::fs::btrfs::{Btrfs, TreeRoot};
 
 /// A completed, self-consistent in-memory btrfs transaction.
+#[derive(Clone)]
 pub struct Transaction {
     pub new_generation: u64,
     pub final_root_bytenr: u64,

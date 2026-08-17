@@ -62,7 +62,10 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false);
     if !up {
-        eprintln!("skipping oracle: colima is not running");
+        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
+            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
+        }
+        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
         return true;
     }
 
@@ -70,7 +73,10 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
 
     match output {
         Ok(out) => {
-            if !out.status.success() {
+            if out.status.success() {
+                println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+                true
+            } else {
                 eprintln!(
                     "verify-btrfs.sh stdout:\n{}",
                     String::from_utf8_lossy(&out.stdout)
@@ -79,8 +85,8 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
                     "verify-btrfs.sh stderr:\n{}",
                     String::from_utf8_lossy(&out.stderr)
                 );
+                false
             }
-            out.status.success()
         }
         Err(e) => {
             eprintln!("could not execute verify-btrfs.sh: {e}");

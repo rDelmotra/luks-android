@@ -74,3 +74,7 @@ required-features = ["dangerous-write-support"]
 [[example]]
 name = "space_probe"
 required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_controls"
+required-features = ["dangerous-write-support"]

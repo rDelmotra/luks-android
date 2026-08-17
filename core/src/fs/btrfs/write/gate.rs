@@ -10,6 +10,31 @@ use crate::fs::btrfs::superblock::{
 };
 use crate::fs::btrfs::TreeRoot;
 
+pub use crate::fs::btrfs::superblock::BTRFS_SYSTEM_CHUNK_ARRAY_SIZE;
+
+/// Minimum byte size required to store a new SYSTEM chunk in `sys_chunk_array`.
+///
+/// In btrfs, a chunk entry in `sys_chunk_array` consists of a 17-byte `btrfs_disk_key`
+/// followed by a `btrfs_chunk` item (48-byte header + 32 bytes per stripe).
+/// For a 2-stripe (DUP) profile: 17 + 48 + (2 * 32) = 129 bytes.
+pub const BTRFS_SYSTEM_CHUNK_ENTRY_SIZE: usize = 129;
+
+/// Refuse chunk allocations if `sys_chunk_array` cannot fit another SYSTEM chunk.
+///
+/// The bootstrap `sys_chunk_array` is statically capped at 2048 bytes (`BTRFS_SYSTEM_CHUNK_ARRAY_SIZE`).
+/// If allocating a chunk could necessitate adding a new SYSTEM chunk and `sys_chunk_array`
+/// does not have sufficient remaining capacity (at least 129 bytes for a 2-stripe chunk item),
+/// refuse before attempting allocation.
+pub fn check_sys_chunk_array_capacity(sb: &Superblock) -> Result<()> {
+    let current_size = sb.sys_chunk_array.len();
+    if current_size + BTRFS_SYSTEM_CHUNK_ENTRY_SIZE > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "btrfs sys_chunk_array capacity exhausted ({current_size}/{BTRFS_SYSTEM_CHUNK_ARRAY_SIZE} bytes used, needs {BTRFS_SYSTEM_CHUNK_ENTRY_SIZE} bytes for system chunk entry)"
+        )));
+    }
+    Ok(())
+}
+
 /// All `compat_ro` flags our write path can safely handle.
 ///
 /// Any other flag (e.g. block-group-tree 0x4, verity 0x8) is refused.
@@ -127,6 +152,34 @@ mod tests {
     use crate::fs::btrfs::chunk::{BLOCK_GROUP_DATA, BLOCK_GROUP_DUP, BLOCK_GROUP_METADATA, BLOCK_GROUP_SYSTEM};
     use crate::fs::btrfs::Btrfs;
 
+    fn dummy_superblock() -> Superblock {
+        Superblock {
+            fsid: [0; 16],
+            bytenr: 0x10000,
+            generation: 1,
+            root: 1048576,
+            chunk_root: 2097152,
+            chunk_root_generation: 1,
+            log_root: 0,
+            total_bytes: 104857600,
+            bytes_used: 1048576,
+            root_dir_objectid: 6,
+            num_devices: 1,
+            dev_id: 1,
+            sector_size: 4096,
+            node_size: 16384,
+            stripe_size: 65536,
+            incompat_flags: 0x100,
+            compat_ro_flags: SUPPORTED_WRITE_COMPAT_RO,
+            csum_type: crate::fs::btrfs::superblock::CsumType::Crc32c,
+            root_level: 0,
+            chunk_root_level: 0,
+            label: "test".into(),
+            metadata_uuid: [0; 16],
+            sys_chunk_array: vec![],
+        }
+    }
+
     #[test]
     fn test_chunk_allocation_profile_gate() {
         assert!(check_chunk_allocation_profile(BLOCK_GROUP_DATA).is_ok());
@@ -145,5 +198,33 @@ mod tests {
             let fs = Btrfs::mount(dev).expect("mount fixture");
             assert!(check_free_space_tree_no_bitmaps(&fs).is_ok());
         }
+    }
+
+    #[test]
+    fn test_check_sys_chunk_array_capacity() {
+        let mut sb = dummy_superblock();
+
+        // 1. Empty sys_chunk_array (0 bytes) -> OK
+        assert!(check_sys_chunk_array_capacity(&sb).is_ok());
+
+        // 2. Fits exactly at limit (2048 - 129 = 1919 bytes) -> OK
+        sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE - BTRFS_SYSTEM_CHUNK_ENTRY_SIZE];
+        assert!(check_sys_chunk_array_capacity(&sb).is_ok());
+
+        // 3. Deliberate break: Near 2048 (1920 bytes, 1 byte too large) -> Refused
+        sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE - BTRFS_SYSTEM_CHUNK_ENTRY_SIZE + 1];
+        match check_sys_chunk_array_capacity(&sb) {
+            Err(LuksError::UnsupportedFsFeature(msg)) => {
+                assert!(
+                    msg.contains("sys_chunk_array capacity exhausted"),
+                    "unexpected message: {msg}"
+                );
+            }
+            res => panic!("expected UnsupportedFsFeature, got {res:?}"),
+        }
+
+        // 4. Deliberate break: Full 2048 bytes -> Refused
+        sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE];
+        assert!(check_sys_chunk_array_capacity(&sb).is_err());
     }
 }
