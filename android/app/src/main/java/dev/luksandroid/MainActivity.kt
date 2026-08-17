@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import dev.luksandroid.session.LuksSession
-import dev.luksandroid.session.UsbDetachReceiver
 import dev.luksandroid.ui.navigation.LuksAppNavigation
 import dev.luksandroid.ui.theme.LuksTheme
 
@@ -47,8 +46,6 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        UsbDetachReceiver.register(this)
-
         setContent {
             LuksTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
@@ -61,10 +58,5 @@ class MainActivity : ComponentActivity() {
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         LuksSession.onTrimMemory(level)
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        UsbDetachReceiver.unregister(this)
     }
 }

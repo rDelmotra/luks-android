@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
-import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -97,12 +96,17 @@ import dev.luksandroid.formatSize
 import dev.luksandroid.formatTimestamp
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.session.TransferManager
+import dev.luksandroid.session.TransferState
+import dev.luksandroid.session.TransferType
 import dev.luksandroid.ui.components.BreadcrumbBar
 import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
 import dev.luksandroid.ui.components.NewFolderDialog
 import dev.luksandroid.ui.components.RenameDialog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -375,16 +379,6 @@ data class ChecksumResult(
     val bytesPerSec: Long,
 )
 
-data class TransferProgress(
-    val operation: String,
-    val fileName: String,
-    val bytesDone: Long,
-    val totalBytes: Long,
-    val speedBytesPerSec: Long = 0L,
-)
-
-private const val CHUNK_SIZE = 1 shl 20 // 1 MiB
-
 /**
  * Checks if the given path is located in a read-only Btrfs subvolume or outside root tree.
  */
@@ -474,8 +468,14 @@ fun BrowserScreen(
     var deleteError by remember { mutableStateOf<String?>(null) }
 
     var activeChecksum by remember { mutableStateOf<ChecksumResult?>(null) }
-    var activeTransfer by remember { mutableStateOf<TransferProgress?>(null) }
     var pendingExportItem by remember { mutableStateOf<BrowserItem?>(null) }
+
+    // Which TransferManager transfer (if any) this screen most recently started.
+    // The transfer itself lives and runs in TransferManager regardless of this
+    // screen's lifecycle; this id is only used to pick which one to show inline.
+    var activeTransferId by remember { mutableStateOf<Long?>(null) }
+    val allTransfers by TransferManager.transfers.collectAsState()
+    val activeTransferItem = activeTransferId?.let { id -> allTransfers.find { it.id == id } }
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -552,6 +552,52 @@ fun BrowserScreen(
         }
     }
 
+    // Watches whichever transfer this screen most recently started and reacts
+    // once it reaches a terminal state. The transfer itself is NOT owned by
+    // this effect: it runs on TransferManager's own scope (see
+    // TransferManager.startExport/startImport/startHash) and keeps going even
+    // if this Composable is disposed before this effect observes completion.
+    LaunchedEffect(activeTransferId) {
+        val id = activeTransferId ?: return@LaunchedEffect
+        val terminal = TransferManager.transfers
+            .map { list -> list.find { it.id == id } }
+            .first { it == null || it.state != TransferState.RUNNING }
+
+        when (terminal?.state) {
+            TransferState.COMPLETED -> {
+                when (terminal.type) {
+                    TransferType.IMPORT -> {
+                        snackbarHostState.showSnackbar("Imported \"${terminal.name}\" successfully")
+                        loadDirectory(currentPath)
+                    }
+                    TransferType.EXPORT -> {
+                        snackbarHostState.showSnackbar("Exported \"${terminal.name}\" successfully")
+                    }
+                    TransferType.HASH -> {} // ChecksumResultDialog is driven by startHash's onResult callback.
+                }
+            }
+            TransferState.FAILED -> {
+                val code = terminal.errorCode
+                if (terminal.type == TransferType.IMPORT &&
+                    (code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED)
+                ) {
+                    isSlackLimitReached = true
+                }
+                val label = when (terminal.type) {
+                    TransferType.IMPORT -> "Import"
+                    TransferType.EXPORT -> "Export"
+                    TransferType.HASH -> "Checksum calculation"
+                }
+                snackbarHostState.showSnackbar("$label failed: ${terminal.error ?: "unknown error"}")
+            }
+            TransferState.CANCELLED -> {
+                snackbarHostState.showSnackbar("Transfer cancelled")
+            }
+            else -> {}
+        }
+        if (activeTransferId == id) activeTransferId = null
+    }
+
     // SAF Exporter
     val exporter = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream")
@@ -560,54 +606,10 @@ fun BrowserScreen(
         pendingExportItem = null
         if (uri == null || source == null) return@rememberLauncherForActivityResult
 
-        scope.launch {
-            try {
-                var lastUpdateMs = System.currentTimeMillis()
-                var lastUpdateBytes = 0L
-
-                withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v ->
-                        val totalSize = source.sizeBytes ?: v.fileSize(source.fullPath)
-                        var done = 0L
-                        val stream = context.contentResolver.openOutputStream(uri)
-                            ?: throw IllegalStateException("Could not open destination for writing")
-
-                        stream.use { out ->
-                            while (done < totalSize) {
-                                val chunk = v.readChunk(source.fullPath, done, CHUNK_SIZE)
-                                if (chunk.isEmpty()) break
-                                out.write(chunk)
-                                done += chunk.size
-
-                                val now = System.currentTimeMillis()
-                                val dt = now - lastUpdateMs
-                                val speed = if (dt > 0) ((done - lastUpdateBytes) * 1000L) / dt else 0L
-                                if (dt >= 250 || done == totalSize) {
-                                    lastUpdateMs = now
-                                    lastUpdateBytes = done
-                                    withContext(Dispatchers.Main) {
-                                        activeTransfer = TransferProgress(
-                                            operation = "Exporting",
-                                            fileName = source.name,
-                                            bytesDone = done,
-                                            totalBytes = totalSize,
-                                            speedBytesPerSec = speed,
-                                        )
-                                    }
-                                }
-                            }
-                            out.flush()
-                        }
-                    }
-                }
-                snackbarHostState.showSnackbar("Exported \"${source.name}\" successfully")
-            } catch (e: Exception) {
-                Trace.err(-1, "export")
-                snackbarHostState.showSnackbar("Export failed: ${e.message}")
-            } finally {
-                activeTransfer = null
-            }
-        }
+        // Routed through TransferManager (N.2): the actual copy runs on
+        // TransferManager's own scope, not this screen's, and is visible on
+        // the Transfers screen for the whole time it runs.
+        activeTransferId = TransferManager.startExport(context, source.fullPath, uri)
     }
 
     // SAF Importer
@@ -616,117 +618,13 @@ fun BrowserScreen(
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
 
-        scope.launch {
-            try {
-                withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v ->
-                        val contentResolver = context.contentResolver
-                        var fileName: String? = null
-                        var fileSize: Long = -1L
-
-                        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                            if (cursor.moveToFirst()) {
-                                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                                val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-                                if (nameIdx != -1) fileName = cursor.getString(nameIdx)
-                                if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) fileSize = cursor.getLong(sizeIdx)
-                            }
-                        }
-
-                        val name = fileName ?: uri.lastPathSegment?.substringAfterLast('/') ?: "imported_${System.currentTimeMillis()}"
-                        if (fileSize < 0L) {
-                            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                                fileSize = pfd.statSize
-                            }
-                        }
-                        check(fileSize >= 0L) { "Could not determine file size" }
-
-                        var done = 0L
-                        var lastUpdateMs = System.currentTimeMillis()
-                        var lastUpdateBytes = 0L
-                        val buffer = java.nio.ByteBuffer.allocateDirect(CHUNK_SIZE)
-
-                        val writer = v.beginFile(fileSize)
-                        try {
-                            contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
-                                java.io.FileInputStream(pfd.fileDescriptor).channel.use { channel ->
-                                    while (done < fileSize) {
-                                        buffer.clear()
-                                        val toRead = (fileSize - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
-                                        buffer.limit(toRead)
-
-                                        var read = 0
-                                        while (buffer.hasRemaining()) {
-                                            val r = channel.read(buffer)
-                                            if (r <= 0) break
-                                            read += r
-                                        }
-                                        if (read <= 0) break
-
-                                        buffer.flip()
-                                        writer.write(buffer, read)
-                                        done += read
-
-                                        val now = System.currentTimeMillis()
-                                        val dt = now - lastUpdateMs
-                                        val speed = if (dt > 0) ((done - lastUpdateBytes) * 1000L) / dt else 0L
-                                        if (dt >= 250 || done == fileSize) {
-                                            lastUpdateMs = now
-                                            lastUpdateBytes = done
-                                            withContext(Dispatchers.Main) {
-                                                activeTransfer = TransferProgress(
-                                                    operation = "Importing",
-                                                    fileName = name,
-                                                    bytesDone = done,
-                                                    totalBytes = fileSize,
-                                                    speedBytesPerSec = speed,
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            } ?: throw IllegalStateException("Could not open input file descriptor")
-
-                            if (done < fileSize) {
-                                throw IllegalStateException("Short read: read $done of $fileSize expected")
-                            }
-
-                            writer.finish(currentPath, name)
-                        } finally {
-                            writer.close()
-                        }
-                    }
-                }
-                snackbarHostState.showSnackbar("Imported successfully")
-                loadDirectory(currentPath)
-            } catch (e: LuksException) {
-                Trace.err(e.code, "import")
-                if (e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) {
-                    isSlackLimitReached = true
-                }
-                snackbarHostState.showSnackbar("Import failed: [${e.code}] ${e.message}")
-            } catch (e: Exception) {
-                Trace.err(-1, "import")
-                snackbarHostState.showSnackbar("Import failed: ${e.message}")
-            } finally {
-                activeTransfer = null
-            }
-        }
+        activeTransferId = TransferManager.startImport(context, currentPath, uri)
     }
 
     // SHA-256 Checksum Calculation
     fun calculateChecksum(item: BrowserItem) {
-        scope.launch {
-            activeTransfer = TransferProgress(
-                operation = "Hashing",
-                fileName = item.name,
-                bytesDone = 0L,
-                totalBytes = item.sizeBytes ?: 0L,
-            )
-            try {
-                val digest = withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v -> v.sha256(item.fullPath) }
-                }
+        activeTransferId = TransferManager.startHash(item.fullPath) { result ->
+            result.onSuccess { digest ->
                 activeChecksum = ChecksumResult(
                     fileName = item.name,
                     sha256 = digest.sha256,
@@ -734,11 +632,6 @@ fun BrowserScreen(
                     elapsedMs = digest.elapsedMs,
                     bytesPerSec = digest.bytesPerSec,
                 )
-            } catch (e: Exception) {
-                Trace.err(-1, "sha256")
-                snackbarHostState.showSnackbar("Checksum calculation failed: ${e.message}")
-            } finally {
-                activeTransfer = null
             }
         }
     }
@@ -1046,8 +939,10 @@ fun BrowserScreen(
                 enabled = !isRefreshing,
             )
 
-            // Active Transfer Progress Banner
-            activeTransfer?.let { transfer ->
+            // Active Transfer Progress Banner. Reads live from TransferManager's
+            // flow (not local composable state) so it reflects the same
+            // process-wide truth as the Transfers screen.
+            activeTransferItem?.takeIf { it.state == TransferState.RUNNING }?.let { transfer ->
                 Surface(
                     color = MaterialTheme.colorScheme.primaryContainer,
                     shape = RoundedCornerShape(8.dp),
@@ -1058,11 +953,16 @@ fun BrowserScreen(
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
                         val pct = if (transfer.totalBytes > 0) {
-                            (transfer.bytesDone * 100 / transfer.totalBytes).toInt()
+                            (transfer.transferredBytes * 100 / transfer.totalBytes).toInt()
                         } else 0
                         val speedStr = if (transfer.speedBytesPerSec > 0) {
                             " · %.1f MiB/s".format(transfer.speedBytesPerSec.toDouble() / (1L shl 20))
                         } else ""
+                        val operation = when (transfer.type) {
+                            TransferType.IMPORT -> "Importing"
+                            TransferType.EXPORT -> "Exporting"
+                            TransferType.HASH -> "Hashing"
+                        }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -1070,7 +970,7 @@ fun BrowserScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                text = "${transfer.operation} ${transfer.fileName}…",
+                                text = "$operation ${transfer.name}…",
                                 style = MaterialTheme.typography.bodyMedium,
                                 fontWeight = FontWeight.SemiBold,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -1088,7 +988,7 @@ fun BrowserScreen(
                         LinearProgressIndicator(
                             progress = {
                                 if (transfer.totalBytes > 0) {
-                                    (transfer.bytesDone.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
+                                    (transfer.transferredBytes.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
                                 } else 0f
                             },
                             modifier = Modifier

@@ -302,18 +302,21 @@ private fun TypeBadge(type: TransferType) {
         color = when (type) {
             TransferType.IMPORT -> MaterialTheme.colorScheme.tertiaryContainer
             TransferType.EXPORT -> MaterialTheme.colorScheme.secondaryContainer
+            TransferType.HASH -> MaterialTheme.colorScheme.surfaceVariant
         },
     ) {
         Text(
             text = when (type) {
                 TransferType.IMPORT -> "Import"
                 TransferType.EXPORT -> "Export"
+                TransferType.HASH -> "Checksum"
             },
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
             color = when (type) {
                 TransferType.IMPORT -> MaterialTheme.colorScheme.onTertiaryContainer
                 TransferType.EXPORT -> MaterialTheme.colorScheme.onSecondaryContainer
+                TransferType.HASH -> MaterialTheme.colorScheme.onSurfaceVariant
             },
         )
     }

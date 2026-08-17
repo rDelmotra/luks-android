@@ -9,8 +9,10 @@ import dev.luksandroid.LuksVolume
 import dev.luksandroid.Trace
 import dev.luksandroid.ui.UiErrorMessage
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,13 +20,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
-enum class TransferType { IMPORT, EXPORT }
+enum class TransferType { IMPORT, EXPORT, HASH }
 
 enum class TransferState { RUNNING, COMPLETED, CANCELLED, FAILED }
 
@@ -39,6 +42,8 @@ data class TransferItem(
     val state: TransferState,
     val cancelToken: Long,
     val error: String?,
+    /** Raw [LuksException.code] behind [error], when the failure came from one. Null otherwise. */
+    val errorCode: Int? = null,
 )
 
 /**
@@ -53,8 +58,83 @@ open class TransferController {
 
     private val activeJobs = ConcurrentHashMap<Long, Job>()
 
+    /**
+     * The manager's own coroutine scope. Transfers started via [startImport] /
+     * [startExport] / [startHash] run here, NOT on a caller-supplied (e.g.
+     * `rememberCoroutineScope()`) scope, so navigating away from the screen that
+     * started a transfer does not cancel it: this scope is process-wide, tied to
+     * [TransferManager] itself, not to any Composable's lifecycle.
+     */
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     companion object {
         const val CHUNK_SIZE = 1 shl 20 // 1 MiB
+    }
+
+    /**
+     * Starts an export on the manager's own scope, holding a [LuksSession] lease
+     * for the whole transfer (so the idle timer cannot lock the session out from
+     * under it). Returns the transfer id immediately; observe [transfers] for
+     * progress. Safe to call from a Composable without tying the transfer's
+     * lifetime to that Composable's.
+     */
+    fun startExport(context: Context, path: String, targetUri: Uri): Long {
+        val transferId = nextTransferId.getAndIncrement()
+        managerScope.launch {
+            runCatching {
+                LuksSession.withLease { volume ->
+                    exportFileWithProgress(context, volume, path, targetUri, transferId)
+                }
+            }.onFailure { t ->
+                if (t !is CancellationException) {
+                    Trace.err(LuksException.GENERIC, "export")
+                }
+            }
+        }
+        return transferId
+    }
+
+    /**
+     * Starts an import on the manager's own scope, holding a [LuksSession] lease
+     * for the whole transfer. Returns the transfer id immediately; observe
+     * [transfers] for progress. Safe to call from a Composable without tying the
+     * transfer's lifetime to that Composable's.
+     */
+    fun startImport(context: Context, parentPath: String, sourceUri: Uri): Long {
+        val transferId = nextTransferId.getAndIncrement()
+        managerScope.launch {
+            runCatching {
+                LuksSession.withLease { volume ->
+                    importFileWithProgress(context, volume, parentPath, sourceUri, transferId)
+                }
+            }.onFailure { t ->
+                if (t !is CancellationException) {
+                    Trace.err(LuksException.GENERIC, "import")
+                }
+            }
+        }
+        return transferId
+    }
+
+    /**
+     * Starts a SHA-256 checksum on the manager's own scope, tracked as a HASH
+     * transfer like imports/exports and holding a [LuksSession] lease for the
+     * duration. [onResult] is invoked with the outcome once finished; it may run
+     * after any originating Composable has left composition, so callers must
+     * tolerate a no-op update in that case.
+     */
+    fun startHash(
+        path: String,
+        onResult: (Result<LuksVolume.Digest>) -> Unit = {},
+    ): Long {
+        val transferId = nextTransferId.getAndIncrement()
+        managerScope.launch {
+            val result = runCatching {
+                LuksSession.withLease { volume -> hashFileWithProgress(volume, path, transferId) }
+            }
+            onResult(result)
+        }
+        return transferId
     }
 
     fun getTransfer(id: Long): TransferItem? =
@@ -116,8 +196,8 @@ open class TransferController {
         volume: LuksVolume,
         path: String,
         targetUri: Uri,
+        transferId: Long = nextTransferId.getAndIncrement(),
     ): Long = withContext(Dispatchers.IO) {
-        val transferId = nextTransferId.getAndIncrement()
         val cancelToken = try {
             LuksNative.nativeCreateCancelToken()
         } catch (_: Throwable) {
@@ -242,6 +322,7 @@ open class TransferController {
                     it.copy(
                         state = TransferState.FAILED,
                         error = errorMsg,
+                        errorCode = e.code,
                         etaSeconds = 0L,
                         speedBytesPerSec = 0L,
                     )
@@ -280,8 +361,8 @@ open class TransferController {
         volume: LuksVolume,
         parentPath: String,
         sourceUri: Uri,
+        transferId: Long = nextTransferId.getAndIncrement(),
     ): Long = withContext(Dispatchers.IO) {
-        val transferId = nextTransferId.getAndIncrement()
         val cancelToken = try {
             LuksNative.nativeCreateCancelToken()
         } catch (_: Throwable) {
@@ -443,6 +524,7 @@ open class TransferController {
                     it.copy(
                         state = TransferState.FAILED,
                         error = errorMsg,
+                        errorCode = e.code,
                         etaSeconds = 0L,
                         speedBytesPerSec = 0L,
                     )
@@ -470,6 +552,75 @@ open class TransferController {
         }
 
         transferId
+    }
+
+    /**
+     * Computes a SHA-256 digest of the file at [path] in [volume], tracked as a
+     * HASH transfer in [transfers] like an import or export.
+     */
+    suspend fun hashFileWithProgress(
+        volume: LuksVolume,
+        path: String,
+        transferId: Long = nextTransferId.getAndIncrement(),
+    ): LuksVolume.Digest = withContext(Dispatchers.IO) {
+        val fileName = path.substringAfterLast('/').ifEmpty { "hash_${System.currentTimeMillis()}" }
+        val totalBytes = try {
+            volume.fileSize(path)
+        } catch (e: Exception) {
+            -1L
+        }
+
+        val initialItem = TransferItem(
+            id = transferId,
+            name = fileName,
+            type = TransferType.HASH,
+            totalBytes = totalBytes,
+            transferredBytes = 0L,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            state = TransferState.RUNNING,
+            cancelToken = 0L,
+            error = null,
+        )
+        _transfers.update { listOf(initialItem) + it }
+        activeJobs[transferId] = currentCoroutineContext().job
+
+        try {
+            val digest = volume.sha256(path)
+            updateTransfer(transferId) {
+                it.copy(
+                    transferredBytes = digest.bytes,
+                    totalBytes = if (it.totalBytes >= 0L) it.totalBytes else digest.bytes,
+                    speedBytesPerSec = digest.bytesPerSec,
+                    etaSeconds = 0L,
+                    state = TransferState.COMPLETED,
+                )
+            }
+            Trace.i("TransferManager", "Hash completed: $transferId")
+            digest
+        } catch (e: CancellationException) {
+            updateTransfer(transferId) {
+                it.copy(state = TransferState.CANCELLED, etaSeconds = 0L, speedBytesPerSec = 0L)
+            }
+            Trace.err(LuksException.CANCELLED, "hash")
+            throw e
+        } catch (e: LuksException) {
+            val errorMsg = UiErrorMessage.getUserMessage(e, "Checksum")
+            updateTransfer(transferId) {
+                it.copy(state = TransferState.FAILED, error = errorMsg, etaSeconds = 0L, speedBytesPerSec = 0L)
+            }
+            Trace.err(e.code, "hash")
+            throw e
+        } catch (t: Throwable) {
+            val errorMsg = UiErrorMessage.getUserMessage(t, "Checksum")
+            updateTransfer(transferId) {
+                it.copy(state = TransferState.FAILED, error = errorMsg, etaSeconds = 0L, speedBytesPerSec = 0L)
+            }
+            Trace.err(LuksException.GENERIC, "hash")
+            throw t
+        } finally {
+            activeJobs.remove(transferId)
+        }
     }
 }
 
