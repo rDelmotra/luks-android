@@ -1,0 +1,417 @@
+package dev.luksandroid.documents
+
+import android.system.ErrnoException
+import android.system.OsConstants
+import dev.luksandroid.Entry
+import dev.luksandroid.FileInfo
+import dev.luksandroid.LuksException
+import dev.luksandroid.LuksVolume
+import dev.luksandroid.PartitionInfo
+import dev.luksandroid.VolumeInfo
+import dev.luksandroid.session.SessionController
+import dev.luksandroid.session.SessionState
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import java.nio.ByteBuffer
+
+class LuksProxyCallbackTest {
+
+    private lateinit var testScope: CoroutineScope
+    private lateinit var session: SessionController
+    private lateinit var testVolume: TestLuksVolume
+
+    class TestLuksVolume(
+        override val info: VolumeInfo = VolumeInfo(
+            label = "ProxyTestVol",
+            uuid = "uuid-proxy-1234",
+            blockSize = 4096,
+            sizeBytes = 100L * 1024 * 1024,
+            fsType = "ext4",
+            subvolumes = emptyList()
+        ),
+        val fileDataMap: MutableMap<String, ByteArray> = mutableMapOf(),
+        val fileInfoMap: MutableMap<String, FileInfo> = mutableMapOf(),
+    ) : LuksVolume(0L) {
+
+        val writtenFiles = mutableListOf<Triple<String, String, ByteArray>>()
+        val abandonedWriters = mutableListOf<FileWriter>()
+        var throwOnRead: Throwable? = null
+        var throwOnWrite: Throwable? = null
+        var throwOnFinish: Throwable? = null
+        var throwOnFileInfo: Throwable? = null
+
+        override fun fileInfo(path: String): FileInfo {
+            throwOnFileInfo?.let { throw it }
+            return fileInfoMap[path] ?: FileInfo(
+                path = path,
+                size = fileDataMap[path]?.size?.toLong() ?: 1024L,
+                mode = 0,
+                uid = 0,
+                gid = 0,
+                links = 1,
+                type = if (path.endsWith("/")) "dir" else "file",
+                atime = 1000L,
+                mtime = 1700000000L,
+                ctime = 1000L,
+            )
+        }
+
+        override fun fileSize(path: String): Long {
+            return fileDataMap[path]?.size?.toLong() ?: 1024L
+        }
+
+        override fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+            throwOnRead?.let { throw it }
+            val data = fileDataMap[path] ?: ByteArray(1024) { (it % 256).toByte() }
+            if (offset >= data.size) return ByteArray(0)
+            val end = minOf(data.size.toLong(), offset + len).toInt()
+            return data.copyOfRange(offset.toInt(), end)
+        }
+
+        override fun beginFile(sizeBytes: Long): FileWriter {
+            return TestFileWriter()
+        }
+
+        override fun writeChunk(writer: FileWriter, data: ByteArray, offset: Int, length: Int) {
+            throwOnWrite?.let { throw it }
+            writer.write(data, offset, length)
+        }
+
+        override fun finishFile(writer: FileWriter, parentPath: String, name: String): Long {
+            throwOnFinish?.let { throw it }
+            return writer.finish(parentPath, name)
+        }
+
+        override fun abandonFile(writer: FileWriter) {
+            abandonedWriters.add(writer)
+            writer.abandon()
+        }
+
+        inner class TestFileWriter : FileWriter(0L) {
+            val chunks = mutableListOf<ByteArray>()
+            var finished = false
+            var abandoned = false
+
+            override fun write(data: ByteBuffer, len: Int) {
+                val bytes = ByteArray(len)
+                data.get(bytes)
+                chunks.add(bytes)
+            }
+
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                chunks.add(bytes.copyOfRange(offset, offset + length))
+            }
+
+            override fun finish(parentPath: String, name: String): Long {
+                finished = true
+                val combined = chunks.fold(ByteArray(0)) { acc, bytes -> acc + bytes }
+                writtenFiles.add(Triple(parentPath, name, combined))
+                val fullPath = if (parentPath == "/") "/$name" else "$parentPath/$name"
+                fileDataMap[fullPath] = combined
+                return 200L
+            }
+
+            override fun abandon() {
+                abandoned = true
+            }
+
+            override fun close() {
+                abandoned = true
+            }
+        }
+    }
+
+    @Before
+    fun setUp() {
+        runBlocking {
+            testScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            session = SessionController(scope = testScope)
+            testVolume = TestLuksVolume()
+
+            session.startUnlockedForTest(
+                volume = testVolume,
+                partition = PartitionInfo(0, "TestPartition", 0L, 100L * 1024 * 1024, true, 2)
+            )
+        }
+    }
+
+    @After
+    fun tearDown() {
+        testScope.cancel()
+    }
+
+    // ==========================================
+    // Pass M.2: Seekable Read Streaming Tests
+    // ==========================================
+
+    @Test
+    fun testM2_onGetSize_returnsVolumeFileSize() {
+        testVolume.fileDataMap["/sample.txt"] = ByteArray(256) { 0x42 }
+        testVolume.fileInfoMap["/sample.txt"] = FileInfo(
+            path = "/sample.txt",
+            size = 256L,
+            mode = 0,
+            uid = 0,
+            gid = 0,
+            links = 1,
+            type = "file",
+            atime = 1000L,
+            mtime = 1000L,
+            ctime = 1000L
+        )
+
+        val callback = LuksReadProxyCallback(session = session, documentId = "/sample.txt")
+        val size = callback.onGetSize()
+        assertEquals(256L, size)
+    }
+
+    @Test
+    fun testM2_onGetSize_throwsEioWhenSessionDead() = runBlocking {
+        testVolume.fileDataMap["/sample.txt"] = ByteArray(256)
+        val callback = LuksReadProxyCallback(session = session, documentId = "/sample.txt")
+
+        // Lock session to simulate dead/closed session
+        session.lock()
+
+        try {
+            callback.onGetSize()
+            fail("Expected ErrnoException(EIO) when session is locked")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    @Test
+    fun testM2_onGetSize_throwsEioWhenVolumeErrors() {
+        testVolume.throwOnFileInfo = RuntimeException("I/O error reading metadata")
+        val callback = LuksReadProxyCallback(session = session, documentId = "/corrupt.txt")
+
+        try {
+            callback.onGetSize()
+            fail("Expected ErrnoException(EIO) on volume error")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    @Test
+    fun testM2_onRead_readsChunksAndCopiesToBuffer() {
+        val original = ByteArray(500) { (it % 100).toByte() }
+        testVolume.fileDataMap["/binary.dat"] = original
+
+        val callback = LuksReadProxyCallback(session = session, documentId = "/binary.dat")
+
+        // 1. Read first 100 bytes from offset 0
+        val buffer1 = ByteArray(100)
+        val read1 = callback.onRead(0L, 100, buffer1)
+        assertEquals(100, read1)
+        val expected1 = original.copyOfRange(0, 100)
+        assertArrayEquals(expected1, buffer1)
+
+        // 2. Read next 200 bytes from offset 100
+        val buffer2 = ByteArray(200)
+        val read2 = callback.onRead(100L, 200, buffer2)
+        assertEquals(200, read2)
+        val expected2 = original.copyOfRange(100, 300)
+        assertArrayEquals(expected2, buffer2)
+
+        // 3. Read past EOF (offset 500) returns 0
+        val bufferEof = ByteArray(100)
+        val readEof = callback.onRead(500L, 100, bufferEof)
+        assertEquals(0, readEof)
+
+        // 4. Read size <= 0 returns 0
+        val readZero = callback.onRead(0L, 0, buffer1)
+        assertEquals(0, readZero)
+    }
+
+    @Test
+    fun testM2_onRead_throwsEioWhenSessionDead() = runBlocking {
+        testVolume.fileDataMap["/binary.dat"] = ByteArray(100)
+        val callback = LuksReadProxyCallback(session = session, documentId = "/binary.dat")
+
+        session.lock()
+
+        val buf = ByteArray(50)
+        try {
+            callback.onRead(0L, 50, buf)
+            fail("Expected ErrnoException(EIO) when session is locked")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    @Test
+    fun testM2_onRead_throwsEioWhenVolumeErrors() {
+        testVolume.fileDataMap["/binary.dat"] = ByteArray(100)
+        testVolume.throwOnRead = LuksException("Read failed", LuksException.IO)
+        val callback = LuksReadProxyCallback(session = session, documentId = "/binary.dat")
+
+        val buf = ByteArray(50)
+        try {
+            callback.onRead(0L, 50, buf)
+            fail("Expected ErrnoException(EIO) on volume read exception")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    // ===============================================
+    // Pass M.5: Sequential-Only Write Streaming Tests
+    // ===============================================
+
+    @Test
+    fun testM5_onWrite_initialGetSize_returnsExpectedOffset() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/write_test.bin")
+        assertEquals(0L, callback.onGetSize())
+    }
+
+    @Test
+    fun testM5_onWrite_streamsSequentialChunksAndAdvancesOffset() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/docs/stream.bin")
+
+        // Chunk 1: 0..99
+        val chunk1 = ByteArray(100) { 1 }
+        val written1 = callback.onWrite(0L, 100, chunk1)
+        assertEquals(100, written1)
+        assertEquals(100L, callback.onGetSize())
+
+        // Chunk 2: 100..149
+        val chunk2 = ByteArray(50) { 2 }
+        val written2 = callback.onWrite(100L, 50, chunk2)
+        assertEquals(50, written2)
+        assertEquals(150L, callback.onGetSize())
+
+        // Chunk 3: 150..174
+        val chunk3 = ByteArray(25) { 3 }
+        val written3 = callback.onWrite(150L, 25, chunk3)
+        assertEquals(25, written3)
+        assertEquals(175L, callback.onGetSize())
+
+        // Fsync
+        callback.onFsync()
+
+        // Release finishes file
+        callback.onRelease()
+
+        assertTrue(testVolume.writtenFiles.any { it.first == "/docs" && it.second == "stream.bin" })
+        val written = testVolume.writtenFiles.first { it.first == "/docs" && it.second == "stream.bin" }.third
+        assertEquals(175, written.size)
+        assertArrayEquals(chunk1 + chunk2 + chunk3, written)
+    }
+
+    @Test
+    fun testM5_onWrite_refusalGate_throwsEinvalOnNonSequentialWrites() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/refuse.bin")
+
+        // 1. Initial write of 100 bytes
+        callback.onWrite(0L, 100, ByteArray(100))
+
+        // 2. Refuse forward seek (gap) -> offset 200 instead of 100
+        try {
+            callback.onWrite(200L, 50, ByteArray(50))
+            fail("Expected EINVAL on forward gap write")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EINVAL, e.errno)
+        }
+
+        // 3. Refuse backward seek -> offset 0 instead of 100
+        val callback2 = LuksWriteProxyCallback(session = session, documentId = "/refuse2.bin")
+        callback2.onWrite(0L, 100, ByteArray(100))
+        try {
+            callback2.onWrite(0L, 50, ByteArray(50))
+            fail("Expected EINVAL on backward seek write")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EINVAL, e.errno)
+        }
+
+        // 4. Refuse non-zero initial offset -> offset 10 instead of 0
+        val callback3 = LuksWriteProxyCallback(session = session, documentId = "/refuse3.bin")
+        try {
+            callback3.onWrite(10L, 50, ByteArray(50))
+            fail("Expected EINVAL on non-zero initial offset")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EINVAL, e.errno)
+        }
+    }
+
+    @Test
+    fun testM5_onWrite_errorOccurred_refusesSubsequentWritesWithEIO() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/err.bin")
+
+        testVolume.throwOnWrite = LuksException("Write chunk failed", LuksException.IO)
+
+        try {
+            callback.onWrite(0L, 100, ByteArray(100))
+            fail("Expected EIO on volume error")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+
+        // After error occurred, next write throws EIO directly
+        testVolume.throwOnWrite = null
+        try {
+            callback.onWrite(0L, 100, ByteArray(100))
+            fail("Expected EIO on subsequent write after error")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    @Test
+    fun testM5_onFsync_throwsEioWhenSessionDeadOrErrorOccurred() = runBlocking {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/fsync.bin")
+        callback.onWrite(0L, 50, ByteArray(50))
+
+        // Clean fsync succeeds
+        callback.onFsync()
+
+        // Session lock makes fsync throw EIO
+        session.lock()
+        try {
+            callback.onFsync()
+            fail("Expected ErrnoException(EIO) on fsync when session locked")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+    }
+
+    @Test
+    fun testM5_onRelease_abandonsFileOnFailureOrError() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/abandon.bin")
+        callback.onWrite(0L, 50, ByteArray(50))
+
+        testVolume.throwOnFinish = LuksException("Finish file failed", LuksException.IO)
+
+        callback.onRelease()
+
+        // Volume should have abandoned the writer
+        assertTrue(testVolume.abandonedWriters.isNotEmpty())
+        assertTrue((testVolume.abandonedWriters.first() as TestLuksVolume.TestFileWriter).abandoned)
+    }
+
+    @Test
+    fun testM5_onWrite_zeroSizeReturnsZero() {
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/zerosize.bin")
+        val written = callback.onWrite(0L, 0, ByteArray(0))
+        assertEquals(0, written)
+        assertEquals(0L, callback.onGetSize())
+    }
+
+    @Test
+    fun testProxyHandlerThread() {
+        val handler = LuksProxyHandlerThread.handler
+        assertNotNull(handler)
+    }
+}
