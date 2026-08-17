@@ -92,6 +92,20 @@ data class Entry(val name: String, val type: String, val isSubvolume: Boolean = 
     val isDir: Boolean get() = type == "dir"
 }
 
+data class FileInfo(
+    val path: String,
+    val size: Long,
+    val mode: Int,
+    val uid: Int,
+    val gid: Int,
+    val links: Int,
+    val type: String,
+    val atime: Long,
+    val mtime: Long,
+    val ctime: Long,
+)
+
+
 /** A drive that has been identified but not decrypted. */
 class LuksDevice internal constructor(
     private var handle: Long,
@@ -249,6 +263,24 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         check(handle != 0L) { "volume is closed" }
         return JSONObject(LuksNative.nativeFileInfo(handle, path)).getLong("size")
     }
+
+    fun fileInfo(path: String): FileInfo {
+        check(handle != 0L) { "volume is closed" }
+        val obj = JSONObject(LuksNative.nativeFileInfo(handle, path))
+        return FileInfo(
+            path = obj.optString("path", path),
+            size = obj.optLong("size", 0L),
+            mode = obj.optInt("mode", 0),
+            uid = obj.optInt("uid", 0),
+            gid = obj.optInt("gid", 0),
+            links = obj.optInt("links", 0),
+            type = obj.optString("type", ""),
+            atime = obj.optLong("atime", 0L),
+            mtime = obj.optLong("mtime", 0L),
+            ctime = obj.optLong("ctime", 0L),
+        )
+    }
+
 
     fun readFile(path: String, maxBytes: Long = 4L * 1024 * 1024): ByteArray {
         check(handle != 0L) { "volume is closed" }
@@ -417,3 +449,16 @@ fun formatSize(bytes: Long): String = when {
     bytes >= 1L shl 10 -> "%.1f KiB".format(bytes.toDouble() / (1L shl 10))
     else -> "$bytes B"
 }
+
+fun formatTimestamp(epochSeconds: Long): String {
+    if (epochSeconds <= 0L) return ""
+    return try {
+        val instant = java.time.Instant.ofEpochSecond(epochSeconds)
+        val zone = java.time.ZoneId.systemDefault()
+        val formatter = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+        formatter.format(instant.atZone(zone))
+    } catch (_: Exception) {
+        ""
+    }
+}
+

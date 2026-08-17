@@ -55,6 +55,7 @@ open class SessionController(
     private val _activeLeases = MutableStateFlow(0)
     val activeLeases: Int get() = _activeLeases.value
     val activeLeaseCount: Int get() = _activeLeases.value
+    val activeLeasesFlow: StateFlow<Int> = _activeLeases.asStateFlow()
 
     private val isLocking = AtomicBoolean(false)
 
@@ -70,12 +71,16 @@ open class SessionController(
     private var idleJob: Job? = null
     private var lastActivityMs: Long = 0L
 
+    private val _remainingIdleMs = MutableStateFlow(DEFAULT_IDLE_TIMEOUT_MS)
+    val remainingIdleMs: StateFlow<Long> = _remainingIdleMs.asStateFlow()
+
     companion object {
         const val DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000L // 5 minutes
     }
 
     fun setIdleTimeout(timeoutMs: Long) {
         idleTimeoutMs = timeoutMs
+        _remainingIdleMs.value = timeoutMs
         if (_state.value is SessionState.Unlocked) {
             restartIdleTimer()
         }
@@ -83,6 +88,7 @@ open class SessionController(
 
     private fun recordActivity() {
         lastActivityMs = timeProvider()
+        _remainingIdleMs.value = idleTimeoutMs
     }
 
     private fun restartIdleTimer() {
@@ -91,8 +97,14 @@ open class SessionController(
         recordActivity()
         idleJob = scope.launch {
             while (isActive) {
+                if (_activeLeases.value > 0) {
+                    recordActivity()
+                    delay(100)
+                    continue
+                }
                 val elapsed = timeProvider() - lastActivityMs
                 val remaining = idleTimeoutMs - elapsed
+                _remainingIdleMs.value = remaining.coerceAtLeast(0L)
                 if (remaining <= 0) {
                     if (_activeLeases.value == 0) {
                         Trace.i("LuksSession: idle timeout expired, locking session")
@@ -102,7 +114,7 @@ open class SessionController(
                         delay(100)
                     }
                 } else {
-                    delay(remaining)
+                    delay(minOf(250L, remaining.coerceAtLeast(1L)))
                 }
             }
         }
@@ -111,6 +123,7 @@ open class SessionController(
     private fun cancelIdleTimer() {
         idleJob?.cancel()
         idleJob = null
+        _remainingIdleMs.value = idleTimeoutMs
     }
 
     /**
@@ -201,6 +214,19 @@ open class SessionController(
             _state.value = failed
             failed
         }
+    }
+
+    /**
+     * Unlocks the first LUKS partition found on [device] using [password].
+     */
+    suspend fun unlock(
+        context: Context,
+        device: LuksDevice,
+        password: SecurePassphraseBuffer,
+    ): SessionState {
+        val partition = device.luksPartitions.firstOrNull()
+            ?: throw IllegalStateException("No LUKS partition found on device")
+        return unlock(context, device, partition, password)
     }
 
     /**
