@@ -22,6 +22,7 @@ pub struct BtrfsFileWriter {
     pub(crate) data_runs: Vec<(u64, u64)>, // (logical_bytenr, num_bytes)
     pub(crate) checksums: Vec<(u64, u32)>, // (logical_bytenr, crc32c)
     pub(crate) allocator: FreeSpaceMap,
+    pub(crate) is_streaming: bool,
 }
 
 impl BtrfsFileWriter {
@@ -35,6 +36,10 @@ impl BtrfsFileWriter {
 
     pub fn data_runs(&self) -> &[(u64, u64)] {
         &self.data_runs
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        self.is_streaming
     }
 }
 
@@ -117,6 +122,28 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             data_runs,
             checksums: Vec::new(),
             allocator,
+            is_streaming: false,
+        })
+    }
+
+    /// Begin an unknown-size streaming file write.
+    ///
+    /// Extents are allocated dynamically in `write_chunk` as data arrives,
+    /// triggering chunk allocation if existing block groups fill up.
+    pub fn begin_file_streaming(&mut self) -> Result<BtrfsFileWriter> {
+        gate::check_writeable_fs(self.superblock())?;
+        gate::check_writeable_subvolume(&self.fs_tree())?;
+
+        let extent_tree = ExtentTree::read(self)?;
+        let allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, self.chunk_map())?;
+
+        Ok(BtrfsFileWriter {
+            size: 0,
+            written_bytes: 0,
+            data_runs: Vec::new(),
+            checksums: Vec::new(),
+            allocator,
+            is_streaming: true,
         })
     }
 
@@ -125,7 +152,38 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             .written_bytes
             .checked_add(data.len() as u64)
             .ok_or(LuksError::OutOfBounds)?;
-        if end > writer.size {
+
+        if writer.is_streaming {
+            let total_allocated: u64 = writer.data_runs.iter().map(|(_, len)| *len).sum();
+            if end > total_allocated {
+                let sector_size = self.superblock().sector_size as u64;
+                let needed_more = end - total_allocated;
+                let disk_num_bytes = ((needed_more + sector_size - 1) / sector_size) * sector_size;
+                let mut allocated_new = 0u64;
+
+                while allocated_new < disk_num_bytes {
+                    let remaining = disk_num_bytes - allocated_new;
+                    match writer.allocator.allocate_data_chunk(remaining, sector_size as u32) {
+                        Ok((bytenr, chunk_len)) => {
+                            writer.data_runs.push((bytenr, chunk_len));
+                            allocated_new += chunk_len;
+                        }
+                        Err(LuksError::FilesystemFull) => {
+                            self.allocate_data_chunk()?;
+                            let extent_tree = ExtentTree::read(self)?;
+                            writer.allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
+                                &extent_tree,
+                                self.chunk_map(),
+                            )?;
+                            for &(run_bytenr, run_len) in &writer.data_runs {
+                                writer.allocator.mark_allocated(run_bytenr, run_len)?;
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        } else if end > writer.size {
             return Err(LuksError::OutOfBounds);
         }
 
@@ -182,17 +240,23 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         }
 
         writer.written_bytes = end;
+        if writer.is_streaming {
+            writer.size = writer.written_bytes;
+        }
         Ok(())
     }
 
     pub fn finish_file(
         &mut self,
-        writer: BtrfsFileWriter,
+        mut writer: BtrfsFileWriter,
         parent_path: &str,
         name: &str,
     ) -> Result<u64> {
-        if writer.written_bytes != writer.size {
+        if !writer.is_streaming && writer.written_bytes != writer.size {
             return Err(LuksError::OutOfBounds);
+        }
+        if writer.is_streaming {
+            writer.size = writer.written_bytes;
         }
 
         let located_parent = self.resolve_no_follow(self.fs_tree(), parent_path)?;
@@ -334,11 +398,13 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         if let Ok(csum_root) = self.tree_root(crate::fs::btrfs::tree::CSUM_TREE_OBJECTID) {
             let mut csum_root_bytenr = csum_root.bytenr;
             let mut csum_root_level = csum_root.level;
+            let mut csum_modified = false;
 
             for &(bytenr, run_len) in &writer.data_runs {
                 if run_len == 0 {
                     continue;
                 }
+                csum_modified = true;
                 let mut extent_data = vec![0u8; run_len as usize];
                 self.read_logical(bytenr, &mut extent_data)?;
                 let csum_items = node::build_extent_csum_items(
@@ -380,7 +446,9 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     csum_root_level = res.new_root_level;
                 }
             }
-            csum_root_opt = Some((csum_root_bytenr, csum_root_level));
+            if csum_modified {
+                csum_root_opt = Some((csum_root_bytenr, csum_root_level));
+            }
         }
 
         let txn = converge_and_finalize(
@@ -489,6 +557,7 @@ mod tests {
             data_runs,
             checksums: Vec::new(),
             allocator,
+            is_streaming: false,
         };
 
         // Prepare test payload (48 KB)

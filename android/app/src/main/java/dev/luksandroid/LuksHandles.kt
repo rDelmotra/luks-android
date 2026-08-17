@@ -62,6 +62,15 @@ data class VolumeInfo(
     val subvolumes: List<SubvolumeInfo>,
 )
 
+data class StatFsInfo(
+    val totalBytes: Long,
+    val freeBytes: Long,
+    val availableBytes: Long,
+    val totalInodes: Long,
+    val freeInodes: Long,
+    val blockSize: Int,
+)
+
 /**
  * A btrfs subvolume: a separate filesystem tree inside the same filesystem.
  * [path] is where it appears when browsing from the top level, so it can be
@@ -272,6 +281,29 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
     fun deleteFile(path: String) {
         check(handle != 0L) { "volume is closed" }
         LuksNative.nativeDeleteFile(handle, path)
+    }
+
+    fun createDirectory(parentPath: String, name: String): Long {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeCreateDirectory(handle, parentPath, name)
+    }
+
+    fun rename(oldParent: String, oldName: String, newParent: String, newName: String) {
+        check(handle != 0L) { "volume is closed" }
+        LuksNative.nativeRename(handle, oldParent, oldName, newParent, newName)
+    }
+
+    fun statFs(): StatFsInfo {
+        check(handle != 0L) { "volume is closed" }
+        val o = JSONObject(LuksNative.nativeStatFs(handle))
+        return StatFsInfo(
+            totalBytes = o.getLong("totalBytes"),
+            freeBytes = o.getLong("freeBytes"),
+            availableBytes = o.getLong("availableBytes"),
+            totalInodes = o.getLong("totalInodes"),
+            freeInodes = o.getLong("freeInodes"),
+            blockSize = o.getInt("blockSize"),
+        )
     }
 
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */

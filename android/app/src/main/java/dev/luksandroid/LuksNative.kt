@@ -141,4 +141,7 @@ internal object LuksNative {
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCloseWriter(handle: Long, writer: Long)
     external fun nativeDeleteFile(handle: Long, path: String)
+    external fun nativeCreateDirectory(handle: Long, parentPath: String, name: String): Long
+    external fun nativeRename(handle: Long, oldParent: String, oldName: String, newParent: String, newName: String)
+    external fun nativeStatFs(handle: Long): String
 }

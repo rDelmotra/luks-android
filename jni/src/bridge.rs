@@ -764,6 +764,19 @@ impl VolumeHandle {
         .to_string())
     }
 
+    pub fn statfs_json(&self) -> Result<String> {
+        let stat = self.fs().statfs()?;
+        Ok(json!({
+            "totalBytes": stat.total_bytes,
+            "freeBytes": stat.free_bytes,
+            "availableBytes": stat.available_bytes,
+            "totalInodes": stat.total_inodes,
+            "freeInodes": stat.free_inodes,
+            "blockSize": stat.block_size,
+        })
+        .to_string())
+    }
+
     /// Whole-file read, refused above `max_bytes`.
     ///
     /// The cap is not paranoia: the result becomes a Java `byte[]`, and a
@@ -779,7 +792,15 @@ impl VolumeHandle {
                 info.size, max_bytes
             )));
         }
-        fs.read_file(path)
+        let data = fs.read_file(path)?;
+        if data.len() as u64 > max_bytes {
+            return Err(LuksError::UnsupportedFsFeature(format!(
+                "file is {} bytes, over the {} byte limit for a single read; \
+                 use readChunk",
+                data.len(), max_bytes
+            )));
+        }
+        Ok(data)
     }
 
     /// Fill `buf` from `offset`, returning how many bytes were written.
@@ -1198,8 +1219,12 @@ mod tests {
     fn read_file_refuses_to_exceed_the_cap() {
         let vol = unlock_fixture();
         assert!(vol.read_file("/proof.txt", u64::MAX).is_ok());
-        let err = vol.read_file("/proof.txt", 4).unwrap_err();
+        let exact_len = vol.read_file("/proof.txt", u64::MAX).unwrap().len() as u64;
+        assert!(vol.read_file("/proof.txt", exact_len).is_ok());
+        let err = vol.read_file("/proof.txt", exact_len - 1).unwrap_err();
         assert_eq!(error_code(&err), code::UNSUPPORTED);
+        let err4 = vol.read_file("/proof.txt", 4).unwrap_err();
+        assert_eq!(error_code(&err4), code::UNSUPPORTED);
     }
 
     /// `sha256_json` streams; `read_file` slurps. They must agree, or the

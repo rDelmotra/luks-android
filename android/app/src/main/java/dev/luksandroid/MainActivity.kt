@@ -33,6 +33,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -638,12 +639,80 @@ private fun UnlockedBody(
         }
     }
 
+    var statFsInfo by remember { mutableStateOf<StatFsInfo?>(null) }
+    LaunchedEffect(state.volume, path) {
+        try {
+            statFsInfo = withContext(Dispatchers.IO) { state.volume.statFs() }
+        } catch (e: LuksException) {
+            Trace.err(e.code, "statfs", "err=${e.message}")
+            Trace.e("statfs: failed [${e.code}] ${e.message}")
+        } catch (e: Exception) {
+            Trace.err(-1, "statfs", "err=${e.message}")
+            Trace.e("statfs: failed", e)
+        }
+    }
+
+    fun createFolder(name: String) {
+        onBusyChange(true)
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    state.volume.createDirectory(path, name)
+                }
+                entries = withContext(Dispatchers.IO) {
+                    state.volume.listDir(path)
+                }
+                statFsInfo = withContext(Dispatchers.IO) { state.volume.statFs() }
+                status = "created folder $name"
+            } catch (e: LuksException) {
+                Trace.err(e.code, "create_directory", "err=${e.message}")
+                Trace.e("create_directory: failed [${e.code}] ${e.message}")
+                status = "create folder failed [${e.code}]: ${e.message}"
+            } catch (e: Exception) {
+                Trace.err(-1, "create_directory", "err=${e.message}")
+                Trace.e("create_directory: failed", e)
+                status = "create folder failed: ${e.message}"
+            }
+            onBusyChange(false)
+        }
+    }
+
+    fun renameItem(oldName: String, newName: String) {
+        onBusyChange(true)
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    state.volume.rename(path, oldName, path, newName)
+                }
+                entries = withContext(Dispatchers.IO) {
+                    state.volume.listDir(path)
+                }
+                status = "renamed $oldName to $newName"
+            } catch (e: LuksException) {
+                Trace.err(e.code, "rename", "err=${e.message}")
+                Trace.e("rename: failed [${e.code}] ${e.message}")
+                status = "rename failed [${e.code}]: ${e.message}"
+            } catch (e: Exception) {
+                Trace.err(-1, "rename", "err=${e.message}")
+                Trace.e("rename: failed", e)
+                status = "rename failed: ${e.message}"
+            }
+            onBusyChange(false)
+        }
+    }
+
     Text(
         "Unlocked: ${info.label.ifBlank { "(no label)" }} · ${info.fsType} " +
             "· ${formatSize(info.sizeBytes)} · ${info.blockSize}B blocks",
         style = MaterialTheme.typography.bodyMedium,
     )
     Text(info.uuid, style = MaterialTheme.typography.bodySmall)
+    statFsInfo?.let { stat ->
+        Text(
+            "Free: ${formatSize(stat.freeBytes)} · Available: ${formatSize(stat.availableBytes)}",
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
     if (info.subvolumes.isNotEmpty()) {
         // Worth showing rather than hiding: on a Linux install these are where
         // the actual content lives, and their paths are directly navigable.

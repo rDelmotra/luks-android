@@ -78,3 +78,37 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_chunk_alloc_controls"
 required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_mkdir"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_rename"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_unknown"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_inode_patch"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_mkdir"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_rename"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_streaming_unknown"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "statfs"
+required-features = ["dangerous-write-support"]
+
+

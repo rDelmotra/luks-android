@@ -93,13 +93,14 @@ const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 //   0x158 s_free_blocks_count_hi
 //   0x15C s_min_extra_isize (u16) | 0x15E s_want_extra_isize (u16)
 const SB_BLOCKS_COUNT_HI: usize = 0x150;
+const SB_R_BLOCKS_COUNT_HI: usize = 0x154;
 pub(crate) const SB_FREE_BLOCKS_COUNT_HI: usize = 0x158;
 const SB_MIN_EXTRA_ISIZE: usize = 0x15C;
 
 // bg_flags bits
 /// The inode bitmap and table for this group have never been written.
 pub const BG_INODE_UNINIT: u16 = 0x0001;
-/// The block bitmap for this group has never been written.
+/// The block bitmap for this group have never been written.
 pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 // i_flags bits
@@ -118,6 +119,7 @@ fn u32le(b: &[u8], o: usize) -> u32 {
 pub struct Superblock {
     pub inodes_count: u32,
     pub blocks_count: u64,
+    pub s_r_blocks_count: u64,
     pub first_data_block: u32,
     pub block_size: u32,
     pub blocks_per_group: u32,
@@ -228,9 +230,17 @@ impl Superblock {
             0
         };
 
+        let r_blocks_lo = u32le(b, 8) as u64;
+        let r_blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
+            u32le(b, SB_R_BLOCKS_COUNT_HI) as u64
+        } else {
+            0
+        };
+
         Ok(Superblock {
             inodes_count: u32le(b, 0),
             blocks_count: blocks_lo | (blocks_hi << 32),
+            s_r_blocks_count: r_blocks_lo | (r_blocks_hi << 32),
             first_data_block: u32le(b, 20),
             block_size,
             blocks_per_group,
@@ -529,6 +539,26 @@ impl<D: ReadAt> Ext4<D> {
 
     pub fn uuid(&self) -> [u8; 16] {
         self.sb.uuid
+    }
+
+    pub fn statfs(&self) -> Result<crate::fs::StatFs> {
+        let bs = self.sb.block_size as u64;
+        let total_bytes = self.sb.blocks_count * bs;
+        let free_bytes = self.sb.free_blocks_count * bs;
+        let available_blocks = self.sb.free_blocks_count.saturating_sub(self.sb.s_r_blocks_count);
+        let available_bytes = available_blocks * bs;
+        let total_inodes = self.sb.inodes_count as u64;
+        let free_inodes = self.sb.free_inodes_count as u64;
+        let block_size = self.sb.block_size;
+
+        Ok(crate::fs::StatFs {
+            total_bytes,
+            free_bytes,
+            available_bytes,
+            total_inodes,
+            free_inodes,
+            block_size,
+        })
     }
 
     #[cfg(any(test, feature = "dangerous-write-support"))]

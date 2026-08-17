@@ -705,3 +705,58 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDeleteFile<'l>(
         Ok(())
     })
 }
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCreateDirectory<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    parent_path: JString<'l>,
+    name: JString<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let parent_path_str = jstr(env, &parent_path)?;
+        let name_str = jstr(env, &name)?;
+        let ino = vol.create_directory(&parent_path_str, &name_str)?;
+        log::i("nativeCreateDirectory: directory created");
+        Ok(ino as jlong)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeRename<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    old_parent: JString<'l>,
+    old_name: JString<'l>,
+    new_parent: JString<'l>,
+    new_name: JString<'l>,
+) {
+    guard(&mut env, (), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let old_parent_str = jstr(env, &old_parent)?;
+        let old_name_str = jstr(env, &old_name)?;
+        let new_parent_str = jstr(env, &new_parent)?;
+        let new_name_str = jstr(env, &new_name)?;
+        vol.rename(&old_parent_str, &old_name_str, &new_parent_str, &new_name_str)?;
+        log::i("nativeRename: item renamed");
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeStatFs<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let json = vol.statfs_json()?;
+        out_string(env, &json)
+    })
+}

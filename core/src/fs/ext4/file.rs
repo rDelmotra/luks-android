@@ -32,8 +32,9 @@
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
 use crate::fs::ext4::alloc::Extent;
-use crate::fs::ext4::csum::Seed;
+use crate::fs::ext4::csum::{Seed, DIR_TAIL_SIZE};
 use crate::fs::ext4::{Ext4, Inode};
+use crate::fs::FileType;
 
 const EXTENT_MAGIC: u16 = 0xF30A;
 /// Header (12 bytes) + four 12-byte entries fills exactly the 60-byte
@@ -88,6 +89,7 @@ pub struct FileWriter {
     /// holding this tail until it is complete avoids writing zero padding that
     /// a later chunk would need to overwrite.
     tail: Vec<u8>,
+    is_streaming: bool,
 }
 
 /// `ee_len` is 16 bits, and values above 32768 mean "uninitialised extent" —
@@ -95,15 +97,35 @@ pub struct FileWriter {
 /// back as a hole.
 const MAX_EXTENT_LEN: u64 = 32768;
 
+/// Coalesce contiguous physical extents before mapping to file runs.
+fn coalesce_extents(extents: &[Extent]) -> Vec<Extent> {
+    let mut merged: Vec<Extent> = Vec::new();
+    for e in extents {
+        if let Some(last) = merged.last_mut() {
+            if last.physical + last.len == e.physical {
+                last.len += e.len;
+                continue;
+            }
+        }
+        merged.push(*e);
+    }
+    merged
+}
+
 /// Lay the allocator's physical runs out as logical file extents.
 ///
-/// The allocator has no reason to respect `ee_len`'s ceiling — it hands back
-/// whatever contiguity it found — so a long run is cut here, at the layer that
-/// knows why the ceiling exists.
+/// Extent tree depth ceiling:
+/// - Depth 0 (inline): at most 4 entries in `i_block` (48 bytes / 12 = 4).
+/// - Depth 1 (single leaf block): at most `(block_size - 12 - 4) / 12` entries:
+///   - 340 entries on a 4 KiB filesystem (up to 42.5 GiB contiguous, or 1.36 MiB fully fragmented).
+///   - 84 entries on a 1 KiB filesystem.
+/// If fragmentation or size requires more runs than fit in a single leaf block, depth 2
+/// would be required. The writer refuses cleanly and early before block allocation.
 fn runs_from(extents: &[Extent], max_runs: usize) -> Result<Vec<Run>> {
     let mut runs = Vec::new();
     let mut logical = 0u64;
-    for e in extents {
+    let merged = coalesce_extents(extents);
+    for e in &merged {
         let mut offset = 0u64;
         while offset < e.len {
             let len = (e.len - offset).min(MAX_EXTENT_LEN);
@@ -119,7 +141,7 @@ fn runs_from(extents: &[Extent], max_runs: usize) -> Result<Vec<Run>> {
     if runs.len() > max_runs {
         return Err(LuksError::UnsupportedFsFeature(
             "file needs more extents than the max leaf node size — multi-leaf \
-             extent trees are not yet implemented"
+             extent trees (depth > 1) are not supported"
                 .into(),
         ));
     }
@@ -173,6 +195,27 @@ impl<D: WriteAt> Ext4<D> {
             blocks_needed,
             leaf_block,
             tail: Vec::new(),
+            is_streaming: false,
+        })
+    }
+
+    /// Begin a streaming file transfer whose final size is not known up-front.
+    ///
+    /// Extents are allocated incrementally as data arrives via [`write_chunk`](Self::write_chunk).
+    pub fn begin_file_streaming(&mut self) -> Result<FileWriter> {
+        let seed = Seed::for_writing(&self.sb)?;
+        let ino = self.alloc_inode(false)?;
+        Ok(FileWriter {
+            ino,
+            extents: Vec::new(),
+            runs: Vec::new(),
+            seed,
+            size: 0,
+            written: 0,
+            blocks_needed: 0,
+            leaf_block: None,
+            tail: Vec::new(),
+            is_streaming: true,
         })
     }
 
@@ -183,11 +226,71 @@ impl<D: WriteAt> Ext4<D> {
             .written
             .checked_add(data.len() as u64)
             .ok_or(LuksError::OutOfBounds)?;
-        if end > writer.size {
+
+        let bs = self.sb.block_size as u64;
+        let block_size = self.sb.block_size as usize;
+        let max_runs = (block_size - 12 - 4) / 12;
+
+        if writer.is_streaming {
+            let blocks_needed = end.div_ceil(bs.max(1));
+            let current_data_blocks: u64 = writer.runs.iter().map(|r| r.len).sum();
+            if blocks_needed > current_data_blocks {
+                let delta = blocks_needed - current_data_blocks;
+                // Refusal gate before block allocation: if we already have max_runs runs,
+                // adding more cannot fit in depth <= 1
+                if writer.runs.len() >= max_runs {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "file needs more extents than the max leaf node size — multi-leaf \
+                         extent trees (depth > 1) are not supported"
+                            .into(),
+                    ));
+                }
+                let goal = writer
+                    .extents
+                    .iter()
+                    .filter(|e| Some(e.physical) != writer.leaf_block)
+                    .last()
+                    .map(|e| e.physical + e.len)
+                    .unwrap_or(0);
+                let new_extents = self.alloc_blocks(goal, delta)?;
+                writer.extents.extend_from_slice(&new_extents);
+
+                let data_extents: Vec<Extent> = writer
+                    .extents
+                    .iter()
+                    .copied()
+                    .filter(|e| Some(e.physical) != writer.leaf_block)
+                    .collect();
+                let runs = match runs_from(&data_extents, max_runs) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = self.free_blocks(&new_extents);
+                        writer
+                            .extents
+                            .truncate(writer.extents.len() - new_extents.len());
+                        return Err(e);
+                    }
+                };
+                writer.runs = runs;
+                writer.blocks_needed = blocks_needed;
+
+                if writer.runs.len() > MAX_INLINE_EXTENTS && writer.leaf_block.is_none() {
+                    match self.alloc_blocks(0, 1) {
+                        Ok(mut e) => {
+                            writer.leaf_block = Some(e[0].physical);
+                            writer.extents.append(&mut e);
+                        }
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            writer.size = end;
+        } else if end > writer.size {
             return Err(LuksError::OutOfBounds);
         }
 
-        let block_size = self.sb.block_size as usize;
         let mut input = data;
         if !writer.tail.is_empty() {
             let needed = block_size - writer.tail.len();
@@ -244,6 +347,10 @@ impl<D: WriteAt> Ext4<D> {
     }
 
     fn finish_unlinked(&mut self, writer: &mut FileWriter) -> Result<u64> {
+        if writer.is_streaming {
+            writer.size = writer.written;
+            writer.blocks_needed = writer.written.div_ceil(self.sb.block_size as u64);
+        }
         if writer.written != writer.size {
             return Err(LuksError::OutOfBounds);
         }
@@ -682,6 +789,305 @@ impl<D: WriteAt> Ext4<D> {
                 "file has extent tree depth > 1".into(),
             ))
         }
+    }
+
+    /// Update `i_links_count` for inode `ino` by adding `delta`.
+    ///
+    /// Reads raw inode table block for `ino`, updates `i_links_count` at offset 0x1A,
+    /// recomputes Castagnoli CRC32C inode checksum using `csum.rs`, writes block
+    /// back to device and flushes.
+    pub fn patch_inode_links_count(&mut self, ino: u32, delta: i16) -> Result<()> {
+        let seed = Seed::for_writing(&self.sb)?;
+        let offset = self.inode_offset(ino as u64)?;
+        let isize_ = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; isize_];
+        self.device.read_at(offset, &mut raw)?;
+
+        let current_links = u16le(&raw, 0x1A);
+        let new_links = current_links as i32 + delta as i32;
+        if new_links < 0 || new_links > u16::MAX as i32 {
+            return Err(LuksError::CorruptFs("inode links count underflow/overflow"));
+        }
+        put16(&mut raw, 0x1A, new_links as u16);
+
+        if let Some(csum) = seed.inode(ino as u64, &raw) {
+            put16(&mut raw, 0x7C, csum as u16);
+            if seed.inode_has_csum_hi(&raw) {
+                put16(&mut raw, 0x82, (csum >> 16) as u16);
+            }
+        }
+
+        self.device.write_at(offset, &raw)?;
+        self.flush()
+    }
+
+    fn write_directory_inode_record(
+        &mut self,
+        ino: u64,
+        block_phys: u64,
+        seed: &Seed,
+    ) -> Result<()> {
+        let isize_ = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; isize_];
+
+        const MODE_DIR_0755: u16 = 0x4000 | 0o755;
+        const FL_EXTENTS: u32 = 0x0008_0000;
+
+        put16(&mut raw, 0x00, MODE_DIR_0755); // i_mode
+        put32(&mut raw, 0x04, self.sb.block_size); // i_size_lo
+        let now = now_unix();
+        put32(&mut raw, 0x08, now); // i_atime
+        put32(&mut raw, 0x0C, now); // i_ctime
+        put32(&mut raw, 0x10, now); // i_mtime
+        put16(&mut raw, 0x1A, 2); // i_links_count = 2 (parent dirent + '.' in self)
+        let sectors_per_block = self.sb.block_size / 512;
+        put32(&mut raw, 0x1C, sectors_per_block); // i_blocks_lo
+        put32(&mut raw, 0x20, FL_EXTENTS); // i_flags
+
+        let runs = [Run {
+            logical: 0,
+            physical: block_phys,
+            len: 1,
+        }];
+        write_extent_tree(&mut raw[0x28..0x28 + 60], &runs, None)?;
+
+        if isize_ > 128 {
+            let cap = (isize_ - 128) as u16;
+            let extra = self.sb.min_extra_isize.max(32).min(cap);
+            let extra = (extra + 3) & !3;
+            put16(&mut raw, 0x80, extra); // i_extra_isize
+        }
+
+        if let Some(csum) = seed.inode(ino, &raw) {
+            put16(&mut raw, 0x7C, csum as u16);
+            if seed.inode_has_csum_hi(&raw) {
+                put16(&mut raw, 0x82, (csum >> 16) as u16);
+            }
+        }
+
+        let offset = self.inode_offset(ino)?;
+        self.device.write_at(offset, &raw)?;
+        Ok(())
+    }
+
+    fn undo_new_dir(&mut self, ino: u64, extents: &[Extent]) {
+        let _ = self.free_inode(ino, true);
+        let _ = self.free_blocks(extents);
+        let _ = self.flush();
+    }
+
+    /// Create a new directory `name` in parent directory `dir_ino`.
+    /// Returns the new directory's inode number.
+    ///
+    /// 1. Allocates an inode with `alloc_inode(true)`.
+    /// 2. Allocates 1 block with `alloc_blocks(0, 1)`.
+    /// 3. Formats fresh dirent block: `.` (`ino`, len 12, `FT_DIR`), `..` (`dir_ino`, len `usable - 12`, `FT_DIR`), and directory checksum tail (`Seed::dir_block`).
+    /// 4. Writes directory inode record (`mode = 0x4000 | 0755`, `i_links_count = 2`, `i_size = block_size`, single-extent pointing to the dirent block).
+    /// 5. Links into parent directory with `link_file`.
+    /// 6. Bumps parent directory's `i_links_count` using `patch_inode_links_count`.
+    /// 7. Provides compensation rollback on any failure before completion.
+    pub fn create_directory(&mut self, dir_ino: u32, name: &str) -> Result<u32> {
+        let seed = Seed::for_writing(&self.sb)?;
+
+        super::dirent::validate_name(name.as_bytes())?;
+
+        let parent = self.read_inode(dir_ino as u64)?;
+        if !parent.file_type().is_dir() {
+            return Err(LuksError::NotADirectory(format!("inode {dir_ino}")));
+        }
+
+        let ino = self.alloc_inode(true)?;
+        let ino_u32 = ino as u32;
+
+        let extents = match self.alloc_blocks(0, 1) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = self.free_inode(ino, true);
+                let _ = self.flush();
+                return Err(e);
+            }
+        };
+        let block_phys = extents[0].physical;
+
+        let bs = self.sb.block_size as usize;
+        let mut block = vec![0u8; bs];
+
+        // First entry: "."
+        put32(&mut block, 0, ino_u32);
+        put16(&mut block, 4, 12);
+        block[6] = 1; // name_len
+        block[7] = 2; // FT_DIR
+        block[8] = b'.';
+        block[9..12].fill(0);
+
+        // Second entry: ".."
+        let dotdot_len = if seed.enabled() {
+            bs - 12 - DIR_TAIL_SIZE
+        } else {
+            bs - 12
+        };
+        put32(&mut block, 12, dir_ino);
+        put16(&mut block, 16, dotdot_len as u16);
+        block[18] = 2; // name_len
+        block[19] = 2; // FT_DIR
+        block[20] = b'.';
+        block[21] = b'.';
+        block[22..12 + dotdot_len].fill(0);
+
+        // Checksum tail
+        if seed.enabled() {
+            let tail_off = bs - DIR_TAIL_SIZE;
+            put32(&mut block, tail_off, 0);
+            put16(&mut block, tail_off + 4, DIR_TAIL_SIZE as u16);
+            block[tail_off + 6] = 0;
+            block[tail_off + 7] = 0xDE;
+            if let Some(csum) = seed.dir_block(ino, 0, &block) {
+                put32(&mut block, bs - 4, csum);
+            }
+        }
+
+        let at = match self.metadata_block_offset(block_phys) {
+            Ok(offset) => offset,
+            Err(e) => {
+                self.undo_new_dir(ino, &extents);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.device.write_at(at, &block) {
+            self.undo_new_dir(ino, &extents);
+            return Err(e);
+        }
+
+        if let Err(e) = self.write_directory_inode_record(ino, block_phys, &seed) {
+            self.undo_new_dir(ino, &extents);
+            return Err(e);
+        }
+
+        if let Err(e) = self.flush() {
+            self.undo_new_dir(ino, &extents);
+            return Err(e);
+        }
+
+        if let Err(e) = self.link_file(dir_ino as u64, name, ino, FileType::Directory) {
+            self.undo_new_dir(ino, &extents);
+            return Err(e);
+        }
+
+        if let Err(e) = self.patch_inode_links_count(dir_ino, 1) {
+            let _ = self.unlink_file(dir_ino as u64, name);
+            self.undo_new_dir(ino, &extents);
+            return Err(e);
+        }
+
+        Ok(ino_u32)
+    }
+
+    /// Rename a regular file from `old_name` to `new_name` in directory `dir_ino`.
+    ///
+    /// Refuses directory renames (`UnsupportedFsFeature`), cross-directory renames
+    /// (`UnsupportedFsFeature`), and non-regular file renames.
+    ///
+    /// If `new_name` exists and is a regular file, unlinks and frees the destination
+    /// before linking `old_name` under `new_name`.
+    pub fn rename_file(&mut self, dir_ino: u32, old_name: &str, new_name: &str) -> Result<()> {
+        let _seed = Seed::for_writing(&self.sb)?;
+
+        // Refusal gate: cross-directory move
+        if old_name.contains('/') || new_name.contains('/') {
+            return Err(LuksError::UnsupportedFsFeature(
+                "cross-directory rename is not supported".into(),
+            ));
+        }
+
+        super::dirent::validate_name(old_name.as_bytes())?;
+        super::dirent::validate_name(new_name.as_bytes())?;
+
+        if old_name == new_name {
+            let dir = self.read_inode(dir_ino as u64)?;
+            if self.find_entry(&dir, old_name.as_bytes())?.is_none() {
+                return Err(LuksError::NotFound(old_name.to_string()));
+            }
+            return Ok(());
+        }
+
+        let dir = self.read_inode(dir_ino as u64)?;
+        if !dir.file_type().is_dir() {
+            return Err(LuksError::NotADirectory(format!("inode {dir_ino}")));
+        }
+
+        let old_ino = self
+            .find_entry(&dir, old_name.as_bytes())?
+            .ok_or_else(|| LuksError::NotFound(old_name.to_string()))?;
+
+        let old_inode = self.read_inode(old_ino)?;
+        // Refusal gate: directory rename
+        if old_inode.file_type().is_dir() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "renaming a directory is not supported".into(),
+            ));
+        }
+        if !old_inode.file_type().is_file() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "renaming non-regular files is not supported".into(),
+            ));
+        }
+
+        // Check if destination exists
+        let dest_entry = self.find_entry(&dir, new_name.as_bytes())?;
+        if let Some(dest_ino) = dest_entry {
+            let dest_inode = self.read_inode(dest_ino)?;
+            if dest_inode.file_type().is_dir() {
+                return Err(LuksError::UnsupportedFsFeature(
+                    "overwriting a directory with a file is not supported".into(),
+                ));
+            }
+            if dest_inode.links > 1 {
+                return Err(LuksError::UnsupportedFsFeature(
+                    "overwriting a hardlinked file is not supported".into(),
+                ));
+            }
+            // Delete destination file completely
+            let (data_extents, index_extents) = self.collect_extents(&dest_inode)?;
+            let removed_ino = self.unlink_file(dir_ino as u64, new_name)?;
+            if removed_ino != dest_ino {
+                return Err(LuksError::CorruptFs("unlinked dest inode number mismatch"));
+            }
+            self.free_inode(dest_ino, false)?;
+            self.free_blocks(&data_extents)?;
+            if !index_extents.is_empty() {
+                self.free_blocks(&index_extents)?;
+            }
+            self.flush()?;
+        }
+
+        // Unlink old name
+        let removed_ino = self.unlink_file(dir_ino as u64, old_name)?;
+        if removed_ino != old_ino {
+            return Err(LuksError::CorruptFs("unlinked old inode number mismatch"));
+        }
+
+        // Link new name
+        if let Err(e) = self.link_file(dir_ino as u64, new_name, old_ino, FileType::Regular) {
+            // Attempt rollback: re-link old name
+            let _ = self.link_file(dir_ino as u64, old_name, old_ino, FileType::Regular);
+            let _ = self.flush();
+            return Err(e);
+        }
+
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Rename an item given old and new parent directory paths and names.
+    pub fn rename(&mut self, old_parent: &str, old_name: &str, new_parent: &str, new_name: &str) -> Result<()> {
+        let old_dir = self.resolve(old_parent)?;
+        let new_dir = self.resolve(new_parent)?;
+        if old_dir.number != new_dir.number {
+            return Err(LuksError::UnsupportedFsFeature(
+                "ext4 cross-directory rename is not supported".into(),
+            ));
+        }
+        self.rename_file(old_dir.number as u32, old_name, new_name)
     }
 }
 

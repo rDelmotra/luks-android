@@ -869,4 +869,75 @@ fn a_btrfs_file_deleted_through_the_bridge_is_gone_and_clean() {
     }
 }
 
+#[test]
+fn ext4_volume_handle_statfs_mkdir_rename_and_read_cap() {
+    let path = scratch("bridge-ops");
+    let vol = unlock(&path);
+
+    // 1. statfs_json
+    let stat_json = vol.statfs_json().expect("statfs_json");
+    let stat: serde_json::Value = serde_json::from_str(&stat_json).expect("valid json");
+    assert!(stat["totalBytes"].as_u64().unwrap() > 0);
+    assert!(stat["freeBytes"].as_u64().unwrap() > 0);
+    assert!(stat["availableBytes"].as_u64().unwrap() > 0);
+    assert!(stat["blockSize"].as_u64().unwrap() > 0);
+
+    // 2. create_directory
+    let dir_ino = vol.create_directory("/", "subfolder").expect("create_directory");
+    assert!(dir_ino > 0);
+
+    // 3. write inside directory
+    vol.write_file("/subfolder", "data.txt", b"ext4 bridge subfolder test content\n")
+        .expect("write_file in subdir");
+
+    // 4. rename inside directory
+    vol.rename("/subfolder", "data.txt", "/subfolder", "renamed_data.txt")
+        .expect("rename in subdir");
+
+    // 5. read_file and max_bytes cap enforcement
+    let content = vol.read_file("/subfolder/renamed_data.txt", 1000).expect("read_file");
+    assert_eq!(content, b"ext4 bridge subfolder test content\n");
+
+    let exact_len = content.len() as u64;
+    assert!(vol.read_file("/subfolder/renamed_data.txt", exact_len).is_ok());
+    let err_capped = vol.read_file("/subfolder/renamed_data.txt", exact_len - 1).unwrap_err();
+    assert_eq!(error_code(&err_capped), code::UNSUPPORTED);
+}
+
+#[test]
+fn btrfs_volume_handle_statfs_mkdir_rename_and_read_cap() {
+    let path = scratch_btrfs("bridge-ops");
+    let vol = unlock(&path);
+
+    // 1. statfs_json
+    let stat_json = vol.statfs_json().expect("statfs_json");
+    let stat: serde_json::Value = serde_json::from_str(&stat_json).expect("valid json");
+    assert!(stat["totalBytes"].as_u64().unwrap() > 0);
+    assert!(stat["freeBytes"].as_u64().unwrap() > 0);
+    assert!(stat["availableBytes"].as_u64().unwrap() > 0);
+    assert_eq!(stat["blockSize"].as_u64().unwrap(), 4096);
+
+    // 2. create_directory
+    let dir_ino = vol.create_directory("/", "btrfs_sub").expect("create_directory");
+    assert!(dir_ino >= 256);
+
+    // 3. write inside directory
+    vol.write_file("/btrfs_sub", "b_data.txt", b"btrfs bridge subfolder test content\n")
+        .expect("write_file in subdir");
+
+    // 4. rename inside directory
+    vol.rename("/btrfs_sub", "b_data.txt", "/btrfs_sub", "renamed_b_data.txt")
+        .expect("rename in subdir");
+
+    // 5. read_file and max_bytes cap enforcement
+    let content = vol.read_file("/btrfs_sub/renamed_b_data.txt", 1000).expect("read_file");
+    assert_eq!(content, b"btrfs bridge subfolder test content\n");
+
+    let exact_len = content.len() as u64;
+    assert!(vol.read_file("/btrfs_sub/renamed_b_data.txt", exact_len).is_ok());
+    let err_capped = vol.read_file("/btrfs_sub/renamed_b_data.txt", exact_len - 1).unwrap_err();
+    assert_eq!(error_code(&err_capped), code::UNSUPPORTED);
+}
+
+
 

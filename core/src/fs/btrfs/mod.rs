@@ -387,4 +387,87 @@ impl<D: ReadAt> Btrfs<D> {
     pub fn read_dev_extents(&self, devid: u64) -> Result<Vec<(u64, u64)>> {
         write::chunk_alloc::read_dev_extents(self, devid)
     }
+
+    /// Filesystem capacity and allocation statistics.
+    pub fn statfs(&self) -> Result<crate::fs::StatFs> {
+        let total_bytes = self.sb.total_bytes;
+        let sector_size = self.sb.sector_size;
+
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            let extent_tree = write::extent_tree::ExtentTree::read(self)?;
+            let free_space_map = write::alloc::FreeSpaceMap::from_extent_tree_and_chunk_map(
+                &extent_tree,
+                self.chunk_map(),
+            )?;
+
+            let mut free_data = 0u64;
+            let mut free_metadata = 0u64;
+            let mut free_system = 0u64;
+
+            for bg in &free_space_map.block_groups {
+                let flags = bg.block_group.flags;
+                if flags & 0x1 != 0 {
+                    // DATA
+                    free_data = free_data.saturating_add(bg.total_free_bytes);
+                }
+                if flags & 0x4 != 0 {
+                    // METADATA
+                    free_metadata = free_metadata.saturating_add(bg.total_free_bytes);
+                }
+                if flags & 0x2 != 0 {
+                    // SYSTEM
+                    free_system = free_system.saturating_add(bg.total_free_bytes);
+                }
+            }
+
+            // Unallocated device space
+            let dev_extents = write::chunk_alloc::read_dev_extents(self, self.sb.dev_id).unwrap_or_default();
+            let allocated_dev_bytes: u64 = dev_extents.iter().map(|(_, len)| *len).sum();
+            let unalloc_dev_bytes = total_bytes
+                .saturating_sub(write::chunk_alloc::BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
+                .saturating_sub(allocated_dev_bytes);
+
+            let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes / (64 * 1024)) * (64 * 1024);
+
+            let total_free_data = free_data.saturating_add(allocatable_unalloc_dev_bytes);
+
+            // Metadata headroom:
+            // In btrfs, each 4 KiB data sector needs 4 bytes of csum, plus extent item & extent data items.
+            // Cost ratio: ~ 1 metadata byte per 256 data bytes.
+            // Reserve a safety margin of metadata (512 KiB).
+            let metadata_safety_margin = 512 * 1024;
+            let remaining_metadata_headroom = free_metadata.saturating_sub(metadata_safety_margin);
+            let max_data_from_metadata = remaining_metadata_headroom.saturating_mul(256);
+
+            let data_safety_margin = 64 * 1024;
+            let available_bytes = total_free_data
+                .min(max_data_from_metadata)
+                .saturating_sub(data_safety_margin);
+
+            let total_free = total_free_data.min(total_bytes);
+
+            Ok(crate::fs::StatFs {
+                total_bytes,
+                free_bytes: total_free,
+                available_bytes: available_bytes.min(total_free),
+                total_inodes: 0,
+                free_inodes: 0,
+                block_size: sector_size,
+            })
+        }
+
+        #[cfg(not(feature = "dangerous-write-support"))]
+        {
+            let free_bytes = total_bytes.saturating_sub(self.sb.bytes_used);
+            Ok(crate::fs::StatFs {
+                total_bytes,
+                free_bytes,
+                available_bytes: free_bytes,
+                total_inodes: 0,
+                free_inodes: 0,
+                block_size: sector_size,
+            })
+        }
+    }
 }

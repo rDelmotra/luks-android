@@ -14,6 +14,16 @@ pub use detect::{detect, FsKind};
 pub use ext4::Ext4;
 pub use mounted::{MountedFs, OpenFile};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StatFs {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub available_bytes: u64,
+    pub total_inodes: u64,
+    pub free_inodes: u64,
+    pub block_size: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Regular,

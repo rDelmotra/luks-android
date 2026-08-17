@@ -179,4 +179,14 @@ impl<D: ReadAt> MountedFs<D> {
             MountedFs::Btrfs(fs) => Some(fs.node_cache_stats()),
         }
     }
+
+    /// Filesystem capacity and allocation statistics.
+    pub fn statfs(&self) -> Result<crate::fs::StatFs> {
+        match self {
+            MountedFs::Ext4(fs) => fs.statfs(),
+            MountedFs::Btrfs(fs) => fs.statfs(),
+        }
+    }
 }
+
+

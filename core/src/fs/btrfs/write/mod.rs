@@ -63,6 +63,56 @@ impl<D: WriteAt> Btrfs<D> {
         Ok(())
     }
 
+    /// Create a new directory named `name` inside `parent_path`.
+    /// Performs this in a transaction and returns the new directory's inode number.
+    pub fn create_directory(&mut self, parent_path: &str, name: &str) -> Result<u64> {
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let (txn, new_ino) = Transaction::create_directory(self, parent_path, name, now_sec, now_nsec)?;
+        commit_transaction(self, txn)?;
+        Ok(new_ino)
+    }
+
+    /// Create a new directory named `name` inside `parent_ino`.
+    /// Performs this in a transaction and returns the new directory's inode number.
+    pub fn create_directory_in_dir(&mut self, parent_ino: u64, name: &str) -> Result<u64> {
+        let located_parent = self.read_inode(self.fs_tree().bytenr, parent_ino)?;
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let (txn, new_ino) = Transaction::create_directory_in_dir(
+            self,
+            parent_ino,
+            located_parent.uid,
+            located_parent.gid,
+            name,
+            now_sec,
+            now_nsec,
+        )?;
+        commit_transaction(self, txn)?;
+        Ok(new_ino)
+    }
+
+    /// Rename or move an entry from `old_parent/old_name` to `new_parent/new_name`.
+    pub fn rename(
+        &mut self,
+        old_parent: &str,
+        old_name: &str,
+        new_parent: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs(), d.subsec_nanos()),
+            Err(_) => (0, 0),
+        };
+        let txn = Transaction::rename(self, old_parent, old_name, new_parent, new_name, now_sec, now_nsec)?;
+        commit_transaction(self, txn)?;
+        Ok(())
+    }
+
     /// Write `data` into the regular file at `path`.
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {

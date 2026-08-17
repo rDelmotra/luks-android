@@ -70,17 +70,7 @@ impl VolumeHandle {
         }
     }
 
-    /// Create `name` in the volume's root directory holding `data`, returning
-    /// the new inode number.
-    ///
-    /// # Scope
-    ///
-    /// Root directory only, one whole file at a time, held in memory. That is
-    /// what the phone needs to prove the path end to end; subdirectories and
-    /// streaming are the next thing, not this thing. The size ceiling is real
-    /// and comes from below: a new inode's extent tree is four inline extents,
-    /// so a file too fragmented to describe in four runs is refused rather
-    /// than truncated.
+    /// Create `name` in `parent_path` holding `data`, returning the new inode number.
     ///
     /// # Ordering
     ///
@@ -143,6 +133,41 @@ impl VolumeHandle {
         match &mut *fs {
             Fs::Ext4(ext4) => ext4.delete_file(path),
             Fs::Btrfs(btrfs) => btrfs.delete_file(path),
+        }
+    }
+
+    /// Create a directory at `parent_path` with name `name`.
+    pub fn create_directory(&self, parent_path: &str, name: &str) -> Result<u64> {
+        let mut fs = self.fs();
+        self.claim_writer()?;
+        match &mut *fs {
+            Fs::Ext4(ext4) => {
+                let dir_ino = ext4.resolve(parent_path)?.number as u32;
+                let ino = ext4.create_directory(dir_ino, name)?;
+                ext4.flush()?;
+                Ok(ino as u64)
+            }
+            Fs::Btrfs(btrfs) => {
+                let ino = btrfs.create_directory(parent_path, name)?;
+                Ok(ino)
+            }
+        }
+    }
+
+    /// Rename an item from `(old_parent, old_name)` to `(new_parent, new_name)`.
+    pub fn rename(&self, old_parent: &str, old_name: &str, new_parent: &str, new_name: &str) -> Result<()> {
+        let mut fs = self.fs();
+        self.claim_writer()?;
+        match &mut *fs {
+            Fs::Ext4(ext4) => {
+                ext4.rename(old_parent, old_name, new_parent, new_name)?;
+                ext4.flush()?;
+                Ok(())
+            }
+            Fs::Btrfs(btrfs) => {
+                btrfs.rename(old_parent, old_name, new_parent, new_name)?;
+                Ok(())
+            }
         }
     }
 
