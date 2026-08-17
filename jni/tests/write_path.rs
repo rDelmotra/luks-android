@@ -22,6 +22,12 @@
 //! mount. Our own reader never grades our own writer.
 #![cfg(feature = "dangerous-write-support")]
 
+// The oracle gate is a single implementation shared with `core/tests/`, not a
+// second copy of the same logic — see `core/tests/common/oracle.rs` for why
+// that duplication was the bug in the first place.
+#[path = "../../core/tests/common/oracle.rs"]
+mod oracle;
+
 use luks_core::device::FileDevice;
 use luks_jni::bridge::{
     cancel_operation, code, error_code, is_cancelled, register_cancel_token,
@@ -43,24 +49,15 @@ fn scratch(test: &str) -> String {
     dst.to_string_lossy().into_owned()
 }
 
-/// The colima VM holds the only real kernel here. Skipping rather than failing
-/// when it is down keeps `cargo test` usable offline — but a skip is printed,
-/// because a silent skip is how a suite quietly stops proving anything.
+/// The colima VM holds the only real kernel here. By default a down oracle
+/// **fails the test** (see `oracle::gate`) rather than silently skipping —
+/// set `ALLOW_NO_ORACLE=1` to explicitly run offline instead.
 fn tool(which: &str) -> Option<String> {
     let script = format!("{}/../tools/{which}", env!("CARGO_MANIFEST_DIR"));
     if !std::path::Path::new(&script).exists() {
         return None;
     }
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !up {
-        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
-            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
-        }
-        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+    if !oracle::gate() {
         return None;
     }
     Some(script)

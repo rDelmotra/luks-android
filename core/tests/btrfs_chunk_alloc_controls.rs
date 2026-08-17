@@ -32,6 +32,8 @@
 //!   logical to physical blocks.
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -86,17 +88,7 @@ fn run_verify_script(image_path: &Path) -> (bool, String) {
         .join("tools")
         .join("verify-btrfs.sh");
 
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !up {
-        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
-            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
-        }
-        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+    if !common::oracle::gate() {
         return (true, String::new());
     }
 
@@ -118,17 +110,7 @@ fn run_verify_script(image_path: &Path) -> (bool, String) {
 }
 
 fn run_btrfs_check(image_path: &Path) -> (bool, String) {
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !up {
-        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
-            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
-        }
-        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+    if !common::oracle::gate() {
         return (true, String::new());
     }
 

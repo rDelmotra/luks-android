@@ -15,6 +15,8 @@
 //! 4. Real Linux kernel mount reads back the written files and verifies byte-for-byte SHA256 match.
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -83,17 +85,7 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
         return false;
     }
 
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !up {
-        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
-            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
-        }
-        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+    if !common::oracle::gate() {
         return true;
     }
 
@@ -125,17 +117,7 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
 
 /// Mount image inside Colima and verify that the Linux kernel reads back the exact SHA256 checksums.
 fn verify_kernel_readback_sha256(image_path: &PathBuf, files: &[(&str, &str)]) -> bool {
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !up {
-        if std::env::var("REQUIRE_ORACLE").map(|v| v == "1").unwrap_or(false) {
-            panic!("REQUIRE_ORACLE=1 is set but colima/oracle is not running!");
-        }
-        eprintln!("⚠️  ORACLE SKIPPED: colima is not running");
+    if !common::oracle::gate() {
         return true;
     }
 
