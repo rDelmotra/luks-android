@@ -25,6 +25,14 @@ pub const BTRFS_SYSTEM_CHUNK_ENTRY_SIZE: usize = 129;
 /// If allocating a chunk could necessitate adding a new SYSTEM chunk and `sys_chunk_array`
 /// does not have sufficient remaining capacity (at least 129 bytes for a 2-stripe chunk item),
 /// refuse before attempting allocation.
+///
+/// **This is a static precondition on pre-existing on-disk state, not a control this writer's
+/// own behaviour can currently trigger.** The writer only ever allocates `DATA|single` chunks —
+/// it never allocates SYSTEM chunks itself — so the scenario this check guards against (a chunk
+/// allocation that would need to grow `sys_chunk_array`) is not reachable by any code path in
+/// this codebase today. The check is still correct to keep: it protects against a `sys_chunk_array`
+/// that arrived already near-full from whatever created the filesystem. Audited 2026-08-17
+/// (`notes/feature-remediation.md` §5, item I.4) and accepted as-is rather than removed.
 pub fn check_sys_chunk_array_capacity(sb: &Superblock) -> Result<()> {
     let current_size = sb.sys_chunk_array.len();
     if current_size + BTRFS_SYSTEM_CHUNK_ENTRY_SIZE > BTRFS_SYSTEM_CHUNK_ARRAY_SIZE {
