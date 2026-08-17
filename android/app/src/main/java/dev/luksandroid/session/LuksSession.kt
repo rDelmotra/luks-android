@@ -202,14 +202,14 @@ open class SessionController(
             unlocked
         } catch (e: LuksException) {
             Trace.err(e.code, "unlock")
-            Trace.e("LuksSession: unlock failed [${e.code}] ${e.message}")
+            Trace.e("LuksSession: unlock failed [${e.code}]")
             val msg = if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}"
             val failed = SessionState.Failed(msg, partition)
             _state.value = failed
             failed
         } catch (e: Exception) {
             Trace.err(-1, "unlock")
-            Trace.e("LuksSession: unlock failed", e)
+            Trace.e("LuksSession: unlock failed: ${Trace.throwableSummary(e)}")
             val failed = SessionState.Failed(e.message ?: e.toString(), partition)
             _state.value = failed
             failed
@@ -281,7 +281,7 @@ open class SessionController(
      * Moves session into [SessionState.Failed] upon write poison / fatal write failure.
      */
     suspend fun onWritePoison(reason: String) = mutex.withLock {
-        Trace.err(-1, "write_poison", reason)
+        Trace.err(-1, "write_poison")
         Trace.e("LuksSession: write poison detected: $reason")
         isLocking.set(false)
         teardownHandles()
@@ -341,14 +341,14 @@ open class SessionController(
         try {
             volC?.close()
         } catch (t: Throwable) {
-            Trace.e("LuksSession: error closing volume during teardown", t)
+            Trace.e("LuksSession: error closing volume during teardown: ${Trace.throwableSummary(t)}")
         }
 
         // 2. Device must close SECOND
         try {
             devC?.close()
         } catch (t: Throwable) {
-            Trace.e("LuksSession: error closing device during teardown", t)
+            Trace.e("LuksSession: error closing device during teardown: ${Trace.throwableSummary(t)}")
         }
     }
 

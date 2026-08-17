@@ -6,6 +6,7 @@ import android.system.ErrnoException
 import android.system.OsConstants
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.Trace
+import dev.luksandroid.Trace.throwableSummary
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionController
 import kotlinx.coroutines.runBlocking
@@ -63,7 +64,7 @@ open class LuksProxyCallback(
         } catch (e: ErrnoException) {
             throw e
         } catch (t: Throwable) {
-            Trace.e("LuksProxyCallback: getSize failed for $documentId", t)
+            Trace.e("LuksProxyCallback: getSize failed: ${throwableSummary(t)}")
             throw ErrnoException("getSize", OsConstants.EIO)
         }
     }
@@ -86,7 +87,7 @@ open class LuksProxyCallback(
         } catch (e: ErrnoException) {
             throw e
         } catch (t: Throwable) {
-            Trace.e("LuksProxyCallback: read failed at offset $offset size $size", t)
+            Trace.e("LuksProxyCallback: read failed at offset $offset size $size: ${throwableSummary(t)}")
             throw ErrnoException("read", OsConstants.EIO)
         }
     }
@@ -117,7 +118,7 @@ open class LuksProxyCallback(
             throw e
         } catch (t: Throwable) {
             errorOccurred = true
-            Trace.e("LuksProxyCallback: write failed at offset $offset size $size", t)
+            Trace.e("LuksProxyCallback: write failed at offset $offset size $size: ${throwableSummary(t)}")
             throw ErrnoException("pwrite", OsConstants.EIO)
         }
     }
@@ -135,7 +136,7 @@ open class LuksProxyCallback(
                 }
             } catch (t: Throwable) {
                 errorOccurred = true
-                Trace.e("LuksProxyCallback: fsync failed", t)
+                Trace.e("LuksProxyCallback: fsync failed: ${throwableSummary(t)}")
                 throw ErrnoException("fsync", OsConstants.EIO)
             }
         }
@@ -151,12 +152,12 @@ open class LuksProxyCallback(
                                 volume.finishFile(writer, parentPath, fileName)
                             }
                             isFinished = true
-                            Trace.i("LuksProxyCallback: finished file write for $documentId ($expectedOffset bytes)")
+                            Trace.i("LuksProxyCallback: finished file write ($expectedOffset bytes)")
                         }
                     }
                 } catch (t: Throwable) {
                     errorOccurred = true
-                    Trace.e("LuksProxyCallback: onRelease finish failed for $documentId", t)
+                    Trace.e("LuksProxyCallback: onRelease finish failed: ${throwableSummary(t)}")
                     try {
                         activeWriter?.let { writer ->
                             runBlocking {
@@ -174,7 +175,7 @@ open class LuksProxyCallback(
                     activeWriter = null
                 }
             } else if (activeWriter != null) {
-                Trace.i("LuksProxyCallback: abandoning file write for $documentId due to error")
+                Trace.i("LuksProxyCallback: abandoning file write due to error")
                 try {
                     activeWriter?.let { writer ->
                         runBlocking {

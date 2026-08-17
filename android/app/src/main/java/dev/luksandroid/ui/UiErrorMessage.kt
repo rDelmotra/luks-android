@@ -45,8 +45,8 @@ object UiErrorMessage {
     /**
      * Formats user-facing message with operation context and logs the error safely.
      */
-    fun getUserMessage(code: Int, operation: String = "", detail: String = ""): String {
-        Trace.err(code, operation.ifBlank { "unknown_operation" }, detail)
+    fun getUserMessage(code: Int, operation: String = ""): String {
+        Trace.err(code, operation.ifBlank { "unknown_operation" })
         val baseMsg = getBaseMessage(code)
         return if (operation.isNotBlank()) {
             if (code == LuksException.CANCELLED) {
@@ -77,7 +77,7 @@ object UiErrorMessage {
             is FileNotFoundException -> getUserMessage(LuksException.NOT_FOUND, op)
             is IOException -> getUserMessage(LuksException.IO, op)
             is SecurityException -> {
-                Trace.err(LuksException.GENERIC, op, "SecurityException")
+                Trace.err(LuksException.GENERIC, op)
                 if (operation.isNotBlank()) "$operation failed: Permission denied." else "Permission denied."
             }
             is IllegalStateException -> {
@@ -92,7 +92,7 @@ object UiErrorMessage {
                 getUserMessage(code, op)
             }
             else -> {
-                Trace.err(LuksException.GENERIC, op, t.javaClass.simpleName)
+                Trace.err(LuksException.GENERIC, op)
                 if (operation.isNotBlank()) {
                     "$operation failed: An unexpected error occurred."
                 } else {

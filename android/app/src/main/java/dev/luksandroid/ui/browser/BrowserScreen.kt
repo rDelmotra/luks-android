@@ -497,7 +497,7 @@ fun BrowserScreen(
                     LuksSession.withLease { v -> v.statFs() }
                 }
             } catch (e: Exception) {
-                Trace.err(-1, "statfs", "err=${e.message}")
+                Trace.err(-1, "statfs")
             }
         }
     }
@@ -529,12 +529,12 @@ fun BrowserScreen(
                     }
                 }
             } catch (e: LuksException) {
-                Trace.err(e.code, "list_dir", "path=$path")
+                Trace.err(e.code, "list_dir")
                 scope.launch {
                     snackbarHostState.showSnackbar("Cannot open folder: [${e.code}] ${e.message}")
                 }
             } catch (e: Exception) {
-                Trace.err(-1, "list_dir", "path=$path")
+                Trace.err(-1, "list_dir")
                 scope.launch {
                     snackbarHostState.showSnackbar("Cannot open folder: ${e.message}")
                 }
@@ -602,7 +602,7 @@ fun BrowserScreen(
                 }
                 snackbarHostState.showSnackbar("Exported \"${source.name}\" successfully")
             } catch (e: Exception) {
-                Trace.err(-1, "export", "file=${source.name}")
+                Trace.err(-1, "export")
                 snackbarHostState.showSnackbar("Export failed: ${e.message}")
             } finally {
                 activeTransfer = null
@@ -735,7 +735,7 @@ fun BrowserScreen(
                     bytesPerSec = digest.bytesPerSec,
                 )
             } catch (e: Exception) {
-                Trace.err(-1, "sha256", "file=${item.name}")
+                Trace.err(-1, "sha256")
                 snackbarHostState.showSnackbar("Checksum calculation failed: ${e.message}")
             } finally {
                 activeTransfer = null
@@ -756,13 +756,13 @@ fun BrowserScreen(
                 snackbarHostState.showSnackbar("Folder \"$name\" created")
                 loadDirectory(currentPath)
             } catch (e: LuksException) {
-                Trace.err(e.code, "create_directory", "name=$name")
+                Trace.err(e.code, "create_directory")
                 if (e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) {
                     isSlackLimitReached = true
                 }
                 newFolderError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
-                Trace.err(-1, "create_directory", "name=$name")
+                Trace.err(-1, "create_directory")
                 newFolderError = e.message ?: "Failed to create folder"
             } finally {
                 isCreatingFolder = false
@@ -785,10 +785,10 @@ fun BrowserScreen(
                 snackbarHostState.showSnackbar("Renamed to \"$newName\"")
                 loadDirectory(currentPath)
             } catch (e: LuksException) {
-                Trace.err(e.code, "rename", "old=${item.name}")
+                Trace.err(e.code, "rename")
                 renameError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
-                Trace.err(-1, "rename", "old=${item.name}")
+                Trace.err(-1, "rename")
                 renameError = e.message ?: "Failed to rename"
             } finally {
                 isRenaming = false
@@ -809,10 +809,10 @@ fun BrowserScreen(
                 snackbarHostState.showSnackbar("Deleted \"${item.name}\"")
                 loadDirectory(currentPath)
             } catch (e: LuksException) {
-                Trace.err(e.code, "delete_file", "path=${item.fullPath}")
+                Trace.err(e.code, "delete_file")
                 deleteError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
-                Trace.err(-1, "delete_file", "path=${item.fullPath}")
+                Trace.err(-1, "delete_file")
                 deleteError = e.message ?: "Failed to delete"
             } finally {
                 isDeleting = false

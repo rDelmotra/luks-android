@@ -1014,10 +1014,10 @@ private suspend fun openTarget(
     DeviceItemState.Opened(device)
 } catch (e: LuksException) {
     Trace.err(e.code, "open_target")
-    Trace.e("DevicesScreen: open failed [${e.code}] ${e.message}")
+    Trace.e("DevicesScreen: open failed [${e.code}]")
     DeviceItemState.Failed("[${e.code}] ${e.message}")
 } catch (e: Exception) {
     Trace.err(-1, "open_target")
-    Trace.e("DevicesScreen: open failed", e)
+    Trace.e("DevicesScreen: open failed: ${Trace.throwableSummary(e)}")
     DeviceItemState.Failed(e.message ?: e.toString())
 }

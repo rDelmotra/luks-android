@@ -97,7 +97,7 @@ open class TransferController {
                 try {
                     LuksNative.nativeCancelOperation(item.cancelToken)
                 } catch (t: Throwable) {
-                    Trace.e("TransferManager: nativeCancelOperation failed", t)
+                    Trace.e("TransferManager: nativeCancelOperation failed: ${Trace.throwableSummary(t)}")
                 }
             }
             activeJobs[id]?.cancel()
@@ -258,7 +258,7 @@ open class TransferController {
                     speedBytesPerSec = 0L,
                 )
             }
-            Trace.err(LuksException.GENERIC, "export", t.javaClass.simpleName)
+            Trace.err(LuksException.GENERIC, "export")
         } finally {
             activeJobs.remove(transferId)
             if (cancelToken > 0L) {
@@ -459,7 +459,7 @@ open class TransferController {
                     speedBytesPerSec = 0L,
                 )
             }
-            Trace.err(LuksException.GENERIC, "import", t.javaClass.simpleName)
+            Trace.err(LuksException.GENERIC, "import")
         } finally {
             activeJobs.remove(transferId)
             if (cancelToken > 0L) {
