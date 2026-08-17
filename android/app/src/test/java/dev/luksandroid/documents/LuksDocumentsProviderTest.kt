@@ -23,7 +23,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -42,7 +44,12 @@ class LuksDocumentsProviderTest {
     private lateinit var provider: LuksDocumentsProvider
 
     class TestContext : ContextWrapper(null) {
-        val revokedUris = mutableListOf<Pair<Uri?, Int>>()
+        // CopyOnWriteArrayList, not a plain mutableListOf: revocation on lock/detach happens
+        // on the session's background collector coroutine (N.8), while tests observe this
+        // list from the test thread. A plain ArrayList has no happens-before edge across
+        // threads here, so a mutation can go unseen indefinitely (or forever, if the JIT
+        // hoists the read out of a polling loop).
+        val revokedUris = java.util.concurrent.CopyOnWriteArrayList<Pair<Uri?, Int>>()
 
         override fun revokeUriPermission(uri: Uri?, modeFlags: Int) {
             revokedUris.add(uri to modeFlags)
@@ -211,7 +218,8 @@ class LuksDocumentsProviderTest {
         assertTrue(flags and Root.FLAG_LOCAL_ONLY != 0)
         assertTrue(flags and Root.FLAG_SUPPORTS_IS_CHILD != 0)
         assertTrue(flags and Root.FLAG_SUPPORTS_EJECT != 0)
-        assertTrue(flags and Root.FLAG_SUPPORTS_CREATE != 0)
+        // Read-only trim (§6.2): the provider must never advertise create support it cannot deliver.
+        assertFalse(flags and Root.FLAG_SUPPORTS_CREATE != 0)
 
         assertEquals(40L * 1024 * 1024, cursorUnlocked.getLong(availableCol))
         assertEquals(100L * 1024 * 1024, cursorUnlocked.getLong(capacityCol))
@@ -260,7 +268,7 @@ class LuksDocumentsProviderTest {
         assertEquals("TestVol", rootCursor.getString(rootCursor.getColumnIndexOrThrow(Document.COLUMN_DISPLAY_NAME)))
         assertEquals(Document.MIME_TYPE_DIR, rootCursor.getString(rootCursor.getColumnIndexOrThrow(Document.COLUMN_MIME_TYPE)))
         val rootFlags = rootCursor.getInt(rootCursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
-        assertTrue(rootFlags and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
+        assertFalse(rootFlags and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
 
         // 2. queryDocument for directory "/Documents"
         val dirCursor: Cursor = provider.queryDocument("/Documents", null)
@@ -270,7 +278,7 @@ class LuksDocumentsProviderTest {
         assertEquals("Documents", dirCursor.getString(dirCursor.getColumnIndexOrThrow(Document.COLUMN_DISPLAY_NAME)))
         assertEquals(Document.MIME_TYPE_DIR, dirCursor.getString(dirCursor.getColumnIndexOrThrow(Document.COLUMN_MIME_TYPE)))
         val dirFlags = dirCursor.getInt(dirCursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
-        assertTrue(dirFlags and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
+        assertFalse(dirFlags and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
         assertTrue(dirFlags and Document.FLAG_SUPPORTS_DELETE != 0)
         assertTrue(dirFlags and Document.FLAG_SUPPORTS_RENAME != 0)
 
@@ -283,7 +291,7 @@ class LuksDocumentsProviderTest {
         assertEquals("image/jpeg", photoCursor.getString(photoCursor.getColumnIndexOrThrow(Document.COLUMN_MIME_TYPE)))
         assertEquals(2048L, photoCursor.getLong(photoCursor.getColumnIndexOrThrow(Document.COLUMN_SIZE)))
         val fileFlags = photoCursor.getInt(photoCursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
-        assertTrue(fileFlags and Document.FLAG_SUPPORTS_WRITE != 0)
+        assertFalse(fileFlags and Document.FLAG_SUPPORTS_WRITE != 0)
         assertTrue(fileFlags and Document.FLAG_SUPPORTS_DELETE != 0)
         assertTrue(fileFlags and Document.FLAG_SUPPORTS_RENAME != 0)
 
@@ -415,68 +423,54 @@ class LuksDocumentsProviderTest {
     }
 
     /**
-     * Test Pass M.5: Sequential write tracking and EINVAL refusal on out-of-order onWrite.
+     * Test Pass M.5 (superseded by §6.2 read-only trim): the provider must never advertise
+     * a write capability it cannot deliver. createDocument always refuses, and openDocument
+     * refuses any write-capable mode cleanly (without touching the volume), while "r" is
+     * still accepted past the guard.
      */
     @Test
-    fun testM5_sequentialWriteTracking_andEinvalRefusalOnOutOfOrder() {
-        // 1. Test createDocument for Directory and File
-        val dirId = provider.createDocument("/", Document.MIME_TYPE_DIR, "MyFolder")
-        assertEquals("/MyFolder", dirId)
-        assertTrue(testVolume.createdDirectories.contains("/" to "MyFolder"))
-
-        val fileId = provider.createDocument("/MyFolder", "text/plain", "notes.txt")
-        assertEquals("/MyFolder/notes.txt", fileId)
-        assertTrue(testVolume.writtenFiles.any { it.first == "/MyFolder" && it.second == "notes.txt" })
-
-        // 2. Test LuksProxyCallback sequential writes
-        val writeCallback = LuksProxyCallback("/stream.bin", "w", null, session)
-        assertEquals(0L, writeCallback.onGetSize())
-
-        // In-order write 1: offset 0, len 100
-        val chunk1 = ByteArray(100) { 1 }
-        val written1 = writeCallback.onWrite(0L, 100, chunk1)
-        assertEquals(100, written1)
-        assertEquals(100L, writeCallback.onGetSize())
-
-        // In-order write 2: offset 100, len 50
-        val chunk2 = ByteArray(50) { 2 }
-        val written2 = writeCallback.onWrite(100L, 50, chunk2)
-        assertEquals(50, written2)
-        assertEquals(150L, writeCallback.onGetSize())
-
-        // Out-of-order write refusal: offset 100 (expected 150) -> EINVAL
+    fun testM5_readOnlyTrim_createDocumentAndWriteModeOpenDocumentRefuseCleanly() {
+        // 1. createDocument for a directory must refuse.
         try {
-            writeCallback.onWrite(100L, 50, chunk2)
-            fail("Expected EINVAL on repeat offset write")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
+            provider.createDocument("/", Document.MIME_TYPE_DIR, "MyFolder")
+            fail("Expected UnsupportedOperationException creating a directory")
+        } catch (e: UnsupportedOperationException) {
+            // Success
+        }
+        assertTrue(testVolume.createdDirectories.isEmpty())
+
+        // 2. createDocument for a file must refuse.
+        try {
+            provider.createDocument("/", "text/plain", "notes.txt")
+            fail("Expected UnsupportedOperationException creating a file")
+        } catch (e: UnsupportedOperationException) {
+            // Success
+        }
+        assertTrue(testVolume.writtenFiles.isEmpty())
+
+        // 3. openDocument with any write-capable mode must refuse before touching the volume
+        //    or the platform ProxyFileDescriptor machinery (TestContext has no StorageManager,
+        //    so reaching that code would throw something other than UnsupportedOperationException).
+        for (writeMode in listOf("w", "wt", "wa", "rw", "rwt")) {
+            try {
+                provider.openDocument("/photo.jpg", writeMode, null)
+                fail("Expected UnsupportedOperationException for openDocument mode=$writeMode")
+            } catch (e: UnsupportedOperationException) {
+                // Success
+            }
         }
 
-        // Out-of-order write refusal: offset 0 (seek backward) -> EINVAL
+        // 4. openDocument("r") must NOT be refused by the write-mode guard: it should fail later,
+        //    for an unrelated reason (no StorageManager in the test Context), proving the read
+        //    path is not blocked by the read-only trim.
         try {
-            writeCallback.onWrite(0L, 50, chunk2)
-            fail("Expected EINVAL on seek backwards write")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
+            provider.openDocument("/photo.jpg", "r", null)
+            fail("Expected an exception once past the write-mode guard (no StorageManager in test)")
+        } catch (e: UnsupportedOperationException) {
+            fail("openDocument(\"r\") must not be refused by the write-mode guard")
+        } catch (e: Throwable) {
+            // Success: got past the guard, failed for an unrelated (environment) reason.
         }
-
-        // Out-of-order write refusal: offset 500 (seek forward gap) -> EINVAL
-        try {
-            writeCallback.onWrite(500L, 50, chunk2)
-            fail("Expected EINVAL on gap write")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
-        }
-
-        // In-order write continuation: offset 150, len 25
-        val chunk3 = ByteArray(25) { 3 }
-        val written3 = writeCallback.onWrite(150L, 25, chunk3)
-        assertEquals(25, written3)
-        assertEquals(175L, writeCallback.onGetSize())
-
-        // Release finishes file
-        writeCallback.onRelease()
-        assertTrue(testVolume.writtenFiles.any { it.first == "/" && it.second == "stream.bin" })
     }
 
     /**
@@ -572,5 +566,68 @@ class LuksDocumentsProviderTest {
                 assertFalse("Leaked path in queryDocument for code $code: $msg", msg.contains(sensitivePath))
             }
         }
+    }
+
+    /**
+     * Test Pass N.8: URI grants issued for this provider's documents must be revoked
+     * proactively when the session transitions into Locked, not merely on delete/rename.
+     * §4.4 requires "delete, rename, and lock/detach for everything issued."
+     */
+    @Test
+    fun testN8_sessionLockTransition_revokesIssuedUriGrants() = runBlocking {
+        provider.onCreate()
+
+        // Simulate the provider becoming aware of documents the way Files/SAF would:
+        // by querying them (and thereby making their document URIs eligible for a
+        // persistable grant the provider cannot refuse).
+        provider.queryDocument("/tracked.txt", null)
+        provider.queryChildDocuments("/", null, null as String?)
+
+        testContext.revokedUris.clear()
+        assertTrue(testContext.revokedUris.isEmpty())
+
+        session.lock()
+        assertEquals(SessionState.Locked, session.state.value)
+
+        withTimeout(3000) {
+            while (testContext.revokedUris.isEmpty()) {
+                delay(10)
+            }
+        }
+
+        // Exactly one document was ever handed out ("/tracked.txt"; queryChildDocuments("/")
+        // returned no entries), so exactly one revoke is expected -- proving this is driven
+        // by tracked issuance, not some unrelated side effect.
+        assertEquals(1, testContext.revokedUris.size)
+        // Full-mask revocation (0.inv(), i.e. Java's ~0), matching the AOSP
+        // ExternalStorageProvider.onDocIdDeleted pattern, not merely the read/write grant
+        // flags used for explicit delete/rename.
+        assertEquals(0.inv(), testContext.revokedUris[0].second)
+    }
+
+    /**
+     * Test Pass N.8: same guarantee on a Detached transition (device pulled while unlocked).
+     */
+    @Test
+    fun testN8_sessionDetachTransition_revokesIssuedUriGrants() = runBlocking {
+        provider.onCreate()
+
+        provider.queryDocument("/tracked2.txt", null)
+
+        testContext.revokedUris.clear()
+        assertTrue(testContext.revokedUris.isEmpty())
+
+        session.onDeviceDetached("Device disconnected")
+
+        withTimeout(3000) {
+            while (testContext.revokedUris.isEmpty()) {
+                delay(10)
+            }
+        }
+
+        // Exactly one document was ever handed out ("/tracked2.txt"), so exactly one revoke
+        // is expected on the Detached transition too.
+        assertEquals(1, testContext.revokedUris.size)
+        assertEquals(0.inv(), testContext.revokedUris[0].second)
     }
 }

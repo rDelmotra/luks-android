@@ -267,146 +267,62 @@ class LuksProxyCallbackTest {
         }
     }
 
-    // ===============================================
-    // Pass M.5: Sequential-Only Write Streaming Tests
-    // ===============================================
+    // ===================================================================
+    // Read-only trim (§6.2, supersedes Pass M.5): onWrite always refuses.
+    //
+    // `begin_file_streaming` (the unknown-size write primitive) has no JNI or
+    // Kotlin surface. The only write primitive available, `beginFile`, requires
+    // an upfront size the proxy cannot know, and the sized writer rejects any
+    // write past that size. Rather than half-work via the broken sized API,
+    // onWrite refuses explicitly and immediately with EROFS, and never touches
+    // the volume's write path at all.
+    // ===================================================================
 
     @Test
-    fun testM5_onWrite_initialGetSize_returnsExpectedOffset() {
+    fun testReadOnlyTrim_onWrite_alwaysThrowsErofsWithoutTouchingVolume() {
         val callback = LuksWriteProxyCallback(session = session, documentId = "/write_test.bin")
-        assertEquals(0L, callback.onGetSize())
+
+        // Even a well-formed, in-order, initial write must be refused.
+        try {
+            callback.onWrite(0L, 100, ByteArray(100))
+            fail("Expected ErrnoException(EROFS) on write")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EROFS, e.errno)
+        }
+
+        // The volume's write primitives must never have been invoked.
+        assertTrue(testVolume.writtenFiles.isEmpty())
+        assertTrue(testVolume.abandonedWriters.isEmpty())
     }
 
     @Test
-    fun testM5_onWrite_streamsSequentialChunksAndAdvancesOffset() {
-        val callback = LuksWriteProxyCallback(session = session, documentId = "/docs/stream.bin")
-
-        // Chunk 1: 0..99
-        val chunk1 = ByteArray(100) { 1 }
-        val written1 = callback.onWrite(0L, 100, chunk1)
-        assertEquals(100, written1)
-        assertEquals(100L, callback.onGetSize())
-
-        // Chunk 2: 100..149
-        val chunk2 = ByteArray(50) { 2 }
-        val written2 = callback.onWrite(100L, 50, chunk2)
-        assertEquals(50, written2)
-        assertEquals(150L, callback.onGetSize())
-
-        // Chunk 3: 150..174
-        val chunk3 = ByteArray(25) { 3 }
-        val written3 = callback.onWrite(150L, 25, chunk3)
-        assertEquals(25, written3)
-        assertEquals(175L, callback.onGetSize())
-
-        // Fsync
-        callback.onFsync()
-
-        // Release finishes file
-        callback.onRelease()
-
-        assertTrue(testVolume.writtenFiles.any { it.first == "/docs" && it.second == "stream.bin" })
-        val written = testVolume.writtenFiles.first { it.first == "/docs" && it.second == "stream.bin" }.third
-        assertEquals(175, written.size)
-        assertArrayEquals(chunk1 + chunk2 + chunk3, written)
-    }
-
-    @Test
-    fun testM5_onWrite_refusalGate_throwsEinvalOnNonSequentialWrites() {
+    fun testReadOnlyTrim_onWrite_refusesRegardlessOfOffsetOrRepetition() {
         val callback = LuksWriteProxyCallback(session = session, documentId = "/refuse.bin")
 
-        // 1. Initial write of 100 bytes
-        callback.onWrite(0L, 100, ByteArray(100))
-
-        // 2. Refuse forward seek (gap) -> offset 200 instead of 100
-        try {
-            callback.onWrite(200L, 50, ByteArray(50))
-            fail("Expected EINVAL on forward gap write")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
-        }
-
-        // 3. Refuse backward seek -> offset 0 instead of 100
-        val callback2 = LuksWriteProxyCallback(session = session, documentId = "/refuse2.bin")
-        callback2.onWrite(0L, 100, ByteArray(100))
-        try {
-            callback2.onWrite(0L, 50, ByteArray(50))
-            fail("Expected EINVAL on backward seek write")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
-        }
-
-        // 4. Refuse non-zero initial offset -> offset 10 instead of 0
-        val callback3 = LuksWriteProxyCallback(session = session, documentId = "/refuse3.bin")
-        try {
-            callback3.onWrite(10L, 50, ByteArray(50))
-            fail("Expected EINVAL on non-zero initial offset")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EINVAL, e.errno)
+        for (offset in listOf(0L, 10L, 100L, 0L)) {
+            try {
+                callback.onWrite(offset, 50, ByteArray(50))
+                fail("Expected ErrnoException(EROFS) at offset $offset")
+            } catch (e: ErrnoException) {
+                assertEquals(OsConstants.EROFS, e.errno)
+            }
         }
     }
 
     @Test
-    fun testM5_onWrite_errorOccurred_refusesSubsequentWritesWithEIO() {
-        val callback = LuksWriteProxyCallback(session = session, documentId = "/err.bin")
-
-        testVolume.throwOnWrite = LuksException("Write chunk failed", LuksException.IO)
-
-        try {
-            callback.onWrite(0L, 100, ByteArray(100))
-            fail("Expected EIO on volume error")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EIO, e.errno)
-        }
-
-        // After error occurred, next write throws EIO directly
-        testVolume.throwOnWrite = null
-        try {
-            callback.onWrite(0L, 100, ByteArray(100))
-            fail("Expected EIO on subsequent write after error")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EIO, e.errno)
-        }
-    }
-
-    @Test
-    fun testM5_onFsync_throwsEioWhenSessionDeadOrErrorOccurred() = runBlocking {
-        val callback = LuksWriteProxyCallback(session = session, documentId = "/fsync.bin")
-        callback.onWrite(0L, 50, ByteArray(50))
-
-        // Clean fsync succeeds
-        callback.onFsync()
-
-        // Session lock makes fsync throw EIO
-        session.lock()
-        try {
-            callback.onFsync()
-            fail("Expected ErrnoException(EIO) on fsync when session locked")
-        } catch (e: ErrnoException) {
-            assertEquals(OsConstants.EIO, e.errno)
-        }
-    }
-
-    @Test
-    fun testM5_onRelease_abandonsFileOnFailureOrError() {
+    fun testReadOnlyTrim_onRelease_isCleanNoOpForWriteMode() {
         val callback = LuksWriteProxyCallback(session = session, documentId = "/abandon.bin")
-        callback.onWrite(0L, 50, ByteArray(50))
 
-        testVolume.throwOnFinish = LuksException("Finish file failed", LuksException.IO)
+        try {
+            callback.onWrite(0L, 50, ByteArray(50))
+        } catch (_: ErrnoException) {
+            // Expected refusal.
+        }
 
+        // No writer was ever created, so release must not attempt to finish or abandon one.
         callback.onRelease()
-
-        // Volume should have abandoned the writer
-        assertTrue(testVolume.abandonedWriters.isNotEmpty())
-        assertTrue((testVolume.abandonedWriters.first() as TestLuksVolume.TestFileWriter).abandoned)
-    }
-
-    @Test
-    fun testM5_onWrite_zeroSizeReturnsZero() {
-        val callback = LuksWriteProxyCallback(session = session, documentId = "/zerosize.bin")
-        val written = callback.onWrite(0L, 0, ByteArray(0))
-        assertEquals(0, written)
-        assertEquals(0L, callback.onGetSize())
+        assertTrue(testVolume.writtenFiles.isEmpty())
+        assertTrue(testVolume.abandonedWriters.isEmpty())
     }
 
     @Test

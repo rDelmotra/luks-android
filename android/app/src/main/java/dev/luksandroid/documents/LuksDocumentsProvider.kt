@@ -120,17 +120,57 @@ open class LuksDocumentsProvider(
     override fun onCreate(): Boolean {
         providerContext?.let { ctx ->
             scope.launch {
-                session.state.collect {
+                session.state.collect { state ->
                     runCatching {
                         val uri = runCatching { DocumentsContract.buildRootsUri(AUTHORITY) }.getOrNull()
                         if (uri != null) {
                             ctx.contentResolver?.notifyChange(uri, null)
                         }
                     }
+                    // N.8: grants outlive the locked volume unless proactively revoked here.
+                    // §4.4 requires revocation on "delete, rename, and lock/detach for
+                    // everything issued" -- delete/rename already revoke their own URI;
+                    // this covers every other transition away from Unlocked.
+                    if (state is SessionState.Locked ||
+                        state is SessionState.Detached ||
+                        state is SessionState.Failed
+                    ) {
+                        revokeAllIssuedGrants()
+                    }
                 }
             }
         }
         return true
+    }
+
+    /** Document IDs the provider has handed out via query/open, and so may carry a grant. */
+    private val issuedDocumentIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun trackIssued(docId: String) {
+        issuedDocumentIds.add(docId)
+    }
+
+    /**
+     * Revokes URI permission grants for every document this provider has issued.
+     * There is no API to block a persistable grant (`takePersistableUriPermission`) from
+     * being taken in the first place, so proactive revocation on lock/detach/failure is
+     * the only lever. Mirrors the AOSP `ExternalStorageProvider.onDocIdDeleted` pattern of
+     * revoking with a full permission mask rather than only the flags this provider granted.
+     */
+    private fun revokeAllIssuedGrants() {
+        val ctx = providerContext ?: return
+        val ids = issuedDocumentIds.toList()
+        issuedDocumentIds.clear()
+        for (id in ids) {
+            runCatching {
+                // Matches the deleteDocument/renameDocument revoke pattern: call
+                // revokeUriPermission unconditionally rather than gating on a non-null
+                // Uri. buildDocumentUri should never fail for a well-formed authority and
+                // document id, and there is nothing more targeted to fall back to here.
+                val uri = DocumentsContract.buildDocumentUri(AUTHORITY, id)
+                ctx.revokeUriPermission(uri, 0.inv())
+            }
+        }
     }
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
@@ -148,10 +188,12 @@ open class LuksDocumentsProvider(
             }
         }.getOrNull()
 
+        // Read-only trim (§6.2): FLAG_SUPPORTS_CREATE is deliberately absent. The volume
+        // cannot durably accept writes (see openDocument/createDocument), so the root must
+        // not advertise create support it cannot deliver.
         val flags = Root.FLAG_LOCAL_ONLY or
                 Root.FLAG_SUPPORTS_IS_CHILD or
-                Root.FLAG_SUPPORTS_EJECT or
-                Root.FLAG_SUPPORTS_CREATE
+                Root.FLAG_SUPPORTS_EJECT
 
         val title = volume.info.label.ifBlank { DEFAULT_ROOT_TITLE }
 
@@ -191,12 +233,14 @@ open class LuksDocumentsProvider(
                                 Document.COLUMN_MIME_TYPE -> Document.MIME_TYPE_DIR
                                 Document.COLUMN_DISPLAY_NAME -> volume.info.label.ifBlank { DEFAULT_ROOT_TITLE }
                                 Document.COLUMN_LAST_MODIFIED -> 0L
-                                Document.COLUMN_FLAGS -> Document.FLAG_DIR_SUPPORTS_CREATE
+                                // Read-only trim (§6.2): no create support to advertise.
+                                Document.COLUMN_FLAGS -> 0
                                 Document.COLUMN_SIZE -> 0L
                                 else -> null
                             }
                         }
                     } else {
+                        trackIssued(docId)
                         val info = volume.fileInfo(docId)
                         val displayName = docId.substringAfterLast('/')
                         val isDir = info.type == "dir"
@@ -205,15 +249,9 @@ open class LuksDocumentsProvider(
                         } else {
                             getMimeType(displayName)
                         }
-                        val flags = if (isDir) {
-                            Document.FLAG_DIR_SUPPORTS_CREATE or
-                                    Document.FLAG_SUPPORTS_DELETE or
-                                    Document.FLAG_SUPPORTS_RENAME
-                        } else {
-                            Document.FLAG_SUPPORTS_WRITE or
-                                    Document.FLAG_SUPPORTS_DELETE or
-                                    Document.FLAG_SUPPORTS_RENAME
-                        }
+                        // Read-only trim (§6.2): FLAG_SUPPORTS_WRITE / FLAG_DIR_SUPPORTS_CREATE
+                        // deliberately omitted. Delete and rename still work, so those flags stay.
+                        val flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
 
                         for (i in cols.indices) {
                             rowValues[i] = when (cols[i]) {
@@ -250,21 +288,16 @@ open class LuksDocumentsProvider(
                     val entries = volume.listDir(parentId)
                     for (entry in entries) {
                         val docId = if (parentId == "/") "/${entry.name}" else "$parentId/${entry.name}"
+                        trackIssued(docId)
                         val isDir = entry.isDir || entry.isSubvolume
                         val mimeType = if (isDir) {
                             Document.MIME_TYPE_DIR
                         } else {
                             getMimeType(entry.name)
                         }
-                        val flags = if (isDir) {
-                            Document.FLAG_DIR_SUPPORTS_CREATE or
-                                    Document.FLAG_SUPPORTS_DELETE or
-                                    Document.FLAG_SUPPORTS_RENAME
-                        } else {
-                            Document.FLAG_SUPPORTS_WRITE or
-                                    Document.FLAG_SUPPORTS_DELETE or
-                                    Document.FLAG_SUPPORTS_RENAME
-                        }
+                        // Read-only trim (§6.2): FLAG_SUPPORTS_WRITE / FLAG_DIR_SUPPORTS_CREATE
+                        // deliberately omitted. Delete and rename still work, so those flags stay.
+                        val flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
 
                         val fileInfo = runCatching { volume.fileInfo(docId) }.getOrNull()
                         val size = if (isDir) 0L else (fileInfo?.size ?: 0L)
@@ -310,7 +343,15 @@ open class LuksDocumentsProvider(
         if (openMode !in VALID_MODES) {
             throw IllegalArgumentException("Unsupported open mode")
         }
+        // Read-only trim (§6.2): refuse every write-capable mode cleanly and explicitly,
+        // rather than handing back a proxy whose writes are guaranteed to fail with EIO
+        // (the sized `beginFile(0)` writer rejects any write past size 0; the unknown-size
+        // primitive has no JNI/Kotlin surface to call instead).
+        if (openMode != "r") {
+            throw UnsupportedOperationException("Write access is not supported")
+        }
 
+        trackIssued(docId)
         val ctx = providerContext ?: throw IllegalStateException("Provider not attached to Context")
         val storageManager = ctx.getSystemService(StorageManager::class.java)
             ?: throw IllegalStateException("StorageManager not available")
@@ -334,26 +375,10 @@ open class LuksDocumentsProvider(
         mimeType: String?,
         displayName: String?
     ): String {
-        val parentId = parentDocumentId ?: throw FileNotFoundException("Document not found")
-        val name = displayName ?: throw IllegalArgumentException("Invalid display name")
-        if (name.isBlank() || name.contains('/') || name == "." || name == "..") {
-            throw IllegalArgumentException("Invalid display name")
-        }
-
-        return safeCall {
-            runBlocking {
-                session.withLease { volume ->
-                    if (mimeType == Document.MIME_TYPE_DIR) {
-                        volume.createDirectory(parentId, name)
-                    } else {
-                        volume.writeFile(parentId, name, ByteArray(0))
-                    }
-                    val newDocId = if (parentId == "/") "/$name" else "$parentId/$name"
-                    notifyDocumentChange(parentId)
-                    newDocId
-                }
-            }
-        }
+        // Read-only trim (§6.2): creation (file or directory) is refused cleanly and
+        // explicitly. FLAG_DIR_SUPPORTS_CREATE / Root.FLAG_SUPPORTS_CREATE are no longer
+        // advertised, but a caller may still invoke this directly, so refuse here too.
+        throw UnsupportedOperationException("Create is not supported: volume is read-only")
     }
 
     override fun deleteDocument(documentId: String?) {
