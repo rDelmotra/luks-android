@@ -139,9 +139,13 @@ val checkNoWriteCodeInRelease by tasks.registering {
 
                     tools/build-android-libs.sh
 
-                (--write is debug-only and the script already refuses to pair
-                it with --release; this catches the other order — a leftover
-                debug .so being packaged into a release APK.)
+                (This task is the ONLY thing preventing a write-enabled .so
+                from reaching a release APK. An earlier version of this
+                message claimed build-android-libs.sh refuses to pair --write
+                with --release; it does not, and never did — `--write` alone
+                builds a write-enabled release-profile .so deliberately, for
+                local benchmarking. So this check is the safety boundary, not
+                a backstop for one.)
                 """.trimIndent()
             )
         }

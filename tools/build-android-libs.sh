@@ -11,16 +11,23 @@
 #   tools/build-android-libs.sh              # arm64 only, release  (the Pixel)
 #   tools/build-android-libs.sh --debug      # unoptimised
 #   tools/build-android-libs.sh --all-abis   # arm64 + armv7 + x86_64
-#   tools/build-android-libs.sh --debug --write   # + the write path — debug only
+#   tools/build-android-libs.sh --debug --write   # + the write path, unoptimised
+#   tools/build-android-libs.sh --write           # + the write path, release profile —
+#                                                  # local benchmarking only, see below
 #
 # ⚠️  --debug builds AES ~60x slower and Argon2 slower still. Use it to chase a
 #     crash, never to judge performance.
 #
-# ⚠️  --write links `dangerous-write-support` into the .so. It only makes sense
-#     paired with --debug, and this script refuses any other combination —
-#     the whole safety argument of this project is that a release build has no
-#     write code in it at all, and that must hold no matter which tool built
-#     the .so. Never distribute a .so built with --write.
+# ⚠️  --write links `dangerous-write-support` into the .so. `--write` alone
+#     (no `--debug`) is accepted deliberately — see the note by WRITE= below —
+#     and builds a write-enabled *release-profile* .so for local benchmarking.
+#     This script does NOT refuse that combination and never did; do not rely
+#     on it as the safety boundary. The actual safety argument is that a
+#     release *APK* cannot contain write code: Gradle's
+#     `checkNoWriteCodeInRelease` task (android/app/build.gradle.kts) inspects
+#     the .so that ends up in jniLibs and fails the build if write code is
+#     present in a release variant. That gate runs regardless of which tool
+#     or flags produced the .so. Never distribute a .so built with --write.
 
 set -euo pipefail
 
