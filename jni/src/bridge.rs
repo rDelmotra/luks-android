@@ -36,6 +36,12 @@ use luks_usbfs::UsbFsTransport;
 
 use serde_json::{json, Value};
 
+/// Rendezvous hook for `VolumeHandle::read_file`'s lock-consolidation test.
+/// `None` in every build except the one unit test that sets it; see the
+/// "Load-bearing: one lock, not two" note on `read_file` itself.
+#[cfg(test)]
+static READ_FILE_RACE_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 /// Write-only volume operations live separately so the long-lived JNI bridge
 /// stays navigable in read-only builds and while Pass 2b grows this boundary.
 #[cfg(feature = "dangerous-write-support")]
@@ -839,6 +845,20 @@ impl VolumeHandle {
     /// The cap is not paranoia: the result becomes a Java `byte[]`, and a
     /// gigabyte file would blow the app heap long before the read finished.
     /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
+    ///
+    /// # Load-bearing: one lock, not two
+    ///
+    /// `fs` is acquired exactly once and held across *both* the cap check and
+    /// the read below. That is not an accident of style: issue #5 was
+    /// `self.fs().file_info(...)` followed by a second, separate
+    /// `self.fs().read_file(...)` acquisition, which let a concurrent writer
+    /// change the file's size in the gap between them — the cap was checked
+    /// against a size that was no longer the size actually read. Splitting
+    /// this back into two `self.fs_for_reading()` calls (or otherwise
+    /// dropping `fs` before the read) reintroduces that race even if each
+    /// half looks correct in isolation. See
+    /// `read_file_cap_is_enforced_against_the_file_actually_read` below,
+    /// which fails if this guard is dropped and reacquired here.
     pub fn read_file(&self, path: &str, max_bytes: u64) -> Result<Vec<u8>> {
         let fs = self.fs_for_reading();
         let info = fs.file_info(path)?;
@@ -848,6 +868,16 @@ impl VolumeHandle {
                  use readChunk",
                 info.size, max_bytes
             )));
+        }
+        // Test-only rendezvous point, always compiled at this exact spot so
+        // it sits identically inside the single-guard window whether or not
+        // a test has registered a callback. It changes no locking behaviour
+        // by itself — `fs` is still the same guard acquired above — it only
+        // gives a test a deterministic place to try to open the race, which
+        // succeeds only if this window is not still covered by one lock.
+        #[cfg(test)]
+        if let Some(hook) = READ_FILE_RACE_HOOK.lock().unwrap().take() {
+            hook();
         }
         let data = fs.read_file(path)?;
         if data.len() as u64 > max_bytes {
@@ -1387,6 +1417,110 @@ mod tests {
         assert_eq!(error_code(&err), code::UNSUPPORTED);
         let err4 = vol.read_file("/proof.txt", 4).unwrap_err();
         assert_eq!(error_code(&err4), code::UNSUPPORTED);
+    }
+
+    /// Issue #5. `read_file` used to check the cap under one `MutexGuard` and
+    /// read under a second, separately-acquired one — a divergence, not
+    /// merely a rename, and the fix is that `read_file` holds a single guard
+    /// across both. This test proves that property rather than assuming it:
+    /// it forces a concurrent writer to try to grow the target file in the
+    /// exact window between the check and the read, using
+    /// `READ_FILE_RACE_HOOK` as a deterministic rendezvous point compiled at
+    /// that exact source location.
+    ///
+    /// If the lock is genuinely held across the whole window, the writer
+    /// cannot acquire `fs_for_writing` until `read_file` returns, so the hook
+    /// always times out and the read proceeds against the original,
+    /// unmodified file. If the lock were instead dropped and reacquired
+    /// there (the historical bug), the writer gets in immediately, the
+    /// second acquisition reads the file it just grew, and the result is
+    /// either the wrong bytes or (with today's redundant post-read check
+    /// also in place) an error instead of the expected data — either way,
+    /// not what this test asserts. Confirmed by hand: temporarily splitting
+    /// `read_file`'s single `let fs = self.fs_for_reading();` into two
+    /// separate acquisitions (one before the check, a second dropped-and-
+    /// reacquired one before `fs.read_file`) makes this test fail with a
+    /// panic on `result.unwrap()` (`UnsupportedFsFeature`, because the
+    /// writer's 4096-byte file blew straight past the 4-byte cap); reverting
+    /// restores the pass.
+    #[test]
+    #[cfg(feature = "dangerous-write-support")]
+    fn read_file_cap_is_enforced_against_the_file_actually_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let scratch_path = std::env::temp_dir().join("luks-jni-read-file-race.img");
+        std::fs::copy(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../fixtures/disks/gpt-luks.img"
+            ),
+            &scratch_path,
+        )
+        .expect("copy fixture");
+        let len = std::fs::metadata(&scratch_path).unwrap().len();
+        let dev = luks_core::device::FileDevice::open_writable(&scratch_path, len)
+            .expect("open writable");
+        let handle =
+            DeviceHandle::new(dev, 512, len / 512, "TEST".into(), "IMAGE".into()).expect("scan");
+        let offset = handle
+            .table
+            .luks_partitions()
+            .next()
+            .expect("a LUKS partition")
+            .offset_bytes();
+        let vol = Arc::new(handle.unlock(offset, PASSWORD).expect("unlock"));
+
+        vol.write_file("/", "race.txt", b"orig").expect("seed file");
+
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        *READ_FILE_RACE_HOOK.lock().unwrap() = Some(Box::new(move || {
+            ready_tx.send(()).expect("writer thread gone");
+            // Bounded, not polled: under the fix this always times out
+            // (the writer is blocked on the same lock `read_file` is still
+            // holding), which is the expected, deterministic outcome — not
+            // a flake. Under the bug it returns almost immediately because
+            // the writer got in for real.
+            let _ = done_rx.recv_timeout(Duration::from_millis(500));
+        }));
+
+        let writer_vol = Arc::clone(&vol);
+        let writer = std::thread::spawn(move || {
+            ready_rx.recv().expect("reader never reached the hook");
+            writer_vol.delete_file("/race.txt").expect("delete");
+            writer_vol
+                .write_file("/", "race.txt", &vec![b'x'; 4096])
+                .expect("grow the file past the cap");
+            let _ = done_tx.send(());
+        });
+
+        let result = vol.read_file("/race.txt", 4);
+
+        writer.join().expect("writer thread panicked");
+
+        // The writer must have actually run — otherwise a broken hook that
+        // never signals it would make this test pass for the wrong reason.
+        let after = vol
+            .read_file("/race.txt", u64::MAX)
+            .expect("post-race read");
+        assert_eq!(
+            after.len(),
+            4096,
+            "the concurrent writer never actually mutated the file, so this \
+             test proved nothing"
+        );
+
+        assert_eq!(
+            result.unwrap(),
+            b"orig",
+            "read_file must return exactly the bytes its cap check was run \
+             against, not bytes read from a file that changed size after \
+             the check ran under a separate lock acquisition"
+        );
+
+        let _ = std::fs::remove_file(&scratch_path);
     }
 
     /// `sha256_json` streams; `read_file` slurps. They must agree, or the
