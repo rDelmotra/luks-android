@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * volume locking and master key destruction when UI is destroyed or under memory pressure.
  */
 class LuksSessionLifecycle(
-    private val session: LuksSession = LuksSession,
+    private val session: SessionController = LuksSession,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
 ) : Application.ActivityLifecycleCallbacks, ComponentCallbacks2 {
 
@@ -61,10 +61,16 @@ class LuksSessionLifecycle(
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         Trace.i("LuksSessionLifecycle", "onTrimMemory level=$level, startedActivities=${startedActivities.get()}, activeLeases=${session.activeLeases}")
+        // notes/feature-session-lifecycle.md §3: idle timeout + explicit lock + unplug are
+        // the relock triggers; screen-off/backgrounding relock was rejected by name as
+        // "hostile to long transfers". TRIM_MEMORY_UI_HIDDEN fires on every backgrounding
+        // (switch apps, screen off, another app's dialog) and is NOT a security event — it
+        // must never lock, regardless of activity count. Only levels that mean the process
+        // is genuinely about to be killed (COMPLETE, RUNNING_CRITICAL) drop the key here;
+        // the idle timeout remains the primary relock mechanism.
         val shouldLock = when (level) {
             ComponentCallbacks2.TRIM_MEMORY_COMPLETE,
             ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> true
-            ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN -> startedActivities.get() <= 0
             else -> false
         }
 

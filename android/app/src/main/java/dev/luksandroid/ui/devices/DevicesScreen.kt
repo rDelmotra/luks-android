@@ -110,6 +110,18 @@ fun DevicesScreen(
     fun keyOf(target: UsbMassStorage.Target) =
         "${target.device.vendorId}:${target.device.productId}:${target.usbInterface.id}"
 
+    // Re-opens a target whose USB permission is already granted, marking it Opening in
+    // the meantime. Shared by the initial scan and by stale-handle recovery below, so
+    // both paths reopen a device the exact same way.
+    fun reopenTarget(target: UsbMassStorage.Target) {
+        val key = keyOf(target)
+        deviceStates = deviceStates + (key to DeviceItemState.Opening)
+        scope.launch {
+            val opened = openTarget(context, target)
+            deviceStates = deviceStates + (key to opened)
+        }
+    }
+
     fun scanDevices() {
         isScanning = true
         scope.launch {
@@ -124,11 +136,7 @@ fun DevicesScreen(
                     deviceStates[key] !is DeviceItemState.Opened &&
                     deviceStates[key] !is DeviceItemState.Opening
                 ) {
-                    deviceStates = deviceStates + (key to DeviceItemState.Opening)
-                    launch {
-                        val opened = openTarget(context, target)
-                        deviceStates = deviceStates + (key to opened)
-                    }
+                    reopenTarget(target)
                 }
             }
             isScanning = false
@@ -137,6 +145,30 @@ fun DevicesScreen(
 
     LaunchedEffect(Unit) {
         scanDevices()
+    }
+
+    // A lock — automatic (idle timeout, trim) or manual (the Lock button) — tears down
+    // the exact LuksDevice instance the UI is still holding in `deviceStates`: closing it
+    // zeroes the native handle AND releases the USB interface underneath it. Without this,
+    // the cached `Opened(device)` entry looks fine to the UI but every native call on it
+    // (including a fresh unlock attempt) throws `IllegalStateException` instantly, and the
+    // only way out was force-stopping the app. Once the session reports Locked, drop any
+    // device entries whose handle is no longer open and transparently re-acquire them —
+    // permission is already granted, so this is just re-reading the partition table.
+    LaunchedEffect(sessionState) {
+        if (sessionState is SessionState.Locked) {
+            val staleKeys = deviceStates.filterValues {
+                it is DeviceItemState.Opened && !it.device.isOpen
+            }.keys
+            if (staleKeys.isNotEmpty()) {
+                deviceStates = deviceStates - staleKeys
+                targets.forEach { target ->
+                    if (keyOf(target) in staleKeys && UsbMassStorage.hasPermission(context, target.device)) {
+                        reopenTarget(target)
+                    }
+                }
+            }
+        }
     }
 
     // Dialog state for passphrase entry

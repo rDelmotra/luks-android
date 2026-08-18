@@ -123,6 +123,19 @@ class LuksDevice internal constructor(
     val luksPartitions: List<PartitionInfo> get() = info.partitions.filter { it.isLuks }
 
     /**
+     * False once [close] has run (native handle zeroed) — including a close
+     * triggered from outside this object, e.g. [dev.luksandroid.session.SessionController]
+     * tearing down the device it took ownership of at unlock time.
+     *
+     * Callers that cache a [LuksDevice] across a lock/unlock cycle (the
+     * devices screen does, so it doesn't have to re-enumerate USB every time)
+     * must check this before reusing the instance: a locked session has
+     * already released the USB interface underneath it, so every native call
+     * on a closed handle fails immediately rather than reopening anything.
+     */
+    val isOpen: Boolean get() = handle != 0L
+
+    /**
      * Derives the master key and mounts the filesystem inside [partitionOffset].
      *
      * Blocking and slow — seconds of CPU and up to a gigabyte of allocation.

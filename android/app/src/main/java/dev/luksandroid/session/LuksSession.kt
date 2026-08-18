@@ -75,7 +75,15 @@ open class SessionController(
     val remainingIdleMs: StateFlow<Long> = _remainingIdleMs.asStateFlow()
 
     companion object {
-        const val DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000L // 5 minutes
+        // Idle-lock value is a trade-off against re-unlock cost, not a fixed security
+        // number: hardware run 2026-08-18 measured a single unlock (Argon2 KDF) at
+        // 78s. At the old 5-minute value, any pause near that length (reading a file
+        // list, switching to a file manager and back) forces the user through another
+        // 78s KDF just to keep working — that is what "locking in 5 mins what is this"
+        // was about. 15 minutes keeps a real idle-security backstop while making
+        // relock rare during actual use; it is not configurable (out of scope here),
+        // so it has to be a number that is defensible on its own.
+        const val DEFAULT_IDLE_TIMEOUT_MS = 15 * 60 * 1000L // 15 minutes
     }
 
     fun setIdleTimeout(timeoutMs: Long) {
@@ -298,10 +306,28 @@ open class SessionController(
         _state.value = SessionState.Locked
     }
 
+    /**
+     * Called directly by [dev.luksandroid.MainActivity]'s own `onTrimMemory` override, in
+     * addition to [LuksSessionLifecycle] (registered at the Application level via
+     * `registerComponentCallbacks`) receiving the same system events — both paths land here
+     * or in [LuksSessionLifecycle], so the policy has to agree in both places.
+     *
+     * Previously this locked on any `level >= TRIM_MEMORY_RUNNING_CRITICAL (15)`, which
+     * silently swept in `TRIM_MEMORY_UI_HIDDEN (20)`, `BACKGROUND (40)`, `MODERATE (60)` and
+     * `COMPLETE (80)` — i.e. plain backgrounding, not memory pressure. The logcat evidence
+     * for the "backgrounding destroys the session" bug (`LuksSession: onTrimMemory level=20`
+     * immediately followed by `LuksSession: locking session...`) is this method's own
+     * `Trace.i` format, not [LuksSessionLifecycle]'s — this was the actual live trigger, not
+     * just [LuksSessionLifecycle]. Only [android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE]
+     * and [android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL] mean the process is
+     * genuinely about to be killed; those are the only levels allowed to lock here.
+     */
     @Suppress("DEPRECATION")
     fun onTrimMemory(level: Int) {
         Trace.i("LuksSession: onTrimMemory level=$level")
-        if (level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL && _activeLeases.value == 0) {
+        val criticalLevel = level == android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE ||
+            level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
+        if (criticalLevel && _activeLeases.value == 0) {
             scope.launch { lock() }
         }
     }

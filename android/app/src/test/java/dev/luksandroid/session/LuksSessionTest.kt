@@ -12,6 +12,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -282,5 +283,87 @@ class LuksSessionTest {
         } catch (e: IllegalStateException) {
             assertTrue(e.message?.contains("not unlocked") == true)
         }
+    }
+
+    /**
+     * Test K.6: [SessionController.onTrimMemory] must not lock on
+     * `TRIM_MEMORY_UI_HIDDEN`.
+     *
+     * This is the method [dev.luksandroid.MainActivity]'s own `onTrimMemory`
+     * override forwards into directly (`LuksSession.onTrimMemory(level)`), separately
+     * from [LuksSessionLifecycle]'s `ComponentCallbacks2` registration at the
+     * Application level — both receive the same system trim events. The captured
+     * hardware logcat for the "backgrounding destroys the session" bug
+     * (`LuksSession: onTrimMemory level=20` immediately followed by
+     * `LuksSession: locking session, waiting for leases to drain`) matches this
+     * method's own `Trace.i` message format, not [LuksSessionLifecycle]'s — so this
+     * was the code path that actually fired on the device, and the policy fix has to
+     * apply here too, not only in [LuksSessionLifecycle].
+     */
+    @Test
+    fun testK6_onTrimMemory_uiHidden_doesNotLock() = runBlocking {
+        session.startUnlockedForTest()
+
+        @Suppress("DEPRECATION")
+        session.onTrimMemory(android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN)
+
+        delay(300)
+        assertTrue(
+            "Backgrounding (UI_HIDDEN=20) must never lock the session",
+            session.state.value is SessionState.Unlocked,
+        )
+    }
+
+    /**
+     * Test K.7: [SessionController.onTrimMemory] still locks on the levels that
+     * mean the process is genuinely about to be killed.
+     */
+    @Test
+    fun testK7_onTrimMemory_completeAndRunningCritical_locks() = runBlocking {
+        @Suppress("DEPRECATION")
+        suspend fun expectLocks(level: Int) {
+            val closeOrder = Collections.synchronizedList(mutableListOf<String>())
+            val volumeStub = AutoCloseable { closeOrder.add("VOLUME_CLOSED") }
+            val deviceStub = AutoCloseable { closeOrder.add("DEVICE_CLOSED") }
+            session.startUnlockedForTest(volume = null, device = deviceStub, volumeCloseable = volumeStub)
+
+            session.onTrimMemory(level)
+
+            withTimeout(2000) {
+                while (session.state.value !is SessionState.Locked) delay(10)
+            }
+            assertEquals(SessionState.Locked, session.state.value)
+            assertTrue(closeOrder.contains("VOLUME_CLOSED"))
+
+            session.reset()
+        }
+
+        expectLocks(android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE)
+        expectLocks(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL)
+    }
+
+    /**
+     * Test K.8: intermediate trim levels (BACKGROUND, MODERATE, RUNNING_LOW) must not
+     * lock — only exact COMPLETE/RUNNING_CRITICAL do. The old policy used
+     * `level >= TRIM_MEMORY_RUNNING_CRITICAL`, which swept these in too.
+     */
+    @Test
+    fun testK8_onTrimMemory_intermediateLevels_doNotLock() = runBlocking {
+        @Suppress("DEPRECATION")
+        suspend fun expectNoLock(level: Int) {
+            session.startUnlockedForTest()
+            session.onTrimMemory(level)
+            delay(200)
+            assertTrue(
+                "level=$level must not lock",
+                session.state.value is SessionState.Unlocked,
+            )
+            session.reset()
+        }
+
+        expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND)
+        expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_MODERATE)
+        expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW)
+        expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE)
     }
 }
