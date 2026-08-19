@@ -203,7 +203,6 @@ pub struct ScsiBlockDevice<T: BulkTransport> {
 impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// Probe the device: identify it, wait for it to be ready, read its size.
     pub fn open(transport: T) -> Result<Self> {
-        let _ = transport.reset();
         let mut dev = Self {
             transport,
             capacity: Capacity {

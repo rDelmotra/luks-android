@@ -318,7 +318,6 @@ impl UsbFsTransport {
             return Err(transfer_err("USBDEVFS_CLAIMINTERFACE", errno()));
         }
         self.claimed = true;
-        let _ = self.reset();
         Ok(())
     }
 

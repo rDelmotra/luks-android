@@ -236,7 +236,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     done += take_stripe;
                 }
 
-                let (prev_bytenr, _) = writer.checksums.pop().expect("checksum entry for tail");
+                let prev_bytenr = writer.checksums.pop().map(|(b, _)| b).unwrap_or(write_addr);
 
                 if writer.tail_buf.len() == sector_size {
                     let crc = crate::fs::btrfs::crc32c::crc32c(&writer.tail_buf);
@@ -397,7 +397,9 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let res = cow_tree_mutate(
             self, &pending_blocks, fs_root_bytenr, fs_root_level, FS_TREE_OBJECTID,
             &parent_inode_key, new_generation, &mut allocator, |leaf| {
-                let idx = leaf.find_item(&parent_inode_key).unwrap();
+                let idx = leaf
+                    .find_item(&parent_inode_key)
+                    .ok_or_else(|| LuksError::NotFound("parent inode not found in leaf".into()))?;
                 let item = &mut leaf.items[idx].data;
                 item[8..16].copy_from_slice(&new_generation.to_le_bytes());
                 let cur_size = u64::from_le_bytes(item[16..24].try_into().unwrap());
