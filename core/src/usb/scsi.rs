@@ -48,6 +48,14 @@ const SA_READ_CAPACITY_16: u8 = 0x10;
 const READ10_MAX_BLOCKS: u64 = 0xFFFF;
 const READ10_MAX_LBA: u64 = 0xFFFF_FFFF;
 
+/// The maximum bytes moved in a single SCSI data phase.
+///
+/// Linux `usb-storage` caps single transfers to 128 KiB (`US_MAX_SECTORS = 240`
+/// or 120 KiB, commonly 128 KiB). Cheap USB flash bridges (e.g. SanDisk) have
+/// limited internal SRAM buffers (typically 128 KiB) and stall the bulk pipe
+/// (`EPIPE` / errno 32) if a single SCSI command requests more.
+pub const MAX_SCSI_TRANSFER: usize = 128 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct InquiryData {
     pub vendor: String,
@@ -261,10 +269,12 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.command_inner(cdb, direction, data, true)
     }
 
+    #[cfg(feature = "dangerous-write-support")]
     fn command_out(&self, cdb: Vec<u8>, data: &[u8]) -> Result<usize> {
         self.command_out_inner(cdb, data, true)
     }
 
+    #[cfg(feature = "dangerous-write-support")]
     fn command_out_inner(&self, cdb: Vec<u8>, data: &[u8], ask_why: bool) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
@@ -289,18 +299,31 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
+        let mut cleared_halt = false;
         while got < CSW_LEN {
-            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-            if n == 0 {
-                self.recover(self.transport.clear_halt(true))?;
-                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-                if n == 0 {
+            match self.transport.read(&mut csw_buf[got..]) {
+                Ok(0) | Err(_) if !cleared_halt => {
+                    // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
+                    // endpoint before/during CSW is standard; clear halt and retry once.
+                    cleared_halt = true;
+                    if let Err(e) = self.transport.clear_halt(true) {
+                        let _ = self.transport.reset();
+                        return Err(e);
+                    }
+                    continue;
+                }
+                Ok(0) => {
+                    let _ = self.transport.reset();
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
-                got += n;
-                continue;
+                Ok(n) => {
+                    got += n;
+                }
+                Err(e) => {
+                    let _ = self.transport.reset();
+                    return Err(e);
+                }
             }
-            got += n;
         }
 
         let csw = CommandStatusWrapper::decode(&csw_buf)?;
@@ -378,19 +401,31 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
+        let mut cleared_halt = false;
         while got < CSW_LEN {
-            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-            if n == 0 {
-                // A stalled endpoint is the usual cause; clear it and retry once.
-                self.recover(self.transport.clear_halt(true))?;
-                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-                if n == 0 {
+            match self.transport.read(&mut csw_buf[got..]) {
+                Ok(0) | Err(_) if !cleared_halt => {
+                    // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
+                    // endpoint before/during CSW is standard; clear halt and retry once.
+                    cleared_halt = true;
+                    if let Err(e) = self.transport.clear_halt(true) {
+                        let _ = self.transport.reset();
+                        return Err(e);
+                    }
+                    continue;
+                }
+                Ok(0) => {
+                    let _ = self.transport.reset();
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
-                got += n;
-                continue;
+                Ok(n) => {
+                    got += n;
+                }
+                Err(e) => {
+                    let _ = self.transport.reset();
+                    return Err(e);
+                }
             }
-            got += n;
         }
 
         let csw = CommandStatusWrapper::decode(&csw_buf)?;
@@ -723,9 +758,10 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        // Per-command block count is bounded by the transport's transfer limit
-        // and by what the CDB can express.
-        let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+        // Per-command block count is bounded by the transport's transfer limit,
+        // the safe SCSI transfer cap (128 KiB), and what the CDB can express.
+        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
+        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
         let mut chunk = vec![0u8; (max_blocks * bs) as usize];
@@ -786,7 +822,8 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
+        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
         while done < buf.len() {

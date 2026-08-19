@@ -409,3 +409,83 @@ fn guid_formatting_uses_mixed_endian_order() {
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
     );
 }
+
+struct CswStallTransport<T> {
+    inner: T,
+    stall_csw: std::cell::Cell<bool>,
+    clear_halt_called: std::cell::Cell<bool>,
+    reset_called: std::cell::Cell<bool>,
+}
+
+impl<T> CswStallTransport<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            stall_csw: std::cell::Cell::new(false),
+            clear_halt_called: std::cell::Cell::new(false),
+            reset_called: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for CswStallTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        if self.stall_csw.get() && buf.len() == 13 && !self.clear_halt_called.get() {
+            return Err(LuksError::UsbTransfer(
+                "USBDEVFS_BULK: errno 32 (Broken pipe) (endpoint stalled)".into(),
+            ));
+        }
+        self.inner.read(buf)
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+        if endpoint_in {
+            self.clear_halt_called.set(true);
+        }
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<(), LuksError> {
+        self.reset_called.set(true);
+        self.inner.reset()
+    }
+}
+
+#[test]
+fn csw_stall_recovers_via_clear_halt() {
+    let raw_drive = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport = CswStallTransport::new(raw_drive);
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    dev.transport().stall_csw.set(true);
+    dev.transport().clear_halt_called.set(false);
+    dev.transport().reset_called.set(false);
+
+    let inq = dev.inquiry().expect("inquiry should recover from CSW stall via clear_halt");
+    assert!(inq.is_block_device());
+    assert!(dev.transport().clear_halt_called.get(), "clear_halt(true) must be called");
+    assert!(!dev.transport().reset_called.get(), "reset() must not be called when clear_halt succeeds");
+}
+
+#[test]
+fn max_scsi_transfer_caps_single_read_commands() {
+    // A transport that allows 1 MiB transfers
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(1024 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    dev.read_at(0, &mut buf).unwrap();
+
+    let stats = *dev.transport().stats.borrow();
+    // 1 MiB in 128 KiB commands = 8 commands
+    assert!(stats.read_commands >= 8, "must split into at least 8 commands");
+    assert_eq!(stats.largest_read_blocks, 256, "capped at 128 KiB / 512 = 256 blocks");
+}
