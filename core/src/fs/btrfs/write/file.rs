@@ -250,54 +250,67 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 }
             }
 
-            // 2. Write remaining chunk data sector by sector
-            while chunk_offset < chunk.len() {
-                let sector_len = sector_size.min(chunk.len() - chunk_offset);
-                let sector_bytenr = write_addr + chunk_offset as u64;
+            // 2. Main aligned body
+            let aligned_len = (chunk.len() - chunk_offset) / sector_size * sector_size;
+            if aligned_len > 0 {
+                let aligned_start_addr = write_addr + chunk_offset as u64;
+                let aligned_data = &chunk[chunk_offset..chunk_offset + aligned_len];
 
-                if sector_len == sector_size {
-                    let sector_data = &chunk[chunk_offset..chunk_offset + sector_size];
-                    let mut done = 0usize;
-                    while done < sector_size {
-                        let logical_cur = sector_bytenr + done as u64;
-                        let (_, run) = self.chunk_map().map(logical_cur)?;
-                        let take_stripe = (sector_size - done).min(run as usize);
-                        let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
-                        for phys_stripe in stripes {
-                            self.device_mut().write_at(
-                                phys_stripe,
-                                &sector_data[done..done + take_stripe],
-                            )?;
-                        }
-                        done += take_stripe;
+                let mut done = 0usize;
+                while done < aligned_len {
+                    let logical_cur = aligned_start_addr + done as u64;
+                    let (_, run) = self.chunk_map().map(logical_cur)?;
+                    let take_stripe = (aligned_len - done).min(run as usize);
+                    let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                    for phys_stripe in stripes {
+                        self.device_mut().write_at(
+                            phys_stripe,
+                            &aligned_data[done..done + take_stripe],
+                        )?;
                     }
-                    let crc = crate::fs::btrfs::crc32c::crc32c(sector_data);
-                    writer.checksums.push((sector_bytenr, crc));
-                } else {
-                    // Partial tail sector: write full zero-padded sector to disk
-                    writer.tail_buf.clear();
-                    writer.tail_buf.extend_from_slice(&chunk[chunk_offset..chunk_offset + sector_len]);
-                    let mut sector_buf = vec![0u8; sector_size];
-                    sector_buf[..sector_len].copy_from_slice(&chunk[chunk_offset..chunk_offset + sector_len]);
+                    done += take_stripe;
+                }
 
-                    let mut done = 0usize;
-                    while done < sector_size {
-                        let logical_cur = sector_bytenr + done as u64;
-                        let (_, run) = self.chunk_map().map(logical_cur)?;
-                        let take_stripe = (sector_size - done).min(run as usize);
-                        let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
-                        for phys_stripe in stripes {
-                            self.device_mut().write_at(
-                                phys_stripe,
-                                &sector_buf[done..done + take_stripe],
-                            )?;
-                        }
-                        done += take_stripe;
-                    }
-                    let crc = crate::fs::btrfs::crc32c::crc32c(&sector_buf);
+                for i in (0..aligned_len).step_by(sector_size) {
+                    let sector_bytenr = aligned_start_addr + i as u64;
+                    let crc = crate::fs::btrfs::crc32c::crc32c(
+                        &aligned_data[i..i + sector_size],
+                    );
                     writer.checksums.push((sector_bytenr, crc));
                 }
-                chunk_offset += sector_size;
+
+                chunk_offset += aligned_len;
+            }
+
+            // 3. Trailing partial sector
+            if chunk.len() > chunk_offset {
+                let rem_len = chunk.len() - chunk_offset;
+                let sector_bytenr = write_addr + chunk_offset as u64;
+                let rem_data = &chunk[chunk_offset..chunk_offset + rem_len];
+
+                writer.tail_buf.clear();
+                writer.tail_buf.extend_from_slice(rem_data);
+
+                let mut sector_buf = vec![0u8; sector_size];
+                sector_buf[..rem_len].copy_from_slice(rem_data);
+
+                let mut done = 0usize;
+                while done < sector_size {
+                    let logical_cur = sector_bytenr + done as u64;
+                    let (_, run) = self.chunk_map().map(logical_cur)?;
+                    let take_stripe = (sector_size - done).min(run as usize);
+                    let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                    for phys_stripe in stripes {
+                        self.device_mut().write_at(
+                            phys_stripe,
+                            &sector_buf[done..done + take_stripe],
+                        )?;
+                    }
+                    done += take_stripe;
+                }
+
+                let crc = crate::fs::btrfs::crc32c::crc32c(&sector_buf);
+                writer.checksums.push((sector_bytenr, crc));
             }
 
             written_so_far += take as u64;
