@@ -20,9 +20,10 @@ pub struct BtrfsFileWriter {
     pub(crate) size: u64,
     pub(crate) written_bytes: u64,
     pub(crate) data_runs: Vec<(u64, u64)>, // (logical_bytenr, num_bytes)
-    pub(crate) checksums: Vec<(u64, u32)>, // (logical_bytenr, crc32c)
+    pub checksums: Vec<(u64, u32)>,        // (logical_bytenr, crc32c)
     pub(crate) allocator: FreeSpaceMap,
     pub(crate) is_streaming: bool,
+    pub(crate) tail_buf: Vec<u8>,
 }
 
 impl BtrfsFileWriter {
@@ -123,6 +124,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             checksums: Vec::new(),
             allocator,
             is_streaming: false,
+            tail_buf: Vec::new(),
         })
     }
 
@@ -144,6 +146,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             checksums: Vec::new(),
             allocator,
             is_streaming: true,
+            tail_buf: Vec::new(),
         })
     }
 
@@ -187,6 +190,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             return Err(LuksError::OutOfBounds);
         }
 
+        let sector_size = self.superblock().sector_size as usize;
         let mut remaining = data;
         let mut written_so_far = writer.written_bytes;
         let mut file_cursor = 0u64;
@@ -206,30 +210,94 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             let chunk = &remaining[..take];
             let write_addr = bytenr + offset_in_run;
 
-            // Write chunk to disk mapping logical -> physical stripes
-            let mut chunk_done = 0usize;
-            while chunk_done < chunk.len() {
-                let logical_cur = write_addr + chunk_done as u64;
-                let (_, run) = self.chunk_map().map(logical_cur)?;
-                let chunk_take = (chunk.len() - chunk_done).min(run as usize);
-                let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
-                for phys_stripe in stripes {
-                    self.device_mut().write_at(
-                        phys_stripe,
-                        &chunk[chunk_done..chunk_done + chunk_take],
-                    )?;
+            // 1. Handle unaligned tail from previous write_chunk if present
+            let mut chunk_offset = 0usize;
+            if !writer.tail_buf.is_empty() {
+                let tail_len = writer.tail_buf.len();
+                let needed = sector_size - tail_len;
+                let take_tail = needed.min(chunk.len());
+                let tail_data = &chunk[..take_tail];
+                writer.tail_buf.extend_from_slice(tail_data);
+                chunk_offset += take_tail;
+
+                // Write the tail continuation to disk
+                let mut done = 0usize;
+                while done < tail_data.len() {
+                    let logical_cur = write_addr + done as u64;
+                    let (_, run) = self.chunk_map().map(logical_cur)?;
+                    let take_stripe = (tail_data.len() - done).min(run as usize);
+                    let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                    for phys_stripe in stripes {
+                        self.device_mut().write_at(
+                            phys_stripe,
+                            &tail_data[done..done + take_stripe],
+                        )?;
+                    }
+                    done += take_stripe;
                 }
-                chunk_done += chunk_take;
+
+                let (prev_bytenr, _) = writer.checksums.pop().expect("checksum entry for tail");
+
+                if writer.tail_buf.len() == sector_size {
+                    let crc = crate::fs::btrfs::crc32c::crc32c(&writer.tail_buf);
+                    writer.checksums.push((prev_bytenr, crc));
+                    writer.tail_buf.clear();
+                } else {
+                    let mut sector_buf = vec![0u8; sector_size];
+                    sector_buf[..writer.tail_buf.len()].copy_from_slice(&writer.tail_buf);
+                    let crc = crate::fs::btrfs::crc32c::crc32c(&sector_buf);
+                    writer.checksums.push((prev_bytenr, crc));
+                }
             }
 
-            // Compute CRC32c for every sector
-            let sector_size = self.superblock().sector_size as usize;
-            let mut offset = 0;
-            while offset < chunk.len() {
-                let sector_len = sector_size.min(chunk.len() - offset);
-                let crc = crate::fs::btrfs::crc32c::crc32c(&chunk[offset..offset + sector_len]);
-                writer.checksums.push((write_addr + offset as u64, crc));
-                offset += sector_size;
+            // 2. Write remaining chunk data sector by sector
+            while chunk_offset < chunk.len() {
+                let sector_len = sector_size.min(chunk.len() - chunk_offset);
+                let sector_bytenr = write_addr + chunk_offset as u64;
+
+                if sector_len == sector_size {
+                    let sector_data = &chunk[chunk_offset..chunk_offset + sector_size];
+                    let mut done = 0usize;
+                    while done < sector_size {
+                        let logical_cur = sector_bytenr + done as u64;
+                        let (_, run) = self.chunk_map().map(logical_cur)?;
+                        let take_stripe = (sector_size - done).min(run as usize);
+                        let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                        for phys_stripe in stripes {
+                            self.device_mut().write_at(
+                                phys_stripe,
+                                &sector_data[done..done + take_stripe],
+                            )?;
+                        }
+                        done += take_stripe;
+                    }
+                    let crc = crate::fs::btrfs::crc32c::crc32c(sector_data);
+                    writer.checksums.push((sector_bytenr, crc));
+                } else {
+                    // Partial tail sector: write full zero-padded sector to disk
+                    writer.tail_buf.clear();
+                    writer.tail_buf.extend_from_slice(&chunk[chunk_offset..chunk_offset + sector_len]);
+                    let mut sector_buf = vec![0u8; sector_size];
+                    sector_buf[..sector_len].copy_from_slice(&chunk[chunk_offset..chunk_offset + sector_len]);
+
+                    let mut done = 0usize;
+                    while done < sector_size {
+                        let logical_cur = sector_bytenr + done as u64;
+                        let (_, run) = self.chunk_map().map(logical_cur)?;
+                        let take_stripe = (sector_size - done).min(run as usize);
+                        let stripes = self.chunk_map().map_all_stripes(logical_cur)?;
+                        for phys_stripe in stripes {
+                            self.device_mut().write_at(
+                                phys_stripe,
+                                &sector_buf[done..done + take_stripe],
+                            )?;
+                        }
+                        done += take_stripe;
+                    }
+                    let crc = crate::fs::btrfs::crc32c::crc32c(&sector_buf);
+                    writer.checksums.push((sector_bytenr, crc));
+                }
+                chunk_offset += sector_size;
             }
 
             written_so_far += take as u64;
@@ -398,22 +466,11 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         if let Ok(csum_root) = self.tree_root(crate::fs::btrfs::tree::CSUM_TREE_OBJECTID) {
             let mut csum_root_bytenr = csum_root.bytenr;
             let mut csum_root_level = csum_root.level;
-            let mut csum_modified = false;
 
-            for &(bytenr, run_len) in &writer.data_runs {
-                if run_len == 0 {
-                    continue;
-                }
-                csum_modified = true;
-                let mut extent_data = vec![0u8; run_len as usize];
-                self.read_logical(bytenr, &mut extent_data)?;
-                let csum_items = node::build_extent_csum_items(
-                    sb.csum_type,
+            if !writer.checksums.is_empty() {
+                let csum_items = node::build_extent_csum_items_from_checksums(
                     sb.node_size,
-                    sb.sector_size,
-                    bytenr,
-                    run_len,
-                    &extent_data,
+                    &writer.checksums,
                 )?;
 
                 for (range_start, csum_payload) in csum_items {
@@ -445,8 +502,6 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     csum_root_bytenr = res.new_root_bytenr;
                     csum_root_level = res.new_root_level;
                 }
-            }
-            if csum_modified {
                 csum_root_opt = Some((csum_root_bytenr, csum_root_level));
             }
         }
@@ -558,6 +613,7 @@ mod tests {
             checksums: Vec::new(),
             allocator,
             is_streaming: false,
+            tail_buf: Vec::new(),
         };
 
         // Prepare test payload (48 KB)

@@ -700,6 +700,63 @@ pub fn build_extent_csum_items(
     Ok(items)
 }
 
+/// Split pre-calculated per-sector checksums into as many `EXTENT_CSUM` items
+/// as this node geometry needs, returning `(logical address, payload)` pairs.
+///
+/// Each sector's CRC32c is packed as 4 little-endian bytes (`crc.to_le_bytes()`).
+/// Items are split when the payload reaches `max_csum_item_bytes(node_size, 4)`
+/// or when there is a discontinuity in logical sector addresses.
+pub fn build_extent_csum_items_from_checksums(
+    node_size: u32,
+    checksums: &[(u64, u32)],
+) -> Result<Vec<(u64, Vec<u8>)>> {
+    if checksums.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_item = max_csum_item_bytes(node_size, 4);
+    if max_item == 0 {
+        return Err(LuksError::BtrfsItemTooLarge {
+            what: "checksum item",
+            item_bytes: 4,
+            node_size,
+        });
+    }
+    let sectors_per_item = max_item / 4;
+
+    let mut items = Vec::new();
+    let mut current_item_start = 0u64;
+    let mut current_payload = Vec::with_capacity(sectors_per_item * 4);
+    let mut current_count = 0usize;
+    let mut next_expected_bytenr = 0u64;
+
+    for &(bytenr, crc) in checksums {
+        if current_payload.is_empty() {
+            current_item_start = bytenr;
+            current_payload.extend_from_slice(&crc.to_le_bytes());
+            current_count = 1;
+            next_expected_bytenr = bytenr.saturating_add(4096);
+        } else if bytenr == next_expected_bytenr && current_count < sectors_per_item {
+            current_payload.extend_from_slice(&crc.to_le_bytes());
+            current_count += 1;
+            next_expected_bytenr = bytenr.saturating_add(4096);
+        } else {
+            items.push((current_item_start, current_payload));
+            current_item_start = bytenr;
+            current_payload = Vec::with_capacity(sectors_per_item * 4);
+            current_payload.extend_from_slice(&crc.to_le_bytes());
+            current_count = 1;
+            next_expected_bytenr = bytenr.saturating_add(4096);
+        }
+    }
+
+    if !current_payload.is_empty() {
+        items.push((current_item_start, current_payload));
+    }
+
+    Ok(items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +841,70 @@ mod tests {
         assert_eq!(items[2].1.len(), 4057 * 4);
         assert_eq!(items[3].0, disk_bytenr + 3 * 4057 * 4096);
         assert_eq!(items[3].1.len(), 629 * 4);
+    }
+
+    #[test]
+    fn test_build_extent_csum_items_from_checksums_matches_build_extent_csum_items() {
+        let node_size = 16384;
+        let sector_size = 4096;
+        let disk_bytenr = 100_000_000u64;
+        let disk_num_bytes = 20 * 1024 * 1024;
+        let test_data = vec![0xABu8; disk_num_bytes as usize];
+
+        let from_data = build_extent_csum_items(
+            CsumType::Crc32c,
+            node_size,
+            sector_size,
+            disk_bytenr,
+            disk_num_bytes,
+            &test_data,
+        )
+        .expect("build csum items from data");
+
+        let nr_sectors = (disk_num_bytes as usize) / (sector_size as usize);
+        let mut checksums = Vec::with_capacity(nr_sectors);
+        for i in 0..nr_sectors {
+            let start = i * sector_size as usize;
+            let crc = crate::fs::btrfs::crc32c::crc32c(&test_data[start..start + sector_size as usize]);
+            checksums.push((disk_bytenr + (i * sector_size as usize) as u64, crc));
+        }
+
+        let from_checksums = build_extent_csum_items_from_checksums(node_size, &checksums)
+            .expect("build csum items from checksums");
+
+        assert_eq!(from_data, from_checksums);
+    }
+
+    #[test]
+    fn test_build_extent_csum_items_from_checksums_discontinuous_extents() {
+        let node_size = 16384;
+        let checksums = vec![
+            (10_000_000, 0x11111111),
+            (10_004_096, 0x22222222),
+            (20_000_000, 0x33333333),
+            (20_004_096, 0x44444444),
+        ];
+
+        let items = build_extent_csum_items_from_checksums(node_size, &checksums)
+            .expect("build csum items discontinuous");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, 10_000_000);
+        assert_eq!(items[0].1.len(), 8);
+        assert_eq!(&items[0].1[0..4], &0x11111111u32.to_le_bytes());
+        assert_eq!(&items[0].1[4..8], &0x22222222u32.to_le_bytes());
+
+        assert_eq!(items[1].0, 20_000_000);
+        assert_eq!(items[1].1.len(), 8);
+        assert_eq!(&items[1].1[0..4], &0x33333333u32.to_le_bytes());
+        assert_eq!(&items[1].1[4..8], &0x44444444u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_build_extent_csum_items_from_checksums_empty() {
+        let items = build_extent_csum_items_from_checksums(16384, &[])
+            .expect("build empty");
+        assert!(items.is_empty());
     }
 }
 
