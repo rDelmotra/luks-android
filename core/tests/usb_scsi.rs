@@ -353,6 +353,7 @@ fn a_transport_failure_triggers_a_bot_reset_before_propagating() {
     let dev = ScsiBlockDevice::open(FlakyTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
         .unwrap();
 
+    assert_eq!(dev.transport().reset_count.get(), 1, "open() triggers initial BOT reset");
     dev.transport().arm(1);
     let mut buf = [0u8; 512];
     let err = dev.read_at(0, &mut buf).unwrap_err();
@@ -363,7 +364,7 @@ fn a_transport_failure_triggers_a_bot_reset_before_propagating() {
     );
     assert_eq!(
         dev.transport().reset_count.get(),
-        1,
+        2,
         "a transport-level failure must trigger exactly one BOT reset"
     );
 }
@@ -377,10 +378,23 @@ fn a_clean_transfer_never_touches_reset() {
     let dev = ScsiBlockDevice::open(FlakyTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
         .unwrap();
 
+    assert_eq!(dev.transport().reset_count.get(), 1, "open() triggers initial BOT reset");
     let mut buf = [0u8; 512];
     dev.read_at(0, &mut buf).unwrap();
 
-    assert_eq!(dev.transport().reset_count.get(), 0);
+    assert_eq!(dev.transport().reset_count.get(), 1);
+}
+
+#[test]
+fn open_issues_bot_reset_for_device_recovery() {
+    let transport = FlakyTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024]));
+    assert_eq!(transport.reset_count.get(), 0);
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+    assert_eq!(
+        dev.transport().reset_count.get(),
+        1,
+        "ScsiBlockDevice::open must issue a BOT reset recovery before sending commands"
+    );
 }
 
 #[test]
