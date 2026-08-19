@@ -585,7 +585,7 @@ fun BrowserScreen(
         val id = activeTransferId ?: return@LaunchedEffect
         val terminal = TransferManager.transfers
             .map { list -> list.find { it.id == id } }
-            .first { it == null || it.state != TransferState.RUNNING }
+            .first { it == null || (it.state != TransferState.RUNNING && it.state != TransferState.QUEUED) }
 
         when (terminal?.state) {
             TransferState.COMPLETED -> {
@@ -638,11 +638,13 @@ fun BrowserScreen(
 
     // SAF Importer
     val importer = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument()
-    ) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isEmpty()) return@rememberLauncherForActivityResult
 
-        activeTransferId = TransferManager.startImport(context, currentPath, uri)
+        for (uri in uris) {
+            activeTransferId = TransferManager.startImport(context, currentPath, uri)
+        }
     }
 
     // SHA-256 Checksum Calculation
@@ -999,7 +1001,7 @@ fun BrowserScreen(
             // Active Transfer Progress Banner. Reads live from TransferManager's
             // flow (not local composable state) so it reflects the same
             // process-wide truth as the Transfers screen.
-            activeTransferItem?.takeIf { it.state == TransferState.RUNNING }?.let { transfer ->
+            activeTransferItem?.takeIf { it.state == TransferState.RUNNING || it.state == TransferState.QUEUED }?.let { transfer ->
                 Surface(
                     color = MaterialTheme.colorScheme.primaryContainer,
                     shape = RoundedCornerShape(8.dp),
@@ -1009,12 +1011,17 @@ fun BrowserScreen(
                         modifier = Modifier.padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        val pct = if (transfer.totalBytes > 0) {
-                            (transfer.transferredBytes * 100 / transfer.totalBytes).toInt()
-                        } else 0
-                        val speedStr = if (transfer.speedBytesPerSec > 0) {
-                            " · %.1f MiB/s".format(transfer.speedBytesPerSec.toDouble() / (1L shl 20))
-                        } else ""
+                        val statusText = if (transfer.state == TransferState.QUEUED) {
+                            "(Queued)"
+                        } else {
+                            val pct = if (transfer.totalBytes > 0) {
+                                (transfer.transferredBytes * 100 / transfer.totalBytes).toInt()
+                            } else 0
+                            val speedStr = if (transfer.speedBytesPerSec > 0) {
+                                " · %.1f MiB/s".format(transfer.speedBytesPerSec.toDouble() / (1L shl 20))
+                            } else ""
+                            "$pct%$speedStr"
+                        }
                         val operation = when (transfer.type) {
                             TransferType.IMPORT -> "Importing"
                             TransferType.EXPORT -> "Exporting"
@@ -1036,7 +1043,7 @@ fun BrowserScreen(
                                 modifier = Modifier.weight(1f),
                             )
                             Text(
-                                text = "$pct%$speedStr",
+                                text = statusText,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onPrimaryContainer,
                             )
@@ -1044,7 +1051,7 @@ fun BrowserScreen(
 
                         LinearProgressIndicator(
                             progress = {
-                                if (transfer.totalBytes > 0) {
+                                if (transfer.state != TransferState.QUEUED && transfer.totalBytes > 0) {
                                     (transfer.transferredBytes.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
                                 } else 0f
                             },

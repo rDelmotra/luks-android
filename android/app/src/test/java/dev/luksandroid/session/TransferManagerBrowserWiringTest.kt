@@ -103,7 +103,7 @@ class TransferManagerBrowserWiringTest {
         // registered in TransferManager.transfers, not held in local
         // Composable state that only this screen can see.
         withTimeout(2000) {
-            while (TransferManager.getTransfer(id) == null) delay(10)
+            while (TransferManager.getTransfer(id)?.state == TransferState.QUEUED) delay(10)
         }
         val registered = TransferManager.getTransfer(id)
         assertEquals(TransferType.HASH, registered?.type)
@@ -122,7 +122,7 @@ class TransferManagerBrowserWiringTest {
         // this transfer would have been a child of the caller's scope and
         // cancelling that scope would have cancelled it too.
         withTimeout(3000) {
-            while (TransferManager.getTransfer(id)?.state == TransferState.RUNNING) delay(20)
+            while (TransferManager.getTransfer(id)?.state != TransferState.COMPLETED) delay(20)
         }
         assertEquals(TransferState.COMPLETED, TransferManager.getTransfer(id)?.state)
     }

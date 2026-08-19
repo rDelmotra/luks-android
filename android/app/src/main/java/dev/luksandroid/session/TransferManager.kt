@@ -22,6 +22,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
@@ -29,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 enum class TransferType { IMPORT, EXPORT, HASH }
 
-enum class TransferState { RUNNING, COMPLETED, CANCELLED, FAILED }
+enum class TransferState { QUEUED, RUNNING, COMPLETED, CANCELLED, FAILED }
 
 data class TransferItem(
     val id: Long,
@@ -57,6 +59,7 @@ open class TransferController {
     val transfers: StateFlow<List<TransferItem>> = _transfers.asStateFlow()
 
     private val activeJobs = ConcurrentHashMap<Long, Job>()
+    private val transferMutex = Mutex()
 
     /**
      * The manager's own coroutine scope. Transfers started via [startImport] /
@@ -80,17 +83,41 @@ open class TransferController {
      */
     fun startExport(context: Context, path: String, targetUri: Uri): Long {
         val transferId = nextTransferId.getAndIncrement()
-        managerScope.launch {
-            runCatching {
-                LuksSession.withLease { volume ->
-                    exportFileWithProgress(context, volume, path, targetUri, transferId)
+        val fileName = path.substringAfterLast('/').ifEmpty { "export_${System.currentTimeMillis()}" }
+        val queuedItem = TransferItem(
+            id = transferId,
+            name = fileName,
+            type = TransferType.EXPORT,
+            totalBytes = -1L,
+            transferredBytes = 0L,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            state = TransferState.QUEUED,
+            cancelToken = 0L,
+            error = null,
+        )
+        _transfers.update { listOf(queuedItem) + it }
+
+        val job = managerScope.launch {
+            try {
+                runCatching {
+                    transferMutex.withLock {
+                        if (isTransferCancelled(transferId)) return@withLock
+                        updateTransfer(transferId) { it.copy(state = TransferState.RUNNING) }
+                        LuksSession.withLease { volume ->
+                            exportFileWithProgress(context, volume, path, targetUri, transferId)
+                        }
+                    }
+                }.onFailure { t ->
+                    if (t !is CancellationException) {
+                        Trace.err(LuksException.GENERIC, "export")
+                    }
                 }
-            }.onFailure { t ->
-                if (t !is CancellationException) {
-                    Trace.err(LuksException.GENERIC, "export")
-                }
+            } finally {
+                activeJobs.remove(transferId)
             }
         }
+        activeJobs[transferId] = job
         return transferId
     }
 
@@ -102,17 +129,69 @@ open class TransferController {
      */
     fun startImport(context: Context, parentPath: String, sourceUri: Uri): Long {
         val transferId = nextTransferId.getAndIncrement()
-        managerScope.launch {
-            runCatching {
-                LuksSession.withLease { volume ->
-                    importFileWithProgress(context, volume, parentPath, sourceUri, transferId)
-                }
-            }.onFailure { t ->
-                if (t !is CancellationException) {
-                    Trace.err(LuksException.GENERIC, "import")
+        val contentResolver = context.contentResolver
+        var queryName: String? = null
+        var querySize: Long = -1L
+
+        try {
+            contentResolver.query(sourceUri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (nameIdx != -1) queryName = cursor.getString(nameIdx)
+                    if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) querySize = cursor.getLong(sizeIdx)
                 }
             }
+        } catch (_: Throwable) {}
+
+        if (querySize < 0L) {
+            try {
+                contentResolver.openFileDescriptor(sourceUri, "r")?.use { pfd ->
+                    querySize = pfd.statSize
+                }
+            } catch (_: Throwable) {}
         }
+
+        val targetName = queryName
+            ?: sourceUri.lastPathSegment?.substringAfterLast('/')
+            ?: "imported_${System.currentTimeMillis()}"
+
+        val totalBytes = querySize
+
+        val queuedItem = TransferItem(
+            id = transferId,
+            name = targetName,
+            type = TransferType.IMPORT,
+            totalBytes = totalBytes,
+            transferredBytes = 0L,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            state = TransferState.QUEUED,
+            cancelToken = 0L,
+            error = null,
+        )
+        _transfers.update { listOf(queuedItem) + it }
+
+        val job = managerScope.launch {
+            try {
+                runCatching {
+                    transferMutex.withLock {
+                        if (isTransferCancelled(transferId)) return@withLock
+                        updateTransfer(transferId) { it.copy(state = TransferState.RUNNING) }
+                        LuksSession.withLease { volume ->
+                            importFileWithProgress(context, volume, parentPath, sourceUri, transferId)
+                        }
+                    }
+                }.onFailure { t ->
+                    if (t !is CancellationException) {
+                        Trace.err(LuksException.GENERIC, "import")
+                    }
+                }
+            } finally {
+                activeJobs.remove(transferId)
+            }
+        }
+        activeJobs[transferId] = job
         return transferId
     }
 
@@ -128,12 +207,38 @@ open class TransferController {
         onResult: (Result<LuksVolume.Digest>) -> Unit = {},
     ): Long {
         val transferId = nextTransferId.getAndIncrement()
-        managerScope.launch {
-            val result = runCatching {
-                LuksSession.withLease { volume -> hashFileWithProgress(volume, path, transferId) }
+        val fileName = path.substringAfterLast('/').ifEmpty { "hash_${System.currentTimeMillis()}" }
+        val queuedItem = TransferItem(
+            id = transferId,
+            name = fileName,
+            type = TransferType.HASH,
+            totalBytes = -1L,
+            transferredBytes = 0L,
+            speedBytesPerSec = 0L,
+            etaSeconds = 0L,
+            state = TransferState.QUEUED,
+            cancelToken = 0L,
+            error = null,
+        )
+        _transfers.update { listOf(queuedItem) + it }
+
+        val job = managerScope.launch {
+            val result = try {
+                runCatching {
+                    transferMutex.withLock {
+                        if (isTransferCancelled(transferId)) {
+                            throw CancellationException("Transfer cancelled")
+                        }
+                        updateTransfer(transferId) { it.copy(state = TransferState.RUNNING) }
+                        LuksSession.withLease { volume -> hashFileWithProgress(volume, path, transferId) }
+                    }
+                }
+            } finally {
+                activeJobs.remove(transferId)
             }
             onResult(result)
         }
+        activeJobs[transferId] = job
         return transferId
     }
 
@@ -142,7 +247,7 @@ open class TransferController {
 
     fun clearCompleted() {
         _transfers.update { list ->
-            list.filter { it.state == TransferState.RUNNING }
+            list.filter { it.state == TransferState.RUNNING || it.state == TransferState.QUEUED }
         }
     }
 
@@ -152,7 +257,7 @@ open class TransferController {
 
     fun removeTransfer(id: Long) {
         _transfers.update { list ->
-            list.filterNot { it.id == id && it.state != TransferState.RUNNING }
+            list.filterNot { it.id == id && it.state != TransferState.RUNNING && it.state != TransferState.QUEUED }
         }
     }
 
@@ -172,7 +277,7 @@ open class TransferController {
      */
     fun cancelTransfer(id: Long) {
         val item = _transfers.value.find { it.id == id } ?: return
-        if (item.state == TransferState.RUNNING) {
+        if (item.state == TransferState.RUNNING || item.state == TransferState.QUEUED) {
             if (item.cancelToken > 0L) {
                 try {
                     LuksNative.nativeCancelOperation(item.cancelToken)
@@ -223,7 +328,22 @@ open class TransferController {
             cancelToken = cancelToken,
             error = null,
         )
-        _transfers.update { listOf(initialItem) + it }
+        _transfers.update { list ->
+            if (list.any { it.id == transferId }) {
+                list.map {
+                    if (it.id == transferId) {
+                        it.copy(
+                            name = fileName,
+                            totalBytes = totalBytes,
+                            state = TransferState.RUNNING,
+                            cancelToken = cancelToken,
+                        )
+                    } else it
+                }
+            } else {
+                listOf(initialItem) + list
+            }
+        }
 
         activeJobs[transferId] = currentCoroutineContext().job
 
@@ -410,7 +530,22 @@ open class TransferController {
             cancelToken = cancelToken,
             error = null,
         )
-        _transfers.update { listOf(initialItem) + it }
+        _transfers.update { list ->
+            if (list.any { it.id == transferId }) {
+                list.map {
+                    if (it.id == transferId) {
+                        it.copy(
+                            name = targetName,
+                            totalBytes = totalBytes,
+                            state = TransferState.RUNNING,
+                            cancelToken = cancelToken,
+                        )
+                    } else it
+                }
+            } else {
+                listOf(initialItem) + list
+            }
+        }
 
         activeJobs[transferId] = currentCoroutineContext().job
 
@@ -582,7 +717,21 @@ open class TransferController {
             cancelToken = 0L,
             error = null,
         )
-        _transfers.update { listOf(initialItem) + it }
+        _transfers.update { list ->
+            if (list.any { it.id == transferId }) {
+                list.map {
+                    if (it.id == transferId) {
+                        it.copy(
+                            name = fileName,
+                            totalBytes = if (totalBytes >= 0L) totalBytes else it.totalBytes,
+                            state = TransferState.RUNNING,
+                        )
+                    } else it
+                }
+            } else {
+                listOf(initialItem) + list
+            }
+        }
         activeJobs[transferId] = currentCoroutineContext().job
 
         try {

@@ -41,8 +41,8 @@ fun TransfersScreen(
     onBack: (() -> Unit)? = null,
 ) {
     val transfers by manager.transfers.collectAsState()
-    val activeTransfers = transfers.filter { it.state == TransferState.RUNNING }
-    val completedTransfers = transfers.filter { it.state != TransferState.RUNNING }
+    val activeTransfers = transfers.filter { it.state == TransferState.RUNNING || it.state == TransferState.QUEUED }
+    val completedTransfers = transfers.filter { it.state != TransferState.RUNNING && it.state != TransferState.QUEUED }
 
     Column(
         modifier = modifier
@@ -171,54 +171,81 @@ private fun ActiveTransferCard(
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                TypeBadge(type = item.type)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TypeBadge(type = item.type)
+                    if (item.state == TransferState.QUEUED) {
+                        StateBadge(state = item.state)
+                    }
+                }
             }
 
-            val progress = if (item.totalBytes > 0) {
-                (item.transferredBytes.toFloat() / item.totalBytes.toFloat()).coerceIn(0f, 1f)
-            } else {
-                0f
-            }
-
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(8.dp),
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                val pct = (progress * 100).toInt()
+            if (item.state == TransferState.QUEUED) {
                 Text(
-                    text = "${formatSize(item.transferredBytes)} / ${formatSize(item.totalBytes)} ($pct%)",
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Text(
-                    text = formatSpeed(item.speedBytesPerSec),
-                    style = MaterialTheme.typography.bodySmall,
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    text = formatEta(item.etaSeconds),
-                    style = MaterialTheme.typography.bodySmall,
+                    text = "Waiting in queue...",
+                    style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                OutlinedButton(
-                    onClick = onCancel,
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error,
-                    ),
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("Cancel")
+                    OutlinedButton(
+                        onClick = onCancel,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text("Cancel")
+                    }
+                }
+            } else {
+                val progress = if (item.totalBytes > 0) {
+                    (item.transferredBytes.toFloat() / item.totalBytes.toFloat()).coerceIn(0f, 1f)
+                } else {
+                    0f
+                }
+
+                LinearProgressIndicator(
+                    progress = { progress },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(8.dp),
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    val pct = (progress * 100).toInt()
+                    Text(
+                        text = "${formatSize(item.transferredBytes)} / ${formatSize(item.totalBytes)} ($pct%)",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Text(
+                        text = formatSpeed(item.speedBytesPerSec),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = formatEta(item.etaSeconds),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(
+                        onClick = onCancel,
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = MaterialTheme.colorScheme.error,
+                        ),
+                    ) {
+                        Text("Cancel")
+                    }
                 }
             }
         }
@@ -327,6 +354,7 @@ private fun StateBadge(state: TransferState) {
     Surface(
         shape = MaterialTheme.shapes.extraSmall,
         color = when (state) {
+            TransferState.QUEUED -> MaterialTheme.colorScheme.secondaryContainer
             TransferState.COMPLETED -> MaterialTheme.colorScheme.primaryContainer
             TransferState.RUNNING -> MaterialTheme.colorScheme.surfaceVariant
             TransferState.CANCELLED -> MaterialTheme.colorScheme.surfaceVariant
@@ -335,6 +363,7 @@ private fun StateBadge(state: TransferState) {
     ) {
         Text(
             text = when (state) {
+                TransferState.QUEUED -> "Queued"
                 TransferState.COMPLETED -> "Completed"
                 TransferState.RUNNING -> "Running"
                 TransferState.CANCELLED -> "Cancelled"
@@ -343,6 +372,7 @@ private fun StateBadge(state: TransferState) {
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
             color = when (state) {
+                TransferState.QUEUED -> MaterialTheme.colorScheme.onSecondaryContainer
                 TransferState.COMPLETED -> MaterialTheme.colorScheme.onPrimaryContainer
                 TransferState.RUNNING -> MaterialTheme.colorScheme.onSurfaceVariant
                 TransferState.CANCELLED -> MaterialTheme.colorScheme.onSurfaceVariant
