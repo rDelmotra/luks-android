@@ -104,9 +104,11 @@ import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
 import dev.luksandroid.ui.components.NewFolderDialog
 import dev.luksandroid.ui.components.RenameDialog
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -491,12 +493,16 @@ fun BrowserScreen(
 
     // Fetch statFs
     fun refreshStatFs() {
+        if (!scope.isActive) return
         scope.launch {
             try {
                 statFsInfo = withContext(Dispatchers.IO) {
                     LuksSession.withLease { v -> v.statFs() }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Trace.err(-1, "statfs")
             }
         }
@@ -504,6 +510,7 @@ fun BrowserScreen(
 
     // Refresh directory entries & statFs
     fun loadDirectory(path: String) {
+        if (!scope.isActive) return
         isRefreshing = true
         scope.launch {
             try {
@@ -515,32 +522,49 @@ fun BrowserScreen(
                 isSlackLimitReached = false
 
                 // Pre-fetch metadata in background
-                scope.launch(Dispatchers.IO) {
-                    list.forEach { entry ->
-                        val itemPath = joinPath(path, entry.name)
-                        if (!itemDetails.containsKey(itemPath)) {
-                            try {
-                                val info = LuksSession.withLease { v -> v.fileInfo(itemPath) }
-                                withContext(Dispatchers.Main) {
-                                    itemDetails[itemPath] = info
+                if (scope.isActive) {
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            list.forEach { entry ->
+                                val itemPath = joinPath(path, entry.name)
+                                if (!itemDetails.containsKey(itemPath)) {
+                                    try {
+                                        val info = LuksSession.withLease { v -> v.fileInfo(itemPath) }
+                                        withContext(Dispatchers.Main) {
+                                            itemDetails[itemPath] = info
+                                        }
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (_: Exception) {}
                                 }
-                            } catch (_: Exception) {}
-                        }
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {}
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "list_dir")
-                scope.launch {
-                    snackbarHostState.showSnackbar("Cannot open folder: [${e.code}] ${e.message}")
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Cannot open folder: [${e.code}] ${e.message}")
+                    }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Trace.err(-1, "list_dir")
-                scope.launch {
-                    snackbarHostState.showSnackbar("Cannot open folder: ${e.message}")
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Cannot open folder: ${e.message}")
+                    }
                 }
             } finally {
                 isRefreshing = false
-                refreshStatFs()
+                if (scope.isActive) {
+                    refreshStatFs()
+                }
             }
         }
     }
@@ -638,6 +662,7 @@ fun BrowserScreen(
 
     // Create Directory
     fun handleCreateDirectory(name: String) {
+        if (!scope.isActive) return
         isCreatingFolder = true
         newFolderError = null
         scope.launch {
@@ -646,8 +671,14 @@ fun BrowserScreen(
                     LuksSession.withLease { v -> v.createDirectory(currentPath, name) }
                 }
                 showNewFolderDialog = false
-                snackbarHostState.showSnackbar("Folder \"$name\" created")
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Folder \"$name\" created")
+                    }
+                }
                 loadDirectory(currentPath)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "create_directory")
                 if (e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) {
@@ -655,6 +686,7 @@ fun BrowserScreen(
                 }
                 newFolderError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Trace.err(-1, "create_directory")
                 newFolderError = e.message ?: "Failed to create folder"
             } finally {
@@ -665,6 +697,7 @@ fun BrowserScreen(
 
     // Rename Item
     fun handleRename(item: BrowserItem, newName: String) {
+        if (!scope.isActive) return
         isRenaming = true
         renameError = null
         scope.launch {
@@ -675,12 +708,19 @@ fun BrowserScreen(
                     }
                 }
                 renamingItem = null
-                snackbarHostState.showSnackbar("Renamed to \"$newName\"")
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Renamed to \"$newName\"")
+                    }
+                }
                 loadDirectory(currentPath)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "rename")
                 renameError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Trace.err(-1, "rename")
                 renameError = e.message ?: "Failed to rename"
             } finally {
@@ -691,6 +731,7 @@ fun BrowserScreen(
 
     // Delete Item
     fun handleDelete(item: BrowserItem) {
+        if (!scope.isActive) return
         isDeleting = true
         deleteError = null
         scope.launch {
@@ -699,12 +740,19 @@ fun BrowserScreen(
                     LuksSession.withLease { v -> v.deleteFile(item.fullPath) }
                 }
                 deletingItem = null
-                snackbarHostState.showSnackbar("Deleted \"${item.name}\"")
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar("Deleted \"${item.name}\"")
+                    }
+                }
                 loadDirectory(currentPath)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "delete_file")
                 deleteError = "[${e.code}] ${e.message}"
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Trace.err(-1, "delete_file")
                 deleteError = e.message ?: "Failed to delete"
             } finally {
@@ -816,9 +864,18 @@ fun BrowserScreen(
 
                     OutlinedButton(
                         onClick = {
-                            scope.launch {
-                                onLockRequested()
-                                LuksSession.lock()
+                            if (scope.isActive) {
+                                scope.launch {
+                                    try {
+                                        onLockRequested()
+                                        LuksSession.lock()
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        if (e is CancellationException) throw e
+                                        Trace.err(-1, "lock")
+                                    }
+                                }
                             }
                         },
                         shape = RoundedCornerShape(8.dp),
