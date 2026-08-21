@@ -36,6 +36,16 @@ pub struct FreeSpaceMap {
     pub block_groups: Vec<BlockGroupFreeSpace>,
 }
 
+/// Whether a block group with the given `flags` can hold DATA extents —
+/// true for `BLOCK_GROUP_DATA` and for a genuinely MIXED
+/// (`BLOCK_GROUP_DATA | BLOCK_GROUP_METADATA`) block group.
+///
+/// A METADATA-only block group must return `false`: `flags` having the
+/// METADATA bit set is not, by itself, evidence of DATA capacity.
+pub fn bg_holds_data(flags: u64) -> bool {
+    flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0
+}
+
 impl FreeSpaceMap {
     /// Derive the free space map from the ground-truth extent tree.
     pub fn from_extent_tree(extent_tree: &ExtentTree) -> Result<Self> {
@@ -322,9 +332,7 @@ impl FreeSpaceMap {
 
         for (bg_idx, bg) in self.block_groups.iter().enumerate() {
             // Check for data or mixed block group
-            let is_data = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
-                || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
-                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+            let is_data = bg_holds_data(bg.block_group.flags);
 
             if !is_data {
                 continue;
@@ -418,9 +426,7 @@ impl FreeSpaceMap {
 
         for bg in &mut self.block_groups {
             // Check for data or mixed block group
-            let is_data = (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
-                || (bg.block_group.flags & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
-                    == (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA));
+            let is_data = bg_holds_data(bg.block_group.flags);
 
             if !is_data {
                 continue;
@@ -697,6 +703,33 @@ mod tests {
     use super::*;
     use crate::fs::btrfs::chunk::{BLOCK_GROUP_DATA, BLOCK_GROUP_METADATA};
     use crate::fs::btrfs::write::extent_tree::BlockGroupItem;
+
+    #[test]
+    fn bg_holds_data_rejects_metadata_only_block_group() {
+        // The predicate this fixed: a METADATA-only block group must not be
+        // treated as DATA-capable.
+        assert!(!bg_holds_data(BLOCK_GROUP_METADATA));
+
+        // Genuinely DATA and genuinely MIXED groups must still pass.
+        assert!(bg_holds_data(BLOCK_GROUP_DATA));
+        assert!(bg_holds_data(BLOCK_GROUP_DATA | BLOCK_GROUP_METADATA));
+
+        // Control: the expression `bg_holds_data` replaced (`file.rs:65-71`,
+        // `alloc.rs:325-327` before this fix) — `flags & DATA != 0 || flags &
+        // (DATA|METADATA) != 0` — is true for a METADATA-only block group
+        // because its second disjunct only checks "either bit set", not
+        // "both bits set". This asserts that old expression really did
+        // misclassify METADATA-only as data-capable, so the fix above is
+        // known to fail on a real regression rather than passing vacuously.
+        let old_buggy_is_data = |flags: u64| {
+            (flags & BLOCK_GROUP_DATA != 0)
+                || (flags & (BLOCK_GROUP_DATA | BLOCK_GROUP_METADATA) != 0)
+        };
+        assert!(
+            old_buggy_is_data(BLOCK_GROUP_METADATA),
+            "control failed: the old expression must misclassify METADATA-only as data-capable"
+        );
+    }
 
     fn create_test_data_bg(start: u64, length: u64, free_ranges: Vec<FreeRange>) -> BlockGroupFreeSpace {
         let total_free: u64 = free_ranges.iter().map(|r| r.length).sum();

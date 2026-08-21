@@ -62,13 +62,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let mut total_free_data: u64 = allocator
             .block_groups
             .iter()
-            .filter(|bg| {
-                (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
-                    || (bg.block_group.flags
-                        & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA
-                            | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
-                        != 0)
-            })
+            .filter(|bg| crate::fs::btrfs::write::alloc::bg_holds_data(bg.block_group.flags))
             .map(|bg| bg.total_free_bytes)
             .sum();
 
@@ -82,13 +76,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             total_free_data = allocator
                 .block_groups
                 .iter()
-                .filter(|bg| {
-                    (bg.block_group.flags & crate::fs::btrfs::chunk::BLOCK_GROUP_DATA != 0)
-                        || (bg.block_group.flags
-                            & (crate::fs::btrfs::chunk::BLOCK_GROUP_DATA
-                                | crate::fs::btrfs::chunk::BLOCK_GROUP_METADATA)
-                            != 0)
-                })
+                .filter(|bg| crate::fs::btrfs::write::alloc::bg_holds_data(bg.block_group.flags))
                 .map(|bg| bg.total_free_bytes)
                 .sum();
         }
