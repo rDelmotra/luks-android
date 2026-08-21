@@ -178,6 +178,31 @@ pub fn read_dev_extents<D: ReadAt>(fs: &Btrfs<D>, devid: u64) -> Result<Vec<(u64
 pub fn allocate_data_chunk_transaction<D: ReadAt>(
     fs: &Btrfs<D>,
 ) -> Result<(Transaction, Chunk)> {
+    allocate_data_chunk_transaction_excluding(fs, &[])
+}
+
+/// Same as [`allocate_data_chunk_transaction`], but additionally excludes
+/// `reserved` logical ranges from the allocator used for the DEV_TREE,
+/// CHUNK_TREE, and EXTENT_TREE CoW below.
+///
+/// `reserved` is a caller's set of already-decided-but-not-yet-committed
+/// data runs (e.g. `BtrfsFileWriter::data_runs`) that must not be handed out
+/// to this chunk's own metadata CoW: those bytes look free in the on-disk
+/// extent tree this function re-derives its allocator from, because the
+/// caller has only reserved them in its own in-memory allocator, not
+/// committed them. Without this exclusion, metadata blocks for this very
+/// chunk allocation can land inside a run the caller believes is reserved,
+/// which is discovered only when the caller replays `mark_allocated` against
+/// its own allocator and finds the range gone.
+///
+/// Exclusion, not `mark_allocated`, is deliberate: `mark_allocated` also
+/// bumps `total_allocated_bytes` / `block_group.used`, and `used` is written
+/// into the `BLOCK_GROUP_ITEM` this transaction commits — inflating it with
+/// bytes the caller hasn't committed yet would corrupt on-disk accounting.
+pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
+    fs: &Btrfs<D>,
+    reserved: &[(u64, u64)],
+) -> Result<(Transaction, Chunk)> {
     // 1. Refusal gates (§8)
     gate::check_writeable_fs(fs.superblock())?;
     gate::check_chunk_allocation_profile(BLOCK_GROUP_DATA)?;
@@ -226,6 +251,13 @@ pub fn allocate_data_chunk_transaction<D: ReadAt>(
     let new_generation = sb.generation + 1;
     let extent_tree = ExtentTree::read(fs)?;
     let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
+    if !reserved.is_empty() {
+        let reserved_ranges: Vec<std::ops::Range<u64>> = reserved
+            .iter()
+            .map(|&(start, len)| start..start.saturating_add(len))
+            .collect();
+        allocator.exclude_ranges(&reserved_ranges);
+    }
     let mut pending_blocks = HashMap::new();
     let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
     let mut blocks_to_remove = Vec::<(u64, u8)>::new();

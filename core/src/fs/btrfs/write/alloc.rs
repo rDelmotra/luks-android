@@ -996,6 +996,61 @@ mod tests {
         }
     }
 
+    /// Mirrors `test_exclude_ranges_prevents_allocation_on_mirror`, but for
+    /// the Bug B fix: on a MIXED (DATA|METADATA) block group, a writer's
+    /// reserved-but-uncommitted data run — excluded via `exclude_ranges`
+    /// exactly as `chunk_alloc::allocate_data_chunk_transaction_excluding`
+    /// does before its DEV_TREE/CHUNK_TREE/EXTENT_TREE CoW — must never be
+    /// handed back out by `allocate_metadata`, since both draw from the same
+    /// `free_ranges` pool on a combined block group.
+    #[test]
+    fn test_exclude_ranges_prevents_metadata_landing_in_reserved_data_run_on_mixed_bg() {
+        let mut bg = create_test_data_bg(
+            10_000_000,
+            20_000_000,
+            vec![FreeRange {
+                start: 10_000_000,
+                length: 20_000_000, // 10_000_000..30_000_000
+            }],
+        );
+        bg.block_group.flags = BLOCK_GROUP_DATA | BLOCK_GROUP_METADATA;
+
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        // A writer has already chosen (but not committed) a 1 MiB data run
+        // in the middle of the free range.
+        let reserved_start = 15_000_000u64;
+        let reserved_len = 1_048_576u64;
+        map.exclude_ranges(&[reserved_start..reserved_start + reserved_len]);
+
+        assert_eq!(
+            map.block_groups[0].free_ranges,
+            vec![
+                FreeRange {
+                    start: 10_000_000,
+                    length: reserved_start - 10_000_000,
+                },
+                FreeRange {
+                    start: reserved_start + reserved_len,
+                    length: 30_000_000 - (reserved_start + reserved_len),
+                },
+            ]
+        );
+
+        // Metadata allocation must never touch the reserved run, all the
+        // way to exhaustion of what remains.
+        while let Ok(bytenr) = map.allocate_metadata(4096) {
+            assert!(
+                bytenr + 4096 <= reserved_start || bytenr >= reserved_start + reserved_len,
+                "metadata allocation {bytenr:#x} must not land inside the writer's \
+                 reserved data run [{reserved_start:#x}, {:#x})",
+                reserved_start + reserved_len
+            );
+        }
+    }
+
     #[test]
     fn test_mark_allocated() {
         let bg = create_test_data_bg(

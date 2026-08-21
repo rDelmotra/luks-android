@@ -160,7 +160,15 @@ impl<D: WriteAt> Btrfs<D> {
     /// Allocate a new single DATA chunk, commit the transaction,
     /// and return the new logical start address.
     pub fn allocate_data_chunk(&mut self) -> Result<u64> {
-        let (txn, new_chunk) = Transaction::allocate_data_chunk(self)?;
+        self.allocate_data_chunk_excluding(&[])
+    }
+
+    /// Same as [`Btrfs::allocate_data_chunk`], but excludes `reserved`
+    /// logical ranges (a writer's already-decided-but-uncommitted data
+    /// runs) from the allocator used for this chunk's own metadata CoW, so
+    /// the new metadata blocks cannot land inside them.
+    pub(crate) fn allocate_data_chunk_excluding(&mut self, reserved: &[(u64, u64)]) -> Result<u64> {
+        let (txn, new_chunk) = Transaction::allocate_data_chunk_excluding(self, reserved)?;
         self.chunks.insert(new_chunk.clone());
         let logical = new_chunk.logical;
         commit_transaction(self, txn)?;

@@ -67,7 +67,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             .sum();
 
         while total_free_data < disk_num_bytes {
-            self.allocate_data_chunk()?;
+            self.allocate_data_chunk_excluding(&[])?;
             let extent_tree = ExtentTree::read(self)?;
             allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
                 &extent_tree,
@@ -91,7 +91,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     allocated += chunk_len;
                 }
                 Err(LuksError::FilesystemFull) => {
-                    self.allocate_data_chunk()?;
+                    self.allocate_data_chunk_excluding(&data_runs)?;
                     let extent_tree = ExtentTree::read(self)?;
                     allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
                         &extent_tree,
@@ -160,7 +160,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                             allocated_new += chunk_len;
                         }
                         Err(LuksError::FilesystemFull) => {
-                            self.allocate_data_chunk()?;
+                            self.allocate_data_chunk_excluding(&writer.data_runs)?;
                             let extent_tree = ExtentTree::read(self)?;
                             writer.allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
                                 &extent_tree,
