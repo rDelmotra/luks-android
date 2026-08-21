@@ -1,6 +1,11 @@
 package dev.luksandroid.ui.devices
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbManager
+import android.os.Build
 import android.text.Editable
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
@@ -108,7 +113,7 @@ fun DevicesScreen(
     var isScanning by remember { mutableStateOf(false) }
 
     fun keyOf(target: UsbMassStorage.Target) =
-        "${target.device.vendorId}:${target.device.productId}:${target.usbInterface.id}"
+        "${target.device.deviceId}:${target.device.vendorId}:${target.device.productId}:${target.usbInterface.id}"
 
     // Re-opens a target whose USB permission is already granted, marking it Opening in
     // the meantime. Shared by the initial scan and by stale-handle recovery below, so
@@ -129,6 +134,11 @@ fun DevicesScreen(
                 UsbMassStorage.findTargets(context)
             }
             targets = list
+            // Clean up stale device entries for devices no longer present or already closed
+            val validKeys = list.map { keyOf(it) }.toSet()
+            deviceStates = deviceStates.filter { (k, v) ->
+                k in validKeys && (v !is DeviceItemState.Opened || v.device.isOpen)
+            }
             // Auto-open devices that already have permissions granted
             list.forEach { target ->
                 val key = keyOf(target)
@@ -147,27 +157,48 @@ fun DevicesScreen(
         scanDevices()
     }
 
+    DisposableEffect(context) {
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                val action = intent.action
+                if (action == UsbManager.ACTION_USB_DEVICE_ATTACHED ||
+                    action == UsbManager.ACTION_USB_DEVICE_DETACHED
+                ) {
+                    scanDevices()
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            context.registerReceiver(receiver, filter)
+        }
+        onDispose {
+            runCatching { context.unregisterReceiver(receiver) }
+        }
+    }
+
     // A lock — automatic (idle timeout, trim) or manual (the Lock button) — tears down
     // the exact LuksDevice instance the UI is still holding in `deviceStates`: closing it
     // zeroes the native handle AND releases the USB interface underneath it. Without this,
     // the cached `Opened(device)` entry looks fine to the UI but every native call on it
     // (including a fresh unlock attempt) throws `IllegalStateException` instantly, and the
-    // only way out was force-stopping the app. Once the session reports Locked, drop any
-    // device entries whose handle is no longer open and transparently re-acquire them —
-    // permission is already granted, so this is just re-reading the partition table.
+    // only way out was force-stopping the app. Once the session reports Locked or Detached, drop any
+    // device entries whose handle is no longer open and transparently re-acquire them.
     LaunchedEffect(sessionState) {
-        if (sessionState is SessionState.Locked) {
+        if (sessionState is SessionState.Locked || sessionState is SessionState.Detached) {
             val staleKeys = deviceStates.filterValues {
                 it is DeviceItemState.Opened && !it.device.isOpen
             }.keys
             if (staleKeys.isNotEmpty()) {
                 deviceStates = deviceStates - staleKeys
-                targets.forEach { target ->
-                    if (keyOf(target) in staleKeys && UsbMassStorage.hasPermission(context, target.device)) {
-                        reopenTarget(target)
-                    }
-                }
             }
+            scanDevices()
         }
     }
 
