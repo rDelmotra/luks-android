@@ -2,7 +2,7 @@ package dev.luksandroid.security
 
 import android.text.Editable
 import android.text.SpannableStringBuilder
-import android.util.Log
+import dev.luksandroid.Trace
 import java.lang.reflect.Field
 import java.nio.ByteBuffer
 import java.nio.CharBuffer
@@ -23,7 +23,7 @@ object PassphraseScrubber {
 
     private fun degrade(what: String, t: Throwable) {
         degradedScrub = true
-        Log.w(TAG, "mitigation unavailable: $what", t)
+        Trace.e(TAG, "mitigation unavailable: $what (${Trace.throwableSummary(t)})")
     }
 
     private val mTextField: Field? = runCatching {
