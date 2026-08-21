@@ -1,12 +1,9 @@
 //! Free-space tracking and allocation derived from the btrfs extent tree.
 //!
-//! Because this implementation skips maintaining the redundant `FREE_SPACE_TREE`
-//! on write (clearing `FREE_SPACE_TREE_VALID` to let Linux rebuild it), the
-//! ground truth for all free space is computed directly from the `ExtentTree`.
-//!
-//! In this pass (Pass B), we compute the free-space map from the extent tree
-//! and cross-check it against the filesystem's `FREE_SPACE_TREE` to prove exact
-//! parity between our derived view and the kernel's index.
+//! Ground truth for free space is derived from the `ExtentTree` and chunk map,
+//! with exclusions applied for superblock mirrors (64 KiB, 64 MiB, 256 GiB).
+//! The derived allocations are actively emitted to the `FREE_SPACE_TREE`
+//! during commit to maintain full parity with the Linux kernel.
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
