@@ -28,6 +28,19 @@ impl VolumeHandle {
         }
     }
 
+    /// Begin an unknown-size file transfer. Unlike `begin_file`, no upfront
+    /// size is required — extents are allocated as chunks arrive in
+    /// `write_chunk`. The returned state has no volume reference, so storing
+    /// it in a JNI handle cannot prolong key lifetime.
+    pub fn begin_file_streaming(&self) -> Result<crate::bridge::FileWriterEnum> {
+        let mut fs = self.fs_for_writing()?;
+        self.claim_writer()?;
+        match &mut *fs {
+            Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file_streaming()?)),
+            Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file_streaming()?)),
+        }
+    }
+
     pub fn write_file_chunk_with_cancel(
         &self,
         writer: &mut crate::bridge::FileWriterEnum,

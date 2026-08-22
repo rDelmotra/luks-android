@@ -693,6 +693,26 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
 
 #[cfg(feature = "dangerous-write-support")]
 #[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFileStreaming<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let writer = vol.begin_file_streaming()?;
+        Ok(bridge::into_raw(bridge::Payload::Writer(
+            bridge::WriterHandle {
+                volume_handle: volume,
+                volume_id: vol.id,
+                writer: std::sync::Mutex::new(Some(writer)),
+            },
+        )))
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
