@@ -1821,7 +1821,10 @@ fn a_single_corrupted_byte_of_file_data_is_caught() {
     let at = physical as usize + 1234;
     image[at] ^= 0x01;
 
-    let corrupt = std::env::temp_dir().join("luks-btrfs-corrupt.img");
+    // Suffixed by pid: two concurrent `cargo test` runs would otherwise race on
+    // one path, and this test deletes it on the way out.
+    let corrupt = std::env::temp_dir()
+        .join(format!("luks-btrfs-corrupt-{}.img", std::process::id()));
     std::fs::write(&corrupt, &image).unwrap();
 
     let fs = Btrfs::mount(FileDevice::open(&corrupt).unwrap()).expect("still mounts");
