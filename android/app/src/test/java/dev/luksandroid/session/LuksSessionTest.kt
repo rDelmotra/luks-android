@@ -1,6 +1,7 @@
 package dev.luksandroid.session
 
 import dev.luksandroid.Entry
+import dev.luksandroid.LuksException
 import dev.luksandroid.PartitionInfo
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -15,6 +16,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -196,6 +198,91 @@ class LuksSessionTest {
         // Reset transitions back to Locked
         session.reset()
         assertEquals(SessionState.Locked, session.state.value)
+    }
+
+    /**
+     * A `CorruptFs` surfacing from a *read* must fail that one read and leave the
+     * session unlocked.
+     *
+     * Regression test. `isFatalWritePoison` used to substring-match "corrupt",
+     * "poison" and "panic" against the exception message, so a read returning
+     * `CorruptFs("btrfs node has no items")` -- raised by `Cursor::retreat_leaf`
+     * while merely listing a btrfs volume through SAF -- tore the whole session
+     * down and reported it to the user as "Write poison". Browsing the drive in a
+     * file manager therefore locked them out of it, and the message named a cause
+     * ("write") that had not happened.
+     */
+    @Test
+    fun testReadSideCorruptFsDoesNotPoisonTheSession() = runBlocking {
+        session.startUnlockedForTest()
+
+        try {
+            session.withLease {
+                throw LuksException(
+                    "corrupt filesystem structure: btrfs node has no items",
+                    LuksException.CORRUPT,
+                )
+            }
+            fail("Expected the CorruptFs to propagate to the caller")
+        } catch (e: LuksException) {
+            assertEquals(LuksException.CORRUPT, e.code)
+        }
+
+        assertTrue(
+            "A read-side CorruptFs must not move the session out of Unlocked, " +
+                "state was ${session.state.value}",
+            session.state.value is SessionState.Unlocked,
+        )
+        // ...and the volume must still be usable.
+        assertEquals(7, session.withLease { 7 })
+    }
+
+    /** The one code that genuinely does invalidate the volume still tears it down. */
+    @Test
+    fun testMutexPoisonedFromNativeStillPoisonsTheSession() = runBlocking {
+        session.startUnlockedForTest()
+
+        try {
+            session.withLease {
+                throw LuksException("write mutex poisoned", LuksException.MUTEX_POISONED)
+            }
+            fail("Expected the poison to propagate")
+        } catch (e: LuksException) {
+            assertEquals(LuksException.MUTEX_POISONED, e.code)
+        }
+
+        assertTrue(
+            "MUTEX_POISONED must move the session to Failed, state was ${session.state.value}",
+            session.state.value is SessionState.Failed,
+        )
+    }
+
+    /**
+     * A refusal handed to a third-party app must not name anything inside the volume.
+     *
+     * `withLease` used to interpolate the whole `SessionState` into its refusal
+     * ("current state: $s"). `Failed`/`Detached` carry a free-text message that
+     * routinely quotes a native error naming a path on the encrypted volume, so a
+     * SAF caller that was just *denied* access got a plaintext filename from it.
+     */
+    @Test
+    fun testWithLeaseRefusalDoesNotLeakVolumeContentsFromTheFailureMessage() = runBlocking {
+        session.startUnlockedForTest()
+        session.onWritePoison("Internal native error at /private/passwords_database.kdbx")
+
+        val message = try {
+            session.withLease { }
+            fail("Expected IllegalStateException once the session is Failed")
+            return@runBlocking
+        } catch (e: IllegalStateException) {
+            e.message.orEmpty()
+        }
+
+        assertFalse(
+            "Refusal leaked a volume path: $message",
+            message.contains("passwords_database") || message.contains("/private"),
+        )
+        assertTrue("Refusal should still say it was refused", message.contains("not unlocked"))
     }
 
     /**

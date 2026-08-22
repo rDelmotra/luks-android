@@ -150,7 +150,16 @@ open class SessionController(
             }
             val s = _state.value
             if (s !is SessionState.Unlocked) {
-                throw IllegalStateException("Session is not unlocked (current state: $s)")
+                // The state's *type*, never the state itself. `Failed` and `Detached`
+                // carry a free-text message that may quote a native error, and those
+                // routinely name a path inside the encrypted volume ("... at
+                // /private/passwords_database.kdbx"). This exception is handed to
+                // whichever third-party app made the SAF call, so interpolating "$s"
+                // published plaintext filenames from a locked volume to an app that
+                // was just refused access to it. Callers that legitimately need the
+                // reason read `state` directly; a refusal only needs to say it was
+                // refused.
+                throw IllegalStateException("Session is not unlocked (state: ${s::class.simpleName})")
             }
             val v = volume ?: s.volume
             _activeLeases.update { it + 1 }
@@ -378,9 +387,27 @@ open class SessionController(
         }
     }
 
+    /**
+     * Whether [t] means the native volume lock is poisoned and no further
+     * operation on this volume can be trusted.
+     *
+     * Matches on the error *code*, never on the message text. An earlier
+     * version substring-matched "poison", "panic" and "corrupt" against
+     * `t.message`, which tore the whole session down on a read that returned
+     * `CorruptFs` — code [LuksException.CORRUPT], from
+     * `Cursor::retreat_leaf`, raised while merely *listing* a btrfs volume
+     * through SAF. Browsing the drive in a file manager therefore killed the
+     * session and reported it as "Write poison", which was false twice over:
+     * nothing had been written, and nothing was poisoned. A corrupt structure
+     * found during a read is a failure of that one operation.
+     *
+     * Only [LuksException.MUTEX_POISONED] (a previous write panicked while
+     * holding the lock) and [LuksException.PANIC] genuinely invalidate the
+     * volume, and both arrive as codes rather than prose.
+     */
     private fun isFatalWritePoison(t: Throwable): Boolean {
-        val msg = t.message?.lowercase() ?: ""
-        return msg.contains("poison") || msg.contains("panic") || msg.contains("corrupt")
+        val e = t as? LuksException ?: return false
+        return e.code == LuksException.MUTEX_POISONED || e.code == LuksException.PANIC
     }
 }
 
