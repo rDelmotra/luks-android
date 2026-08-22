@@ -81,6 +81,16 @@ class LuksDocumentsProviderTest {
         var throwOnListDir: LuksException? = null
         var throwOnFileInfo: LuksException? = null
 
+        /**
+         * Overridable seam for `nativeWriteSupported()`. Defaults to false, matching the
+         * common case (a build without dangerous-write-support) and keeping every test that
+         * doesn't opt in exercising the fail-closed path -- calling the real native function
+         * in a host JVM test throws UnsatisfiedLinkError, which is exactly what this seam
+         * exists to avoid.
+         */
+        var writeSupported: Boolean = false
+        override val canWrite: Boolean get() = writeSupported
+
         override fun listDir(path: String): List<Entry> {
             throwOnListDir?.let { throw it }
             return entriesMap[path] ?: emptyList()
@@ -423,13 +433,16 @@ class LuksDocumentsProviderTest {
     }
 
     /**
-     * Test Pass M.5 (superseded by §6.2 read-only trim): the provider must never advertise
-     * a write capability it cannot deliver. createDocument always refuses, and openDocument
-     * refuses any write-capable mode cleanly (without touching the volume), while "r" is
-     * still accepted past the guard.
+     * Test Pass M.5: the provider must never advertise or act on a write capability the
+     * loaded .so cannot deliver. With `writeSupported` false (the fake's default, matching
+     * a build without dangerous-write-support), createDocument refuses both kinds and
+     * openDocument refuses every write-capable mode cleanly, without touching the volume,
+     * while "r" is still accepted past the guard.
      */
     @Test
-    fun testM5_readOnlyTrim_createDocumentAndWriteModeOpenDocumentRefuseCleanly() {
+    fun testM5_writeSupportAbsent_createDocumentAndWriteModeOpenDocumentRefuseCleanly() {
+        assertFalse("this test covers the fail-closed path", testVolume.writeSupported)
+
         // 1. createDocument for a directory must refuse.
         try {
             provider.createDocument("/", Document.MIME_TYPE_DIR, "MyFolder")
@@ -471,6 +484,100 @@ class LuksDocumentsProviderTest {
         } catch (e: Throwable) {
             // Success: got past the guard, failed for an unrelated (environment) reason.
         }
+    }
+
+    /**
+     * With write support built in, createDocument creates a directory for real and
+     * immediately: directories have a create-empty primitive (nativeCreateDirectory), unlike
+     * files. Creating a file is still refused, because the deferred pending-document path it
+     * needs does not exist yet -- and it must say so rather than fail obscurely.
+     */
+    @Test
+    fun testCreateDocument_withWriteSupport_createsDirectoryForRealAndStillRefusesFiles() {
+        testVolume.writeSupported = true
+
+        val docId = provider.createDocument("/", Document.MIME_TYPE_DIR, "MyFolder")
+
+        assertEquals("/MyFolder", docId)
+        assertEquals(listOf("/" to "MyFolder"), testVolume.createdDirectories)
+
+        // Nested parent: the documentId must not end up with a doubled separator.
+        val nested = provider.createDocument("/MyFolder", Document.MIME_TYPE_DIR, "Inner")
+        assertEquals("/MyFolder/Inner", nested)
+
+        // Files have no create-empty primitive yet, so they must still refuse -- and for a
+        // different, honest reason than "the volume is read-only".
+        try {
+            provider.createDocument("/", "text/plain", "notes.txt")
+            fail("Expected UnsupportedOperationException creating a file")
+        } catch (e: UnsupportedOperationException) {
+            // Success
+        }
+        assertTrue(testVolume.writtenFiles.isEmpty())
+    }
+
+    /**
+     * A display name that would escape its parent, or name no document at all, must be
+     * rejected before any volume call -- a documentId is a path here, so "../x" or "a/b"
+     * would silently write outside the intended directory.
+     */
+    @Test
+    fun testCreateDocument_rejectsInvalidDisplayNamesBeforeTouchingTheVolume() {
+        testVolume.writeSupported = true
+
+        for (bad in listOf("", "   ", "a/b", ".", "..")) {
+            try {
+                provider.createDocument("/", Document.MIME_TYPE_DIR, bad)
+                fail("Expected IllegalArgumentException for display name \"$bad\"")
+            } catch (e: IllegalArgumentException) {
+                // Success
+            }
+        }
+        assertTrue(testVolume.createdDirectories.isEmpty())
+    }
+
+    /**
+     * Create flags track the build, not wishful thinking: they appear only when the loaded
+     * .so links the write path, so a read-only build never advertises create support a file
+     * manager would then fail to use.
+     */
+    @Test
+    fun testCreateFlags_areAdvertisedOnlyWhenWriteSupportIsBuiltIn() {
+        testVolume.entriesMap["/"] = listOf(Entry("Documents", "dir"))
+        // The fake reports a path as a directory only when it is itself a listing key.
+        testVolume.entriesMap["/Documents"] = emptyList()
+
+        // Write support absent -> no create flags anywhere.
+        val rootsOff = provider.queryRoots(null)
+        assertTrue(rootsOff.moveToFirst())
+        val rootFlagsOff = rootsOff.getInt(rootsOff.getColumnIndexOrThrow(Root.COLUMN_FLAGS))
+        assertFalse(rootFlagsOff and Root.FLAG_SUPPORTS_CREATE != 0)
+
+        val dirOff = provider.queryDocument("/Documents", null)
+        assertTrue(dirOff.moveToFirst())
+        val dirFlagsOff = dirOff.getInt(dirOff.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertFalse(dirFlagsOff and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
+
+        // Write support present -> create flags appear, on the root and on directories.
+        testVolume.writeSupported = true
+
+        val rootsOn = provider.queryRoots(null)
+        assertTrue(rootsOn.moveToFirst())
+        val rootFlagsOn = rootsOn.getInt(rootsOn.getColumnIndexOrThrow(Root.COLUMN_FLAGS))
+        assertTrue(rootFlagsOn and Root.FLAG_SUPPORTS_CREATE != 0)
+
+        val dirOn = provider.queryDocument("/Documents", null)
+        assertTrue(dirOn.moveToFirst())
+        val dirFlagsOn = dirOn.getInt(dirOn.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(dirFlagsOn and Document.FLAG_DIR_SUPPORTS_CREATE != 0)
+
+        // A regular file must never gain FLAG_SUPPORTS_WRITE: overwriting an existing file
+        // is out of scope, and advertising it would invite writes that cannot be served.
+        testVolume.entriesMap["/"] = listOf(Entry("photo.jpg", "file"))
+        val fileOn = provider.queryDocument("/photo.jpg", null)
+        assertTrue(fileOn.moveToFirst())
+        val fileFlagsOn = fileOn.getInt(fileOn.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertFalse(fileFlagsOn and Document.FLAG_SUPPORTS_WRITE != 0)
     }
 
     /**
