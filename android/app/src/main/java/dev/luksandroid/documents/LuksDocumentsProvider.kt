@@ -136,6 +136,9 @@ open class LuksDocumentsProvider(
                         state is SessionState.Failed
                     ) {
                         revokeAllIssuedGrants()
+                        // Pending (not-yet-materialized) documents reference a volume session
+                        // that no longer exists past this transition -- see PendingDocuments.
+                        PendingDocuments.clear()
                     }
                 }
             }
