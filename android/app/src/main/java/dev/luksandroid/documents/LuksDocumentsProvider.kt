@@ -67,6 +67,29 @@ open class LuksDocumentsProvider(
 
         private val VALID_MODES = setOf("r", "w", "wt", "wa", "rw", "rwt")
 
+        /**
+         * The access constant [openDocument] hands to `openProxyFileDescriptor` for [openMode].
+         *
+         * NOT [ParcelFileDescriptor.parseMode]. `openProxyFileDescriptor` accepts exactly one
+         * of `MODE_READ_ONLY` / `MODE_WRITE_ONLY` / `MODE_READ_WRITE` and throws
+         * `IllegalArgumentException` on any other bit pattern -- there is no file for
+         * `MODE_CREATE` or `MODE_TRUNCATE` to act on, the callback *is* the file.
+         *
+         * `parseMode("w")` returns `MODE_WRITE_ONLY or MODE_CREATE or MODE_TRUNCATE`, so
+         * passing it through meant every write-mode open threw before the proxy was ever
+         * constructed, reaching the caller as `ContentResolver.openFileDescriptor()` returning
+         * null -- which reads as "the provider has no write support" rather than as a bad
+         * argument. `parseMode("r")` happens to return a bare `MODE_READ_ONLY`, so reads
+         * worked and hid it: on device, browsing and deleting worked while every copy-in
+         * failed. Only r/w/wt reach here; [openDocument] refuses the rest.
+         */
+        internal fun proxyAccessMode(openMode: String): Int =
+            if (openMode == "r") {
+                ParcelFileDescriptor.MODE_READ_ONLY
+            } else {
+                ParcelFileDescriptor.MODE_WRITE_ONLY
+            }
+
         fun mapLuksException(e: LuksException): Throwable = when (e.code) {
             LuksException.NOT_FOUND -> FileNotFoundException("Document not found")
             LuksException.ALREADY_EXISTS -> IllegalStateException("Item already exists")
@@ -416,11 +439,10 @@ open class LuksDocumentsProvider(
             Trace.i("LuksDocumentsProvider: openDocument cancelled")
         }
 
-        val parsedMode = ParcelFileDescriptor.parseMode(openMode)
         val callback = LuksProxyCallback(docId, openMode, ctx, session)
 
         return storageManager.openProxyFileDescriptor(
-            parsedMode,
+            proxyAccessMode(openMode),
             callback,
             LuksProxyHandlerThread.handler
         )

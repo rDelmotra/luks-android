@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ProviderInfo
 import android.database.Cursor
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
@@ -827,5 +828,47 @@ class LuksDocumentsProviderTest {
         // is expected on the Detached transition too.
         assertEquals(1, testContext.revokedUris.size)
         assertEquals(0.inv(), testContext.revokedUris[0].second)
+    }
+
+    /**
+     * The mode handed to `openProxyFileDescriptor` must be a bare access constant.
+     *
+     * Regression test. `openDocument` passed `ParcelFileDescriptor.parseMode(openMode)`
+     * straight through, and `parseMode("w")` is
+     * `MODE_WRITE_ONLY or MODE_CREATE or MODE_TRUNCATE`. `openProxyFileDescriptor` accepts
+     * only one of the three bare access constants and throws IllegalArgumentException on
+     * anything else, so every write-mode open died before the proxy existed and the caller
+     * saw `ContentResolver.openFileDescriptor()` return null. On device that read as
+     * "no write support": folder create and delete worked (neither opens a descriptor),
+     * browsing worked (`parseMode("r")` is already a bare MODE_READ_ONLY), and every
+     * copy-into-the-volume failed.
+     *
+     * Asserting the exact constants rather than "not parseMode" is deliberate: it pins the
+     * one property `openProxyFileDescriptor` actually enforces.
+     */
+    @Test
+    fun testOpenDocumentUsesBareAccessModeForTheProxyDescriptor() {
+        assertEquals(
+            ParcelFileDescriptor.MODE_READ_ONLY,
+            LuksDocumentsProvider.proxyAccessMode("r"),
+        )
+        for (writeMode in listOf("w", "wt")) {
+            assertEquals(
+                "mode $writeMode must map to a bare MODE_WRITE_ONLY",
+                ParcelFileDescriptor.MODE_WRITE_ONLY,
+                LuksDocumentsProvider.proxyAccessMode(writeMode),
+            )
+        }
+
+        // The bits that must never be set: openProxyFileDescriptor rejects the whole value
+        // if either is present, and neither means anything when the callback is the file.
+        val forbidden = ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
+        for (mode in listOf("r", "w", "wt")) {
+            assertEquals(
+                "mode $mode leaked MODE_CREATE/MODE_TRUNCATE into the proxy mode",
+                0,
+                LuksDocumentsProvider.proxyAccessMode(mode) and forbidden,
+            )
+        }
     }
 }
