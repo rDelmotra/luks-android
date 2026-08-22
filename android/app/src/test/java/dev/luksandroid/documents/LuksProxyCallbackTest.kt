@@ -190,6 +190,38 @@ class LuksProxyCallbackTest {
         assertEquals(256L, size)
     }
 
+    /**
+     * A write proxy's [LuksProxyCallback.onGetSize] must never consult the volume.
+     *
+     * Regression test for the failure that made every create-a-file and every
+     * copy-into-the-volume fail on device while reads, mkdir and delete worked.
+     *
+     * FUSE calls onGetSize for getattr, which happens on *open* -- before any byte is
+     * written. The document a write proxy serves is still pending by construction, so
+     * asking the volume returned NOT_FOUND, and throwing it made the open itself fail.
+     * That surfaced to the caller as ContentResolver.openFileDescriptor() returning null
+     * with no exception, which reads as "this provider cannot write" rather than as a
+     * stat of a not-yet-materialized file.
+     *
+     * The fake volume is left deliberately empty here: the pending document has no entry,
+     * exactly as on device.
+     */
+    @Test
+    fun testWrite_onGetSizeOnAPendingDocumentReportsZeroWithoutTouchingTheVolume() {
+        val docId = PendingDocuments.register("/", "brand-new.txt")
+        assertTrue(testVolume.fileInfoMap.isEmpty())
+        // Make any volume lookup fail loudly, so "returns 0" cannot pass by accident.
+        testVolume.throwOnFileInfo = RuntimeException("onGetSize must not reach the volume")
+
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        assertEquals(
+            "a pending document has zero bytes until something is written",
+            0L,
+            callback.onGetSize(),
+        )
+    }
+
     @Test
     fun testM2_onGetSize_throwsEioWhenSessionDead() = runBlocking {
         testVolume.fileDataMap["/sample.txt"] = ByteArray(256)

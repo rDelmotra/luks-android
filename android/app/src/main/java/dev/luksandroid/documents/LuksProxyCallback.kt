@@ -53,6 +53,22 @@ open class LuksProxyCallback(
     private var writeLockHeld: Boolean = false
 
     override fun onGetSize(): Long {
+        // A write-mode proxy answers from the write cursor, never from the volume.
+        //
+        // FUSE calls this for getattr, which happens on *open* -- before a single byte is
+        // written, and regardless of mode. The document a write proxy serves is by
+        // definition still pending (see the class doc), so asking the volume for it returns
+        // NOT_FOUND; throwing that made the open itself fail, which reaches the caller as
+        // ContentResolver.openFileDescriptor() returning null with no exception to explain
+        // it. On device that meant every create-a-file and every copy-into-the-volume died
+        // at open with "returned null", while reads, mkdir and delete were unaffected.
+        //
+        // Zero before the first write is the honest answer: that is exactly how many bytes
+        // this document has. After that, the running total is what a stat mid-write should
+        // report.
+        if (mode == "w" || mode == "wt") {
+            return expectedNextOffset
+        }
         return try {
             runBlocking {
                 session.withLease { volume ->
