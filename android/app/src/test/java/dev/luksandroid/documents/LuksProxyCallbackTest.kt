@@ -421,7 +421,22 @@ class LuksProxyCallbackTest {
 
         assertTrue(testVolume.writtenFiles.isEmpty())
         assertTrue(testVolume.abandonedWriters.isEmpty())
-        // Nothing happened either way -- the pending document is still available to open again.
+        // The registration is dropped rather than left open for a second attempt: a caller
+        // that created a document and closed it unwritten has abandoned it, and a surviving
+        // entry would keep queryDocument reporting a 0-byte file that never materializes --
+        // visible to the user as a real file they cannot open.
+        assertFalse(PendingDocuments.isPending(docId))
+    }
+
+    @Test
+    fun testWrite_readModeReleaseLeavesAnUnrelatedPendingDocumentAlone() {
+        // A read proxy never owns a pending entry, so closing one must not evict a document
+        // some other caller is still preparing to write.
+        val docId = PendingDocuments.register("/", "someone_elses.bin")
+        val readCallback = LuksReadProxyCallback(session = session, documentId = docId)
+
+        readCallback.onRelease()
+
         assertTrue(PendingDocuments.isPending(docId))
     }
 

@@ -183,7 +183,21 @@ open class LuksProxyCallback(
     }
 
     override fun onRelease() {
-        val activeWriter = writer ?: return
+        val activeWriter = writer
+        if (activeWriter == null) {
+            // A write-mode proxy that closed without a single byte written: the caller created
+            // a document and then abandoned it. Drop the registration, or the provider keeps
+            // synthesizing a 0-byte row for a document that will never exist until the session
+            // locks. Note this deliberately differs from the platform's FileSystemProvider,
+            // which would leave a real empty file behind -- materializing one here would mean
+            // claiming the native writer during a release path that does not otherwise hold
+            // it. Read-mode proxies leave the registry alone: they never owned the entry.
+            if (mode == "w" || mode == "wt") {
+                PendingDocuments.remove(documentId)
+            }
+            releaseWriteLockIfHeld()
+            return
+        }
         writer = null
         val pending = PendingDocuments.get(documentId)
         try {
