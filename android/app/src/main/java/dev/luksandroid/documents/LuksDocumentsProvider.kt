@@ -392,11 +392,9 @@ open class LuksDocumentsProvider(
 
             // Fail closed, same pattern as createDocument: a build without
             // dangerous-write-support must refuse here rather than reach a native symbol
-            // that does not exist in that .so.
-            val writeSupported = runCatching {
-                runBlocking { session.withLease { it.canWrite } }
-            }.getOrDefault(false)
-            if (!writeSupported) {
+            // that does not exist in that .so. Only a genuine `false` means that --
+            // exceptions propagate untouched, see the note in createDocument.
+            if (!runBlocking { session.withLease { it.canWrite } }) {
                 throw UnsupportedOperationException("Write support is not built into this app")
             }
 
@@ -444,10 +442,15 @@ open class LuksDocumentsProvider(
         // does not exist in that .so (UnsatisfiedLinkError, not a catchable LuksException).
         // volume.canWrite is the safe indirection onto nativeWriteSupported() -- see its
         // doc comment in LuksHandles.kt.
-        val writeSupported = runCatching {
-            runBlocking { session.withLease { it.canWrite } }
-        }.getOrDefault(false)
-        if (!writeSupported) {
+        //
+        // Only a `false` answer means write support is absent. This used to be wrapped in
+        // `runCatching { ... }.getOrDefault(false)`, which also caught the lease failing
+        // because the session was locked/failed/detached and reported *that* as a missing
+        // write build -- a flatly false message that hid a dead session behind a claim
+        // about how the app was compiled. Nothing here can throw UnsatisfiedLinkError
+        // anyway: `nativeWriteSupported` is compiled into both builds precisely so it can
+        // be asked (it returns the cfg flag), so there is no link error to swallow.
+        if (!runBlocking { session.withLease { it.canWrite } }) {
             throw UnsupportedOperationException("Write support is not built into this app")
         }
 

@@ -104,10 +104,17 @@ open class LuksProxyCallback(
         // Fail closed first, before touching the mutex or the volume: a build without
         // dangerous-write-support must refuse here rather than reach a native symbol that
         // does not exist in that .so (UnsatisfiedLinkError, not a catchable LuksException).
+        //
+        // EROFS is reserved for the one thing it actually means here -- this build cannot
+        // write at all. Anything else (most often the lease failing because the session is
+        // no longer unlocked) is EIO. Collapsing both into EROFS, as this used to, told the
+        // caller "read-only filesystem" for what was really a dead session, and left no
+        // trace to diagnose it from.
         val writeSupported = try {
             runBlocking { session.withLease { it.canWrite } }
         } catch (t: Throwable) {
-            false
+            Trace.e("LuksProxyCallback: write-support check failed: ${throwableSummary(t)}")
+            throw ErrnoException("pwrite", OsConstants.EIO)
         }
         if (!writeSupported) {
             throw ErrnoException("pwrite", OsConstants.EROFS)
