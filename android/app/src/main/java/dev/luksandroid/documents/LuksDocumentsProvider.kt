@@ -228,6 +228,30 @@ open class LuksDocumentsProvider(
         val cols = resolveColumns(projection, DEFAULT_DOCUMENT_PROJECTION)
         val result = MatrixCursor(cols)
 
+        val pending = if (docId != ROOT_DOCUMENT_ID) PendingDocuments.get(docId) else null
+        if (pending != null) {
+            // Synthesizes a 0-byte row for a document that exists only in the pending
+            // registry -- nothing has touched the volume yet (see the ARCHITECTURE note on
+            // createDocument). FLAG_SUPPORTS_WRITE is the one flag an existing on-disk file
+            // never gets (see the comment further down): overwrite is out of scope, but a
+            // still-pending document is exactly what a write-mode openDocument requires.
+            trackIssued(docId)
+            val rowValues = arrayOfNulls<Any>(cols.size)
+            for (i in cols.indices) {
+                rowValues[i] = when (cols[i]) {
+                    Document.COLUMN_DOCUMENT_ID -> docId
+                    Document.COLUMN_MIME_TYPE -> getMimeType(pending.name)
+                    Document.COLUMN_DISPLAY_NAME -> pending.name
+                    Document.COLUMN_LAST_MODIFIED -> 0L
+                    Document.COLUMN_FLAGS -> Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_DELETE
+                    Document.COLUMN_SIZE -> 0L
+                    else -> null
+                }
+            }
+            result.addRow(rowValues)
+            return result
+        }
+
         safeCall {
             runBlocking {
                 session.withLease { volume ->
@@ -258,8 +282,8 @@ open class LuksDocumentsProvider(
                         // FLAG_DIR_SUPPORTS_CREATE only when the .so actually links the write
                         // path (see queryRoots). FLAG_SUPPORTS_WRITE for an existing on-disk
                         // file is never advertised -- overwrite is out of scope (see
-                        // openDocument); it is only added for a still-pending document, in the
-                        // createDocument-added commit that follows this one.
+                        // openDocument); it is only ever set for a still-pending document,
+                        // handled in the branch above before this block is ever reached.
                         var flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
                         if (isDir && volume.canWrite) {
                             flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
@@ -357,12 +381,32 @@ open class LuksDocumentsProvider(
         if (openMode !in VALID_MODES) {
             throw IllegalArgumentException("Unsupported open mode")
         }
-        // Read-only trim (§6.2): refuse every write-capable mode cleanly and explicitly,
-        // rather than handing back a proxy whose writes are guaranteed to fail with EIO
-        // (the sized `beginFile(0)` writer rejects any write past size 0; the unknown-size
-        // primitive has no JNI/Kotlin surface to call instead).
+
         if (openMode != "r") {
-            throw UnsupportedOperationException("Write access is not supported")
+            // Only a streaming create-then-write can be served: "wa" (append), "rw" and
+            // "rwt" have no counterpart in an append-only, single-writer streaming
+            // primitive -- refuse them outright, distinctly from the two gates below.
+            if (openMode != "w" && openMode != "wt") {
+                throw UnsupportedOperationException("Append and read-write modes are not supported")
+            }
+
+            // Fail closed, same pattern as createDocument: a build without
+            // dangerous-write-support must refuse here rather than reach a native symbol
+            // that does not exist in that .so.
+            val writeSupported = runCatching {
+                runBlocking { session.withLease { it.canWrite } }
+            }.getOrDefault(false)
+            if (!writeSupported) {
+                throw UnsupportedOperationException("Write support is not built into this app")
+            }
+
+            // Overwrite is out of scope: a write-mode open is only ever served for a
+            // document this provider registered via createDocument and has not yet
+            // materialized. Everything else -- an existing on-disk file, an unknown id --
+            // is refused, distinctly from the write-support gate above.
+            if (!PendingDocuments.isPending(docId)) {
+                throw UnsupportedOperationException("Overwriting an existing file is not supported")
+            }
         }
 
         trackIssued(docId)
@@ -425,15 +469,25 @@ open class LuksDocumentsProvider(
             }
         }
 
-        // File creation has no create-empty-then-append primitive to call yet; lands via
-        // the pending-document registry in a later commit.
-        throw UnsupportedOperationException("Create is not supported: file write is not implemented yet")
+        // File creation has no create-empty-then-append primitive: SAF requires
+        // createDocument to return an id for a document that exists NOW, but finish_file
+        // (the only primitive that materializes a file) needs content to write against.
+        // Register a PENDING document instead -- touching nothing on disk -- and return its
+        // id. The real file is materialized at onRelease of the write proxy opened against
+        // that id (see openDocument, LuksProxyCallback.onRelease).
+        val docId = PendingDocuments.register(parentId, name)
+        trackIssued(docId)
+        return docId
     }
 
     override fun deleteDocument(documentId: String?) {
         val docId = documentId ?: throw FileNotFoundException("Document not found")
         if (docId == ROOT_DOCUMENT_ID) {
             throw UnsupportedOperationException("Cannot delete root document")
+        }
+        if (PendingDocuments.remove(docId) != null) {
+            // Nothing was ever written to disk -- this simply cancels the pending create.
+            return
         }
         safeCall {
             runBlocking {

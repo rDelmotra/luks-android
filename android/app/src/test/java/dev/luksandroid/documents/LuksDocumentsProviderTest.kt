@@ -201,6 +201,7 @@ class LuksDocumentsProviderTest {
     @After
     fun tearDown() {
         testScope.cancel()
+        PendingDocuments.clear()
     }
 
     /**
@@ -489,11 +490,11 @@ class LuksDocumentsProviderTest {
     /**
      * With write support built in, createDocument creates a directory for real and
      * immediately: directories have a create-empty primitive (nativeCreateDirectory), unlike
-     * files. Creating a file is still refused, because the deferred pending-document path it
-     * needs does not exist yet -- and it must say so rather than fail obscurely.
+     * files. Creating a file instead registers a pending document -- nothing touches the
+     * volume until the write proxy opened against that id finishes (see PendingDocuments).
      */
     @Test
-    fun testCreateDocument_withWriteSupport_createsDirectoryForRealAndStillRefusesFiles() {
+    fun testCreateDocument_withWriteSupport_createsDirectoryForRealAndRegistersFileAsPending() {
         testVolume.writeSupported = true
 
         val docId = provider.createDocument("/", Document.MIME_TYPE_DIR, "MyFolder")
@@ -505,15 +506,105 @@ class LuksDocumentsProviderTest {
         val nested = provider.createDocument("/MyFolder", Document.MIME_TYPE_DIR, "Inner")
         assertEquals("/MyFolder/Inner", nested)
 
-        // Files have no create-empty primitive yet, so they must still refuse -- and for a
-        // different, honest reason than "the volume is read-only".
-        try {
-            provider.createDocument("/", "text/plain", "notes.txt")
-            fail("Expected UnsupportedOperationException creating a file")
-        } catch (e: UnsupportedOperationException) {
-            // Success
-        }
+        // A file has no create-empty primitive: it is registered pending, not written.
+        val fileDocId = provider.createDocument("/", "text/plain", "notes.txt")
+        assertEquals("/notes.txt", fileDocId)
         assertTrue(testVolume.writtenFiles.isEmpty())
+        assertTrue(PendingDocuments.isPending(fileDocId))
+    }
+
+    /**
+     * queryDocument on a still-pending file synthesizes a 0-byte row without touching the
+     * volume at all -- it carries FLAG_SUPPORTS_WRITE (the one flag an existing on-disk file
+     * never gets) so a write-mode openDocument against it is exactly what is expected.
+     */
+    @Test
+    fun testQueryDocument_pendingFile_synthesizesZeroByteRowWithWriteFlag() {
+        testVolume.writeSupported = true
+        val docId = provider.createDocument("/", "text/plain", "draft.txt")
+
+        val cursor = provider.queryDocument(docId, null)
+        assertEquals(1, cursor.count)
+        assertTrue(cursor.moveToFirst())
+        assertEquals(docId, cursor.getString(cursor.getColumnIndexOrThrow(Document.COLUMN_DOCUMENT_ID)))
+        assertEquals("draft.txt", cursor.getString(cursor.getColumnIndexOrThrow(Document.COLUMN_DISPLAY_NAME)))
+        assertEquals(0L, cursor.getLong(cursor.getColumnIndexOrThrow(Document.COLUMN_SIZE)))
+        val flags = cursor.getInt(cursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(flags and Document.FLAG_SUPPORTS_WRITE != 0)
+
+        // The volume itself was never asked about this id -- it does not exist there.
+        assertFalse(testVolume.fileInfoMap.containsKey(docId))
+    }
+
+    /**
+     * openDocument gating for write-capable modes, with write support built in: "w"/"wt"
+     * succeed past the guard for a pending document (failing later only because the test
+     * Context has no StorageManager); an existing on-disk file is refused distinctly from an
+     * unsupported mode; "wa"/"rw"/"rwt" are refused outright regardless of pending status.
+     */
+    @Test
+    fun testOpenDocument_writeModeGating_withWriteSupportBuiltIn() {
+        testVolume.writeSupported = true
+        val pendingDocId = provider.createDocument("/", "text/plain", "in_progress.txt")
+
+        // "w"/"wt" against a pending document get past the write-mode guard entirely --
+        // they fail only because this test Context has no StorageManager to hand back a
+        // real proxy fd, the same trick testM5 uses to prove the read path isn't blocked.
+        for (writeMode in listOf("w", "wt")) {
+            try {
+                provider.openDocument(pendingDocId, writeMode, null)
+                fail("Expected an exception once past the write-mode guard (no StorageManager in test)")
+            } catch (e: UnsupportedOperationException) {
+                fail("openDocument(\"$writeMode\") on a pending document must not be refused: ${e.message}")
+            } catch (e: Throwable) {
+                // Success: got past every write gate, failed for an unrelated reason.
+            }
+        }
+
+        // An existing on-disk file (never registered as pending) must be refused distinctly
+        // from the append/read-write refusal below -- overwrite is out of scope.
+        try {
+            provider.openDocument("/photo.jpg", "w", null)
+            fail("Expected UnsupportedOperationException opening an existing file for write")
+        } catch (e: UnsupportedOperationException) {
+            assertTrue(
+                "expected an overwrite-specific message, got: ${e.message}",
+                e.message?.contains("verwrit") == true,
+            )
+        }
+
+        // "wa" (append), "rw" and "rwt" have no counterpart in a streaming, single-writer,
+        // append-only primitive -- refused outright, even for the pending document itself.
+        for (unsupportedMode in listOf("wa", "rw", "rwt")) {
+            try {
+                provider.openDocument(pendingDocId, unsupportedMode, null)
+                fail("Expected UnsupportedOperationException for mode=$unsupportedMode")
+            } catch (e: UnsupportedOperationException) {
+                // Success
+            }
+        }
+    }
+
+    /**
+     * Pending documents reference a volume session that stops existing once the session
+     * locks -- they must be dropped on the same transition that revokes issued URI grants
+     * (§4.4), not left to dangle and resurrect a stale write target on the next unlock.
+     */
+    @Test
+    fun testPendingDocuments_clearedOnSessionLock() = runBlocking {
+        testVolume.writeSupported = true
+        val docId = provider.createDocument("/", "text/plain", "orphan.txt")
+        assertTrue(PendingDocuments.isPending(docId))
+
+        provider.onCreate()
+        session.lock()
+
+        withTimeout(3000) {
+            while (PendingDocuments.isPending(docId)) {
+                delay(10)
+            }
+        }
+        assertFalse(PendingDocuments.isPending(docId))
     }
 
     /**
