@@ -571,6 +571,165 @@ fn a_streaming_writer_that_collides_on_finish_rolls_back_cleanly() {
     );
 }
 
+// --- begin_file_streaming: the genuinely unknown-size path (Pass 2b JNI) ---
+//
+// The two tests above with "streaming" in the name drive the SIZED
+// `begin_file(1024)` in chunks — they never call `begin_file_streaming`, so
+// they say nothing about the unknown-size primitive. These do.
+
+#[test]
+fn a_streaming_write_of_unknown_size_is_readable_by_the_kernel() {
+    let Some(script) = tool("cat-in-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("streaming-unknown-size");
+    let content = b"nobody told begin_file_streaming how big this was\n";
+
+    let ino = {
+        let vol = unlock(&path);
+        let mut writer = vol.begin_file_streaming().expect("begin_file_streaming");
+        // Write in pieces, as a transfer whose total length is not known
+        // upfront would arrive.
+        vol.write_file_chunk(&mut writer, &content[..10]).expect("chunk 1");
+        vol.write_file_chunk(&mut writer, &content[10..]).expect("chunk 2");
+        vol.finish_file(writer, "/", "unknown-size.txt").expect("finish")
+    };
+    assert!(ino > 0, "expected a real inode/objectid, got {ino}");
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg("unknown-size.txt")
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run cat-in-image");
+
+    assert!(
+        out.status.success(),
+        "the kernel could not read back the streamed write:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, content,
+        "the kernel returned different bytes than the stream wrote"
+    );
+}
+
+#[test]
+fn a_second_writer_is_refused_while_a_streaming_writer_is_live() {
+    // Same claim mechanism `a_second_volume_on_one_device_cannot_also_write`
+    // exercises for the sized path — here the live writer is the unknown-size
+    // one, so this is the actual regression this pass could introduce: a
+    // begin_file_streaming that forgot to call claim_writer would let a
+    // second volume in underneath it.
+    let path = scratch("streaming-writer-busy");
+    let len = std::fs::metadata(&path).expect("stat").len();
+    let dev = FileDevice::open_writable(&path, len).expect("open writable");
+    let handle =
+        DeviceHandle::new(dev, 512, len / 512, "TEST".into(), "IMAGE".into()).expect("scan");
+    let offset = handle
+        .table
+        .luks_partitions()
+        .next()
+        .expect("a LUKS partition")
+        .offset_bytes();
+
+    let first = handle.unlock(offset, PASSWORD).expect("first unlock");
+    let second = handle.unlock(offset, PASSWORD).expect("second unlock");
+
+    let mut writer = first.begin_file_streaming().expect("begin_file_streaming");
+    let err = second
+        .begin_file_streaming()
+        .err()
+        .expect("a second streaming writer must be refused while the first is live");
+    assert_eq!(
+        error_code(&err),
+        code::WRITER_BUSY,
+        "the refusal should be WRITER_BUSY, not something else: {err}"
+    );
+
+    // The second volume can still read while the first holds the writer.
+    second.list_dir_json("/").expect("the second volume must still read");
+
+    first.write_file_chunk(&mut writer, b"still holding the claim").expect("chunk");
+    first.abandon_file(writer);
+}
+
+#[test]
+fn an_abandoned_streaming_writer_leaves_no_orphan_behind() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("streaming-unknown-abandon");
+    {
+        let vol = unlock(&path);
+        let mut writer = vol.begin_file_streaming().expect("begin_file_streaming");
+        vol.write_file_chunk(&mut writer, b"never finished").expect("chunk");
+        vol.abandon_file(writer); // explicitly abandon before finish
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "an abandoned unknown-size stream left the filesystem unclean:\n{text}"
+    );
+}
+
+#[test]
+fn a_zero_byte_streaming_write_finishes_cleanly() {
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch("streaming-zero-byte");
+    {
+        let vol = unlock(&path);
+        // Begin, then finish immediately — no chunk written at all, which is
+        // the shape of a genuinely empty unknown-size transfer.
+        let writer = vol.begin_file_streaming().expect("begin_file_streaming");
+        let ino = vol
+            .finish_file(writer, "/", "empty-stream.txt")
+            .expect("finish a zero-byte stream");
+        assert!(ino > 0, "expected a real inode/objectid, got {ino}");
+
+        let content = vol.read_file("/empty-stream.txt", 1024).expect("read back");
+        assert!(content.is_empty(), "a zero-byte stream produced {} bytes", content.len());
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        out.status.success() && text.contains("VERDICT: clean"),
+        "a zero-byte stream left the filesystem unclean:\n{text}"
+    );
+}
+
 #[test]
 fn a_file_deleted_through_the_bridge_is_gone_and_e2fsck_clean() {
     let path = scratch("bridge-delete");
