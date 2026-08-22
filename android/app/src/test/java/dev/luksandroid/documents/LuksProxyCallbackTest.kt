@@ -18,6 +18,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -51,6 +52,14 @@ class LuksProxyCallbackTest {
         var throwOnFinish: Throwable? = null
         var throwOnFileInfo: Throwable? = null
 
+        /**
+         * Overridable seam for `nativeWriteSupported()`. Defaults to true here (unlike the
+         * provider test's fake) because most of this file's write tests exercise the real
+         * streaming path; the fail-closed tests opt out explicitly.
+         */
+        var writeSupported: Boolean = true
+        override val canWrite: Boolean get() = writeSupported
+
         override fun fileInfo(path: String): FileInfo {
             throwOnFileInfo?.let { throw it }
             return fileInfoMap[path] ?: FileInfo(
@@ -80,6 +89,10 @@ class LuksProxyCallbackTest {
         }
 
         override fun beginFile(sizeBytes: Long): FileWriter {
+            return TestFileWriter()
+        }
+
+        override fun beginFileStreaming(): FileWriter {
             return TestFileWriter()
         }
 
@@ -149,6 +162,7 @@ class LuksProxyCallbackTest {
     @After
     fun tearDown() {
         testScope.cancel()
+        PendingDocuments.clear()
     }
 
     // ==========================================
@@ -268,18 +282,15 @@ class LuksProxyCallbackTest {
     }
 
     // ===================================================================
-    // Read-only trim (§6.2, supersedes Pass M.5): onWrite always refuses.
-    //
-    // `begin_file_streaming` (the unknown-size write primitive) has no JNI or
-    // Kotlin surface. The only write primitive available, `beginFile`, requires
-    // an upfront size the proxy cannot know, and the sized writer rejects any
-    // write past that size. Rather than half-work via the broken sized API,
-    // onWrite refuses explicitly and immediately with EROFS, and never touches
-    // the volume's write path at all.
+    // Fail-closed: without write support, onWrite always refuses, and never
+    // touches the volume's write path at all. (Formerly the unconditional
+    // read-only trim from §6.2, now scoped to the write-support-absent case
+    // now that the streaming write path itself is implemented below.)
     // ===================================================================
 
     @Test
     fun testReadOnlyTrim_onWrite_alwaysThrowsErofsWithoutTouchingVolume() {
+        testVolume.writeSupported = false
         val callback = LuksWriteProxyCallback(session = session, documentId = "/write_test.bin")
 
         // Even a well-formed, in-order, initial write must be refused.
@@ -297,6 +308,7 @@ class LuksProxyCallbackTest {
 
     @Test
     fun testReadOnlyTrim_onWrite_refusesRegardlessOfOffsetOrRepetition() {
+        testVolume.writeSupported = false
         val callback = LuksWriteProxyCallback(session = session, documentId = "/refuse.bin")
 
         for (offset in listOf(0L, 10L, 100L, 0L)) {
@@ -311,6 +323,7 @@ class LuksProxyCallbackTest {
 
     @Test
     fun testReadOnlyTrim_onRelease_isCleanNoOpForWriteMode() {
+        testVolume.writeSupported = false
         val callback = LuksWriteProxyCallback(session = session, documentId = "/abandon.bin")
 
         try {
@@ -323,6 +336,144 @@ class LuksProxyCallbackTest {
         callback.onRelease()
         assertTrue(testVolume.writtenFiles.isEmpty())
         assertTrue(testVolume.abandonedWriters.isEmpty())
+    }
+
+    // ===================================================================
+    // Streaming write path: sequential offsets, mutex-for-the-lifetime,
+    // abandon-on-error. See LuksProxyCallback's class doc for the invariants.
+    // ===================================================================
+
+    @Test
+    fun testWrite_successfulMultiChunkStream_materializesOnRelease() {
+        val docId = PendingDocuments.register("/", "upload.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        val chunk1 = ByteArray(100) { 1 }
+        val chunk2 = ByteArray(200) { 2 }
+        val chunk3 = ByteArray(50) { 3 }
+
+        assertEquals(100, callback.onWrite(0L, 100, chunk1))
+        assertEquals(200, callback.onWrite(100L, 200, chunk2))
+        assertEquals(50, callback.onWrite(300L, 50, chunk3))
+
+        callback.onRelease()
+
+        assertEquals(1, testVolume.writtenFiles.size)
+        val (parentPath, name, combined) = testVolume.writtenFiles.single()
+        assertEquals("/", parentPath)
+        assertEquals("upload.bin", name)
+        assertEquals(350, combined.size)
+        assertArrayEquals(chunk1, combined.copyOfRange(0, 100))
+        assertArrayEquals(chunk2, combined.copyOfRange(100, 300))
+        assertArrayEquals(chunk3, combined.copyOfRange(300, 350))
+
+        // The pending registration is consumed once the file is real.
+        assertFalse(PendingDocuments.isPending(docId))
+    }
+
+    @Test
+    fun testWrite_nonSequentialOffset_rejectedWithEinvalAndAbandons() {
+        val docId = PendingDocuments.register("/", "seek_attempt.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        assertEquals(100, callback.onWrite(0L, 100, ByteArray(100)))
+
+        try {
+            // Skips ahead instead of continuing at offset 100 -- the one thing this writer
+            // can never honor safely.
+            callback.onWrite(250L, 50, ByteArray(50))
+            fail("Expected ErrnoException(EINVAL) for a non-sequential offset")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EINVAL, e.errno)
+        }
+
+        assertTrue("a non-sequential write must abandon, not materialize", testVolume.writtenFiles.isEmpty())
+        assertEquals(1, testVolume.abandonedWriters.size)
+        assertFalse("pending entry must be dropped once abandoned", PendingDocuments.isPending(docId))
+    }
+
+    @Test
+    fun testWrite_midStreamVolumeFailure_abandonsAndLeavesNoPendingEntry() {
+        val docId = PendingDocuments.register("/", "flaky.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        assertEquals(100, callback.onWrite(0L, 100, ByteArray(100)))
+
+        testVolume.throwOnWrite = RuntimeException("simulated I/O failure")
+        try {
+            callback.onWrite(100L, 50, ByteArray(50))
+            fail("Expected ErrnoException(EIO) when the volume write fails")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+
+        assertTrue("a failed write must never materialize a half file", testVolume.writtenFiles.isEmpty())
+        assertEquals(1, testVolume.abandonedWriters.size)
+        assertFalse(PendingDocuments.isPending(docId))
+    }
+
+    @Test
+    fun testWrite_onReleaseWithNoWrites_materializesNothing() {
+        val docId = PendingDocuments.register("/", "untouched.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        callback.onRelease()
+
+        assertTrue(testVolume.writtenFiles.isEmpty())
+        assertTrue(testVolume.abandonedWriters.isEmpty())
+        // Nothing happened either way -- the pending document is still available to open again.
+        assertTrue(PendingDocuments.isPending(docId))
+    }
+
+    @Test
+    fun testWrite_withoutWriteSupport_refusesBeforeClaimingTheTransferLock() {
+        testVolume.writeSupported = false
+        val docId = PendingDocuments.register("/", "no_support.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        try {
+            callback.onWrite(0L, 10, ByteArray(10))
+            fail("Expected ErrnoException(EROFS) without write support")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EROFS, e.errno)
+        }
+
+        // The transfer lock must never have been claimed -- it must still be free.
+        val stillFree = runBlocking { dev.luksandroid.session.TransferManager.tryAcquireForSafWrite(100L) }
+        assertTrue("write-support refusal must not have claimed the transfer lock", stillFree)
+        if (stillFree) {
+            dev.luksandroid.session.TransferManager.releaseSafWriteLock()
+        }
+    }
+
+    @Test
+    fun testWrite_notAPendingDocument_refusesWithoutCreatingAWriter() {
+        // No PendingDocuments.register call for this id -- simulates an existing on-disk
+        // file, or a stale/foreign id. The provider is meant to gate this before ever
+        // constructing the callback, but the callback enforces it independently too.
+        val callback = LuksWriteProxyCallback(session = session, documentId = "/not_pending.bin")
+
+        try {
+            callback.onWrite(0L, 10, ByteArray(10))
+            fail("Expected ErrnoException(EROFS) for a non-pending document")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EROFS, e.errno)
+        }
+        assertTrue(testVolume.writtenFiles.isEmpty())
+    }
+
+    @Test
+    fun testOnFsync_isANoOpReportingSuccess() {
+        val docId = PendingDocuments.register("/", "fsync_test.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        callback.onWrite(0L, 10, ByteArray(10))
+        // Must not throw -- nothing is durable yet, but that is reported as success, not EIO.
+        callback.onFsync()
+
+        assertTrue(testVolume.writtenFiles.isEmpty())
+        callback.onRelease()
+        assertEquals(1, testVolume.writtenFiles.size)
     }
 
     @Test

@@ -24,6 +24,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
@@ -72,6 +73,39 @@ open class TransferController {
 
     companion object {
         const val CHUNK_SIZE = 1 shl 20 // 1 MiB
+
+        /** Bound on [tryAcquireForSafWrite] -- see its doc comment for why this is finite. */
+        private const val SAF_WRITE_LOCK_TIMEOUT_MS = 10_000L
+    }
+
+    /**
+     * Acquires [transferMutex] for the lifetime of a single SAF streaming write (see
+     * `LuksProxyCallback` in the documents package), so a write coming in through the
+     * platform Files app cannot interleave with an app-initiated import/export/hash queued
+     * through [startImport]/[startExport]/[startHash] -- both paths serialize through this
+     * one mutex, never two independent ones.
+     *
+     * Bounded wait, not a suspend-forever [Mutex.lock]: the Rust writer's `claim_writer()`
+     * guard returns `WriterBusy` if it is already held, and that arriving mid-stream (after
+     * this mutex was already acquired) is unrecoverable -- so contention has to be resolved
+     * here, before the native writer is ever claimed, not discovered afterward. The risk this
+     * bounds is real, not theoretical: an app that opens a write `ParcelFileDescriptor` and is
+     * killed, crashes, or otherwise never closes it would hold this lock until whatever bound
+     * applies, or forever with a plain [Mutex.lock]. There is no way to detect "this caller
+     * vanished" from inside a suspend function; the timeout is the entire mitigation.
+     */
+    suspend fun tryAcquireForSafWrite(timeoutMs: Long = SAF_WRITE_LOCK_TIMEOUT_MS): Boolean {
+        val acquired = withTimeoutOrNull(timeoutMs) { transferMutex.lock() }
+        return acquired != null
+    }
+
+    /**
+     * Releases the mutex acquired by [tryAcquireForSafWrite]. Must be called exactly once per
+     * successful acquire -- callers hold it across error paths with try/finally, not just the
+     * happy path, so a failed write never leaks the lock.
+     */
+    fun releaseSafWriteLock() {
+        transferMutex.unlock()
     }
 
     /**
