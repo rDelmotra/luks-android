@@ -393,6 +393,18 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         return writer
     }
 
+    /**
+     * Sibling of [beginFile] with no upfront size -- for a streaming write whose total
+     * length is not known before the first chunk arrives. Same semantics otherwise:
+     * fixed-memory, and closing without [FileWriter.finish] rolls it back.
+     */
+    open fun beginFileStreaming(): FileWriter {
+        check(handle != 0L) { "volume is closed" }
+        val writer = FileWriter(LuksNative.nativeBeginFileStreaming(handle))
+        activeWriters += writer
+        return writer
+    }
+
     open fun writeChunk(writer: FileWriter, data: ByteArray, offset: Int = 0, length: Int = data.size) {
         writer.write(data, offset, length)
     }

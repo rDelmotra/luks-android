@@ -153,6 +153,16 @@ internal object LuksNative {
     external fun nativeWriteFile(handle: Long, parentPath: String, name: String, data: ByteArray): Long
 
     external fun nativeBeginFile(handle: Long, sizeBytes: Long): Long
+
+    /**
+     * Sibling of [nativeBeginFile] with no upfront size, for a streaming write whose
+     * total length is not known before the first chunk arrives -- the shape the SAF
+     * write proxy needs, since the kernel VFS delivers writes without ever declaring a
+     * length. Same gating as every other write primitive: only linkable when the
+     * loaded `.so` was built with `dangerous-write-support`. Call [nativeWriteSupported]
+     * first.
+     */
+    external fun nativeBeginFileStreaming(handle: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCloseWriter(handle: Long, writer: Long)
