@@ -415,6 +415,40 @@ fun isPathInsideReadOnlySubvolume(path: String, fsType: String, subvolumes: List
 }
 
 /**
+ * Whether renaming an item named [currentName] to [newName] would collide with
+ * another entry already present in the same directory, given that directory's
+ * current listing [existingNames].
+ *
+ * This exists because the native rename implementations use POSIX rename
+ * semantics: renaming onto an existing destination does not fail, it silently
+ * replaces the destination and frees its data — see
+ * `core/src/fs/btrfs/write/txn/rename.rs` (frees the colliding file's extents)
+ * and `core/src/fs/ext4/file.rs` (unlinks and frees it). Neither native call
+ * warns, confirms, or offers an undo, so a typo in the rename dialog (renaming
+ * `draft.txt` to `notes.txt` when `notes.txt` already exists) would silently
+ * destroy `notes.txt`. This check runs before the native call so the UI can
+ * refuse instead.
+ *
+ * Comparison is exact and case-sensitive: ext4 and btrfs are case-sensitive
+ * filesystems, so `Notes.txt` and `notes.txt` are genuinely different files
+ * and both must be allowed to coexist. Renaming an item to its own current
+ * name is a no-op on the native side (see `rename.rs`'s same-path check) and
+ * is therefore never reported as a collision here, even though
+ * [dev.luksandroid.ui.components.validateNewName] already rejects that case
+ * earlier in the dialog flow for other reasons.
+ *
+ * IMPORTANT: this is a usability guard, not an atomicity guarantee. There is
+ * an unavoidable TOCTOU window between this check (reading [existingNames], a
+ * snapshot already in memory) and the native rename call that follows it: if
+ * something else creates a file named [newName] in that window, the native
+ * rename will still silently replace it. This function only catches the
+ * common case — a typo caught against what the UI already knows — not
+ * concurrent writers.
+ */
+fun renameTargetExists(existingNames: List<String>, currentName: String, newName: String): Boolean =
+    newName != currentName && existingNames.any { it == newName }
+
+/**
  * Main File Browser Screen for Phase L.
  */
 @Composable
@@ -698,6 +732,15 @@ fun BrowserScreen(
     // Rename Item
     fun handleRename(item: BrowserItem, newName: String) {
         if (!scope.isActive) return
+        // Refuse before the native call ever runs: see renameTargetExists's
+        // doc comment for why a silent collision here is a data-loss defect,
+        // not a cosmetic one. This reads `entries`, the listing already held
+        // in state for `currentPath` — the same directory `item` lives in —
+        // so no extra fetch is needed.
+        if (renameTargetExists(entries.map { it.name }, item.name, newName)) {
+            renameError = "\"$newName\" already exists in this folder"
+            return
+        }
         isRenaming = true
         renameError = null
         scope.launch {
