@@ -28,8 +28,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import dev.luksandroid.transfer.CollisionMode
+import dev.luksandroid.transfer.StatsRecorder
 import dev.luksandroid.transfer.TransferCancelledException
 import dev.luksandroid.transfer.TransferProgress
+import dev.luksandroid.transfer.formatThroughput
 import dev.luksandroid.transfer.stoppedSummary
 import dev.luksandroid.transfer.treeProgressLabel
 import java.util.concurrent.ConcurrentHashMap
@@ -729,6 +731,7 @@ open class TransferController {
         activeJobs[transferId] = currentCoroutineContext().job
 
         var done = 0L
+        val stats = StatsRecorder()
         val started = System.currentTimeMillis()
         var lastUpdateMs = started
         var lastUpdateBytes = 0L
@@ -753,16 +756,24 @@ open class TransferController {
                             val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
                             buffer.limit(toRead)
 
+                            // Timed with the same recorder the directory paths
+                            // use, so the two are directly comparable: this loop
+                            // is the zero-copy control (FileChannel straight into
+                            // a direct buffer) against TreeImporter's heap
+                            // ByteArray. The whole refill counts as one read, to
+                            // match one chunk = one read there.
                             var read = 0
-                            while (buffer.hasRemaining()) {
-                                val r = channel.read(buffer)
-                                if (r <= 0) break
-                                read += r
+                            stats.read {
+                                while (buffer.hasRemaining()) {
+                                    val r = channel.read(buffer)
+                                    if (r <= 0) break
+                                    read += r
+                                }
                             }
                             if (read <= 0) break
 
                             buffer.flip()
-                            writer.write(buffer, read)
+                            stats.write { writer.write(buffer, read) }
                             done += read
 
                             val now = System.currentTimeMillis()
@@ -798,7 +809,7 @@ open class TransferController {
                     throw IllegalStateException("Short read: imported $done bytes of $totalBytes expected")
                 }
 
-                val ino = writer.finish(parentPath, targetName)
+                val ino = stats.commit { writer.finish(parentPath, targetName) }
                 val totalSec = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
                 val finalSpeed = (done / totalSec).toLong()
                 updateTransfer(transferId) {
@@ -810,6 +821,7 @@ open class TransferController {
                     )
                 }
                 Trace.i("TransferManager", "Import completed: $transferId in ${totalSec}s (inode $ino)")
+                Trace.i(formatThroughput("import-single", done, stats.snapshot()))
             } finally {
                 writer.close()
             }

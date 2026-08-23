@@ -56,6 +56,7 @@ object TreeImporter {
         plan.checkParentBeforeChild()
 
         val destination = DestinationState(volume)
+        val stats = StatsRecorder()
         val filesTotal = plan.fileCount
         val bytesTotal = plan.totalBytes
 
@@ -88,7 +89,9 @@ object TreeImporter {
 
         fun stop(entryPath: String, cause: Throwable): TransferOutcome {
             fireProgress(entryPath, bytesCopied, force = true)
-            return TransferOutcome(filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause)
+            return TransferOutcome(
+                filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause, stats.snapshot(),
+            )
         }
 
         for (entry in plan.entries) {
@@ -156,7 +159,7 @@ object TreeImporter {
                     CollisionMode.KEEP_BOTH -> {
                         val targetName = uniqueName(destination.namesOf(parentDir), name)
                         val written = try {
-                            streamFile(volume, source, entry, parentDir, targetName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir,targetName) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -175,7 +178,7 @@ object TreeImporter {
                         // aborted run can never collide with this one either.
                         val tempName = uniqueName(destination.namesOf(parentDir), ".transfer-tmp-${name}-${System.nanoTime()}")
                         val written = try {
-                            streamFile(volume, source, entry, parentDir, tempName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir,tempName) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -206,7 +209,7 @@ object TreeImporter {
 
             // No collision: plain write.
             val written = try {
-                streamFile(volume, source, entry, parentDir, name) { liveBytes ->
+                streamFile(volume, source, stats, entry, parentDir, name) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
@@ -220,7 +223,9 @@ object TreeImporter {
         }
 
         fireProgress(lastPath, bytesCopied, force = true)
-        return TransferOutcome(filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null)
+        return TransferOutcome(
+            filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null, stats.snapshot(),
+        )
     }
 
     /**
@@ -239,6 +244,7 @@ object TreeImporter {
     private fun streamFile(
         volume: LuksVolume,
         source: SourceBytes,
+        stats: StatsRecorder,
         entry: PlanEntry,
         parentDir: String,
         targetName: String,
@@ -250,10 +256,15 @@ object TreeImporter {
             source.open(entry.sourceId).use { input ->
                 val buffer = ByteArray(CHUNK_SIZE)
                 while (true) {
-                    val read = input.read(buffer)
+                    // The read and the write are timed separately because the
+                    // loop runs them in series: the drive is idle for the whole
+                    // read and the phone for the whole write. Whether that costs
+                    // anything worth fixing is exactly what these two numbers
+                    // answer -- see TransferStats.
+                    val read = stats.read { input.read(buffer) }
                     if (read < 0) break
                     if (read == 0) continue
-                    volume.writeChunk(writer, buffer, 0, read)
+                    stats.write { volume.writeChunk(writer, buffer, 0, read) }
                     total += read
                     onChunk(total)
                 }
@@ -262,7 +273,7 @@ object TreeImporter {
             volume.abandonFile(writer)
             throw t
         }
-        volume.finishFile(writer, parentDir, targetName)
+        stats.commit { volume.finishFile(writer, parentDir, targetName) }
         return total
     }
 }

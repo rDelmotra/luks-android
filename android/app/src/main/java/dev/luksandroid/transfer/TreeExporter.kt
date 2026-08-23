@@ -102,6 +102,7 @@ object TreeExporter {
         plan.checkParentBeforeChild()
 
         val state = DestinationTree(destination, destinationRootId)
+        val stats = StatsRecorder()
         val filesTotal = plan.fileCount
         val bytesTotal = plan.totalBytes
 
@@ -132,7 +133,9 @@ object TreeExporter {
 
         fun stop(entryPath: String, cause: Throwable): TransferOutcome {
             fireProgress(entryPath, bytesCopied, force = true)
-            return TransferOutcome(filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause)
+            return TransferOutcome(
+                filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause, stats.snapshot(),
+            )
         }
 
         for (entry in plan.entries) {
@@ -214,7 +217,7 @@ object TreeExporter {
             var created: CreatedDocument
             try {
                 created = destination.createFile(parentId, requestedName, mimeTypeFor(name))
-                written = streamFile(destination, source, entry, created) { liveBytes ->
+                written = streamFile(destination, source, stats, entry, created) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
@@ -248,7 +251,9 @@ object TreeExporter {
         }
 
         fireProgress(lastPath, bytesCopied, force = true)
-        return TransferOutcome(filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null)
+        return TransferOutcome(
+            filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null, stats.snapshot(),
+        )
     }
 
     /**
@@ -265,23 +270,32 @@ object TreeExporter {
     private fun streamFile(
         destination: ExportDestination,
         source: SourceBytes,
+        stats: StatsRecorder,
         entry: PlanEntry,
         target: CreatedDocument,
         onChunk: (Long) -> Unit,
     ): Long {
         var total = 0L
-        destination.openOutput(target.id).use { output ->
+        val output = destination.openOutput(target.id)
+        try {
             source.open(entry.sourceId).use { input ->
                 val buffer = ByteArray(CHUNK_SIZE)
                 while (true) {
-                    val read = input.read(buffer)
+                    // Here "read" is the drive and "write" is the phone -- the
+                    // mirror of TreeImporter's, and serialised the same way.
+                    val read = stats.read { input.read(buffer) }
                     if (read < 0) break
                     if (read == 0) continue
-                    output.write(buffer, 0, read)
+                    stats.write { output.write(buffer, 0, read) }
                     total += read
                     onChunk(total)
                 }
             }
+        } finally {
+            // Timed rather than left to `use`: a provider stream can hold a
+            // whole file's worth of buffering until close, which would
+            // otherwise land in "other" and look like per-entry overhead.
+            stats.commit { output.close() }
         }
         return total
     }

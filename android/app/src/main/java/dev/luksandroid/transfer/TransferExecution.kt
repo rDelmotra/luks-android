@@ -61,8 +61,140 @@ data class TransferOutcome(
     val bytesCopied: Long,
     val stoppedAtPath: String?,
     val failure: Throwable?,
+    val stats: TransferStats = TransferStats.EMPTY,
 ) {
     val succeeded: Boolean get() = failure == null
+}
+
+/**
+ * Where a transfer's wall-clock actually went.
+ *
+ * This exists because of INCIDENTS.md 2026-08-08 and 2026-08-10: throughput on
+ * this project has been misattributed three separate times -- to command size,
+ * to buffer copies, to flash cache folding -- and each time what settled it was
+ * building the cheapest instrument that could *contradict* the hypothesis
+ * rather than one that could confirm it.
+ *
+ * The current hypothesis is that [TreeImporter.streamFile] and
+ * [TreeExporter.streamFile] serialise two comparable-cost stages -- the source
+ * read and the destination write -- so the destination sits idle for the whole
+ * read and vice versa, capping throughput near half of either side's ceiling.
+ * That hypothesis makes a falsifiable prediction: [readNanos] and [writeNanos]
+ * are of the same order. If instead the read is a few percent of the total,
+ * pipelining them can win at most that few percent and should not be built.
+ *
+ * All four buckets are measured, not derived, and they do not sum to
+ * [elapsedNanos] -- the remainder is directory creation, destination listings,
+ * and per-entry lookups, which is itself worth seeing on a many-small-files
+ * tree.
+ */
+data class TransferStats(
+    /** Wall-clock for the whole tree, including per-entry lookups and mkdirs. */
+    val elapsedNanos: Long,
+    /** Time blocked in the source's `read`. */
+    val readNanos: Long,
+    /** Time blocked writing a chunk to the destination. */
+    val writeNanos: Long,
+    /**
+     * Time closing each file out: `finishFile` on import (which commits the
+     * btrfs transaction) or closing the provider's stream on export. Broken out
+     * rather than folded into [writeNanos] because it is per-*file* cost, not
+     * per-byte, and so scales with the tree's shape instead of its size.
+     */
+    val commitNanos: Long,
+    val readCalls: Int,
+    val writeCalls: Int,
+) {
+    companion object {
+        val EMPTY = TransferStats(0, 0, 0, 0, 0, 0)
+    }
+}
+
+/**
+ * A one-line, path-free summary of [stats] for [bytes] moved, safe to log in
+ * any build: counts, durations and rates only, never a name from either side.
+ *
+ * Pure and separate from the logging call so it can be unit-tested; see
+ * `Trace.err`'s `ErrDetail` for the same "make it structurally impossible to
+ * log a path" reasoning.
+ */
+fun formatThroughput(direction: String, bytes: Long, stats: TransferStats): String {
+    val seconds = stats.elapsedNanos / 1_000_000_000.0
+    val mib = bytes / (1024.0 * 1024.0)
+    val rate = if (seconds > 0) mib / seconds else 0.0
+    fun bucket(label: String, nanos: Long): String {
+        val pct = if (stats.elapsedNanos > 0) nanos * 100.0 / stats.elapsedNanos else 0.0
+        return "%s=%.2fs/%.0f%%".format(label, nanos / 1_000_000_000.0, pct)
+    }
+    val other = stats.elapsedNanos - stats.readNanos - stats.writeNanos - stats.commitNanos
+    return "throughput dir=%s bytes=%d elapsed=%.2fs rate=%.2fMiB/s %s %s %s %s reads=%d writes=%d".format(
+        direction,
+        bytes,
+        seconds,
+        rate,
+        bucket("read", stats.readNanos),
+        bucket("write", stats.writeNanos),
+        bucket("commit", stats.commitNanos),
+        bucket("other", other),
+        stats.readCalls,
+        stats.writeCalls,
+    )
+}
+
+/**
+ * Accumulates [TransferStats] while a transfer runs. Not thread-safe and does
+ * not need to be: both executors are single-threaded by construction, and a
+ * pipelined version would hand each stage its own counter rather than sharing
+ * this one.
+ */
+internal class StatsRecorder {
+    private val startedAt = System.nanoTime()
+    var readNanos = 0L
+    var writeNanos = 0L
+    var commitNanos = 0L
+    var readCalls = 0
+    var writeCalls = 0
+
+    inline fun <T> read(block: () -> T): T {
+        val t0 = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            readNanos += System.nanoTime() - t0
+            readCalls++
+        }
+    }
+
+    inline fun <T> write(block: () -> T): T {
+        val t0 = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            writeNanos += System.nanoTime() - t0
+            writeCalls++
+        }
+    }
+
+    inline fun <T> commit(block: () -> T): T {
+        val t0 = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            commitNanos += System.nanoTime() - t0
+        }
+    }
+
+    // Timed on the way out too, so a failed or cancelled run still reports how
+    // far it got and how fast -- a transfer that died at 90% is exactly when
+    // the numbers are most interesting.
+    fun snapshot() = TransferStats(
+        elapsedNanos = System.nanoTime() - startedAt,
+        readNanos = readNanos,
+        writeNanos = writeNanos,
+        commitNanos = commitNanos,
+        readCalls = readCalls,
+        writeCalls = writeCalls,
+    )
 }
 
 /**

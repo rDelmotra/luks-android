@@ -5,6 +5,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.StatFsInfo
+import dev.luksandroid.Trace
 import dev.luksandroid.transfer.CollisionMode
 import dev.luksandroid.transfer.Destination
 import dev.luksandroid.transfer.DestinationEntry
@@ -20,6 +21,7 @@ import dev.luksandroid.transfer.TreeExporter
 import dev.luksandroid.transfer.TreeImporter
 import dev.luksandroid.transfer.VolumeChildSource
 import dev.luksandroid.transfer.VolumeSourceBytes
+import dev.luksandroid.transfer.formatThroughput
 import dev.luksandroid.transfer.precheckTransfer
 import dev.luksandroid.transfer.promptFor
 import dev.luksandroid.transfer.surveyDestination
@@ -211,7 +213,7 @@ fun runDirectoryImport(
     mode: CollisionMode,
     onProgress: (TransferProgress) -> Unit,
     isCancelled: () -> Boolean,
-) = TreeImporter.importTree(
+): dev.luksandroid.transfer.TransferOutcome = TreeImporter.importTree(
     volume = volume,
     plan = request.plan,
     // The folder itself is created here, before its children land in it.
@@ -223,7 +225,7 @@ fun runDirectoryImport(
     collisionMode = mode,
     onProgress = onProgress,
     isCancelled = isCancelled,
-)
+).also { Trace.i(formatThroughput("import", it.bytesCopied, it.stats)) }
 
 /** Creates [path] if it is not already there, so the plan's children have somewhere to land. */
 private fun ensureDirectory(volume: LuksVolume, path: String) {
@@ -262,5 +264,5 @@ fun runDirectoryExport(
         mimeTypeFor = SafExportDestination::mimeTypeFor,
         onProgress = onProgress,
         isCancelled = isCancelled,
-    )
+    ).also { Trace.i(formatThroughput("export", it.bytesCopied, it.stats)) }
 }
