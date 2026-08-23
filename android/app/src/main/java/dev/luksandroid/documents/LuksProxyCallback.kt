@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.ProxyFileDescriptorCallback
 import android.system.ErrnoException
 import android.system.OsConstants
+import dev.luksandroid.LuksException
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.Trace
 import dev.luksandroid.Trace.throwableSummary
@@ -206,22 +207,58 @@ open class LuksProxyCallback(
     }
 
     override fun onRelease() {
-        val activeWriter = writer
-        if (activeWriter == null) {
-            // A write-mode proxy that closed without a single byte written: the caller created
-            // a document and then abandoned it. Drop the registration, or the provider keeps
-            // synthesizing a 0-byte row for a document that will never exist until the session
-            // locks. Note this deliberately differs from the platform's FileSystemProvider,
-            // which would leave a real empty file behind -- materializing one here would mean
-            // claiming the native writer during a release path that does not otherwise hold
-            // it. Read-mode proxies leave the registry alone: they never owned the entry.
-            if (mode == "w" || mode == "wt") {
-                PendingDocuments.remove(documentId)
-            }
-            releaseWriteLockIfHeld()
+        if (mode != "w" && mode != "wt") {
+            // Read-mode proxies never own a pending entry or the transfer lock -- nothing to
+            // release here. (Kept as an explicit early return, rather than folding into the
+            // logic below, so the DEFECT 3 materialization path below can never accidentally
+            // run for a read proxy.)
             return
         }
-        writer = null
+
+        val activeWriter = writer
+        if (activeWriter != null) {
+            writer = null
+            finishOrAbandon(activeWriter)
+            return
+        }
+
+        // No onWrite call ever arrived on this stream: the caller created a document and then
+        // abandoned it before writing anything. Drop the registration, or the provider keeps
+        // synthesizing a 0-byte row for a document that will never exist until the session
+        // locks. Read-mode proxies never reach here at all (see the early return above): they
+        // never owned a pending entry to drop.
+        PendingDocuments.remove(documentId)
+        releaseWriteLockIfHeld()
+    }
+
+    /**
+     * Finishes [activeWriter] against its [PendingDocuments] registration, or abandons it if
+     * that registration is gone or the finish itself fails.
+     *
+     * DEFECT 2 defence in depth: [LuksDocumentsProvider.createDocument] already resolves the
+     * destination name to something free at create time (see
+     * [LuksDocumentsProvider.uniqueDocumentName]), so `finishFile` rejecting it here with
+     * [LuksException.ALREADY_EXISTS] means something else claimed that exact name in the
+     * window between that check and this commit -- the same TOCTOU sliver documented on
+     * [LuksDocumentsProvider.renameDocument]. Matched on [LuksException.code] via
+     * [LuksException.isAlreadyExists], never on a message substring -- that pattern was
+     * deliberately removed from this codebase (commit 25f09ee).
+     *
+     * There is no byte-preserving retry available at that point, and this is a hard
+     * architectural fact, not a gap left for later: `nativeFinishFile` (jni/src/lib.rs) calls
+     * `bridge::drop_writer(writer)` unconditionally, on success OR failure, before it even
+     * looks at the result -- and both `Btrfs::finish_file` and `Ext4::finish_file` (core/src)
+     * take the writer by value and consume it on every path including the error one. The
+     * native writer backing [activeWriter] is gone the instant `finishFile` returns, by
+     * design, regardless of outcome. Retrying would need the bytes buffered somewhere on the
+     * Kotlin side to replay -- and [onWrite] deliberately never buffers them, forwarding each
+     * chunk straight to the native writer to keep this a fixed-memory transfer (see the class
+     * doc). So by the time this branch can run, the bytes the user already wrote no longer
+     * exist anywhere to retry with; the file is abandoned because that is the only safe choice
+     * left, distinctly logged so this specific case is diagnosable rather than folded into a
+     * generic I/O failure.
+     */
+    private fun finishOrAbandon(activeWriter: LuksVolume.FileWriter) {
         val pending = PendingDocuments.get(documentId)
         try {
             if (pending != null) {
@@ -233,6 +270,13 @@ open class LuksProxyCallback(
                 // against, so the only safe thing left to do is discard what was written.
                 runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
             }
+        } catch (e: LuksException) {
+            if (e.isAlreadyExists) {
+                Trace.e("LuksProxyCallback: finish rejected the pre-checked name as already-existing; abandoning")
+            } else {
+                Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(e)}")
+            }
+            runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
         } catch (t: Throwable) {
             Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(t)}")
             runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }

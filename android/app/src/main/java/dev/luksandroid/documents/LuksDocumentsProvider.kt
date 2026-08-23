@@ -562,7 +562,20 @@ open class LuksDocumentsProvider(
         // Register a PENDING document instead -- touching nothing on disk -- and return its
         // id. The real file is materialized at onRelease of the write proxy opened against
         // that id (see openDocument, LuksProxyCallback.onRelease).
-        val docId = PendingDocuments.register(parentId, name)
+        //
+        // DEFECT 2: finish_file's own collision check (core/src/fs/btrfs/write/txn/create.rs)
+        // rejects a duplicate at COMMIT time, deep inside LuksProxyCallback.onRelease -- a
+        // platform callback that returns Unit and can only log and abandon. Every byte the
+        // caller already streamed in would be silently discarded and the file manager would
+        // still report success. Resolve the collision up front instead, the way the
+        // platform's own FileSystemProvider.createDocument does: pick a free name now, before
+        // any bytes are ever accepted, and register (and return) THAT name. SAF's contract
+        // explicitly allows createDocument to hand back a different display name than the one
+        // requested -- that is why it returns an id rather than void.
+        val resolvedName = safeCall {
+            runBlocking { session.withLease { volume -> uniqueDocumentName(volume, parentId, name) } }
+        }
+        val docId = PendingDocuments.register(parentId, resolvedName)
         trackIssued(docId)
         return docId
     }

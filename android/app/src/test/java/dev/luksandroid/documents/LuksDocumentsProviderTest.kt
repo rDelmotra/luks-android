@@ -576,6 +576,57 @@ class LuksDocumentsProviderTest {
     }
 
     /**
+     * DEFECT 2 (up-front half): createDocument for a file whose name already exists on disk
+     * must not register the pending document under the colliding name -- doing so defers the
+     * collision to finish_file's own check deep inside a void platform callback
+     * (LuksProxyCallback.onRelease), silently discarding every byte the caller had already
+     * streamed in when it fires. Resolve it up front instead, the way
+     * FileSystemProvider.createDocument does, and hand back the id for the name actually
+     * chosen -- SAF's contract explicitly allows that.
+     */
+    @Test
+    fun testCreateDocument_fileNameCollisionOnDisk_resolvesToAUniqueNameUpFront() {
+        testVolume.writeSupported = true
+        testVolume.entriesMap["/"] = listOf(Entry("notes.txt", "file"))
+
+        val docId = provider.createDocument("/", "text/plain", "notes.txt")
+
+        assertEquals("/notes (1).txt", docId)
+        assertTrue(PendingDocuments.isPending(docId))
+        assertFalse(PendingDocuments.isPending("/notes.txt"))
+    }
+
+    /**
+     * Same collision, but against a still-pending document rather than an on-disk one --
+     * PendingDocuments must be consulted, not just the volume listing.
+     */
+    @Test
+    fun testCreateDocument_fileNameCollisionWithPendingDocument_resolvesToAUniqueNameUpFront() {
+        testVolume.writeSupported = true
+        provider.createDocument("/", "text/plain", "draft.txt")
+
+        val secondDocId = provider.createDocument("/", "text/plain", "draft.txt")
+
+        assertEquals("/draft (1).txt", secondDocId)
+    }
+
+    /**
+     * A repeated collision must keep counting up rather than looping or throwing.
+     */
+    @Test
+    fun testCreateDocument_repeatedFileNameCollision_countsUpPastTheFirstSuffix() {
+        testVolume.writeSupported = true
+        testVolume.entriesMap["/"] = listOf(
+            Entry("notes.txt", "file"),
+            Entry("notes (1).txt", "file"),
+        )
+
+        val docId = provider.createDocument("/", "text/plain", "notes.txt")
+
+        assertEquals("/notes (2).txt", docId)
+    }
+
+    /**
      * queryDocument on a still-pending file synthesizes a 0-byte row without touching the
      * volume at all -- it carries FLAG_SUPPORTS_WRITE (the one flag an existing on-disk file
      * never gets) so a write-mode openDocument against it is exactly what is expected.

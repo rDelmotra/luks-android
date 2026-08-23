@@ -403,6 +403,33 @@ class LuksProxyCallbackTest {
         assertFalse(PendingDocuments.isPending(docId))
     }
 
+    /**
+     * DEFECT 2 defence in depth: when `finishFile` rejects the (already up-front-checked)
+     * name with ALREADY_EXISTS -- a TOCTOU race that slipped past createDocument's own check
+     * -- onRelease must abandon cleanly rather than crash or leave a dangling pending entry.
+     * There is no byte-preserving retry available here (see finishOrAbandon's doc comment for
+     * why), so abandon is the correct, and only safe, outcome; this test's job is to prove the
+     * ALREADY_EXISTS path is handled by CODE (LuksException.isAlreadyExists), not by matching
+     * on the exception's message.
+     */
+    @Test
+    fun testWrite_finishRejectsAlreadyExists_abandonsCleanlyByCodeNotMessage() {
+        val docId = PendingDocuments.register("/", "raced.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        assertEquals(50, callback.onWrite(0L, 50, ByteArray(50)))
+
+        // A message deliberately unrelated to "already exists" wording, to prove the handling
+        // keys off LuksException.code (ALREADY_EXISTS), not a substring of the message.
+        testVolume.throwOnFinish = LuksException("collision at commit", LuksException.ALREADY_EXISTS)
+
+        callback.onRelease()
+
+        assertTrue("a rejected finish must never materialize a file", testVolume.writtenFiles.isEmpty())
+        assertEquals(1, testVolume.abandonedWriters.size)
+        assertFalse("the pending registration must not survive a failed finish", PendingDocuments.isPending(docId))
+    }
+
     @Test
     fun testWrite_nonSequentialOffset_rejectedWithEinvalAndAbandons() {
         val docId = PendingDocuments.register("/", "seek_attempt.bin")
