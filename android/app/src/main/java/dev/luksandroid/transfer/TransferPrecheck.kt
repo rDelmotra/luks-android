@@ -113,8 +113,6 @@ sealed class Verdict {
  */
 internal fun ext4DirectoryEntryCeiling(blockSize: Int): Int = (blockSize - 36) / 20
 
-private fun nameOf(relativePath: String): String = relativePath.substringAfterLast('/')
-
 fun precheckTransfer(plan: TransferPlan, destination: Destination): Verdict {
     val refusals = mutableListOf<Refusal>()
     val fileCollisions = mutableListOf<FileCollision>()

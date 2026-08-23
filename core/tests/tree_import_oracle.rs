@@ -314,6 +314,49 @@ fn imports_a_nested_tree_the_kernel_agrees_with() {
     );
 }
 
+/// Pass 4's exit bar: a tree exported off the drive and re-imported must land
+/// as exactly what it started as.
+///
+/// The destination of an export is a document provider, which no kernel can
+/// grade — so exporting alone could only ever be checked against our own idea
+/// of what should have been written. Feeding the exported bytes back through
+/// the import path makes it answerable: a wrong export becomes a wrong tree on
+/// a real filesystem, and that is something `btrfs check`, a mount, and a
+/// sha256 per file can all disagree with.
+///
+/// The trace this replays comes from `TreeRoundTripTraceTest`, where the real
+/// exporter, the real walker, and the real importer all run in sequence; only
+/// the two endpoints are fakes.
+#[test]
+fn a_tree_survives_export_and_reimport() {
+    let img = copy_fixture_to_temp("plain.img", "roundtrip");
+    let len = fs::metadata(&img).unwrap().len();
+
+    let ops = parse_trace(&repo_path("fixtures/transfer/roundtrip-import.trace"));
+
+    {
+        let dev = FileDevice::open_writable(&img, len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+        seed_destination(&mut fs, false);
+        replay(&mut fs, &ops);
+    }
+
+    kernel_verify(&img);
+
+    let big_len = (1 << 20) + (1 << 19);
+    assert_manifest(
+        &img,
+        &[
+            "d Docs".to_string(),
+            "d Docs/Sub".to_string(),
+            "d Empty".to_string(),
+            manifest_line_for_file("Docs/Sub/data.bin", 23, big_len),
+            manifest_line_for_file("Docs/notes.txt", 11, 100),
+            manifest_line_for_file("top.txt", 5, 7),
+        ],
+    );
+}
+
 /// §5.2 keeps whatever landed rather than rolling back, so a transfer that
 /// stops partway must leave a filesystem the kernel still considers valid —
 /// "half a tree" has to mean half a *correct* tree. This is the 2026-08-23

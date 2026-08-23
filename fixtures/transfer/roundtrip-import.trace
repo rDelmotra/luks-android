@@ -1,0 +1,13 @@
+mkdir	/dst	Docs
+mkdir	/dst	Empty
+begin
+write	0	7	5
+finish	/dst	top.txt
+mkdir	/dst/Docs	Sub
+begin
+write	0	100	11
+finish	/dst/Docs	notes.txt
+begin
+write	0	1048576	23
+write	1048576	524288	23
+finish	/dst/Docs/Sub	data.bin

@@ -438,7 +438,7 @@ class TreeImporterTest {
         )
 
         assertFalse(outcome.succeeded)
-        assertTrue(outcome.failure is ImportCancelledException)
+        assertTrue(outcome.failure is TransferCancelledException)
         assertEquals("three.bin", outcome.stoppedAtPath)
         assertEquals(2, outcome.filesCopied)
         assertArrayEquals(byteArrayOf(1, 1, 1), volume.fileAt("/dst", "one.bin"))
@@ -452,7 +452,7 @@ class TreeImporterTest {
     fun `progress fires with correct totals and always fires a final update`() {
         val p = plan(file("a.bin", 10), file("b.bin", 20))
         val source = FakeSource(mapOf("id:a.bin" to ByteArray(10), "id:b.bin" to ByteArray(20)))
-        val updates = mutableListOf<ImportProgress>()
+        val updates = mutableListOf<TransferProgress>()
 
         val outcome = TreeImporter.importTree(volume, p, "/dst", source, CollisionMode.SKIP, onProgress = { updates += it })
 
@@ -476,7 +476,7 @@ class TreeImporterTest {
         // SIZE_UNKNOWN means the plan's totalBytes undercounts this file entirely.
         val p = plan(file("mystery.bin", SIZE_UNKNOWN))
         val source = FakeSource(mapOf("id:mystery.bin" to realBytes))
-        val updates = mutableListOf<ImportProgress>()
+        val updates = mutableListOf<TransferProgress>()
 
         val outcome = TreeImporter.importTree(volume, p, "/dst", source, CollisionMode.SKIP, onProgress = { updates += it })
 
@@ -535,7 +535,7 @@ class TreeImporterTest {
                 "id:last.txt" to "3".toByteArray(),
             ),
         )
-        val updates = mutableListOf<ImportProgress>()
+        val updates = mutableListOf<TransferProgress>()
 
         val outcome = TreeImporter.importTree(volume, p, "/dst", source, CollisionMode.SKIP, onProgress = { updates += it })
 
