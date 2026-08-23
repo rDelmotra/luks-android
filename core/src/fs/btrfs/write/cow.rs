@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::device::ReadAt;
-use crate::error::Result;
+use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::{Key, Node};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::node::{InteriorNode, Leaf, LeafItem};
@@ -465,7 +465,7 @@ where
     let mut allocated = Vec::new();
     let mut freed = Vec::new();
 
-    let (new_root_bytenr, _, emitted) = cow_descend(
+    let (root_res, emitted) = cow_descend(
         fs,
         pending,
         root_bytenr,
@@ -476,8 +476,19 @@ where
         allocator,
         &mut allocated,
         &mut freed,
+        true,
         mutate_fn,
     )?;
+
+    // `cow_descend` only reports `None` for a node that has a parent to be
+    // removed from, and the root has none — it is passed `is_root = true` and
+    // keeps an emptied root rather than deleting it, because a root with zero
+    // items violates nothing (a freshly-`mkfs`'d csum tree looks exactly like
+    // that). Reaching `None` here would mean that contract was broken, so fail
+    // closed rather than write a tree with no root at all.
+    let (new_root_bytenr, _) = root_res.ok_or(LuksError::CorruptFs(
+        "btrfs CoW removed the tree root; a root has no parent to be removed from",
+    ))?;
 
     Ok(CowResult {
         new_root_bytenr,
@@ -499,8 +510,9 @@ fn cow_descend<D: ReadAt, F>(
     allocator: &mut FreeSpaceMap,
     allocated: &mut Vec<(u64, u8)>,
     freed: &mut Vec<(u64, u8)>,
+    is_root: bool,
     mutate_fn: F,
-) -> Result<(u64, Key, Vec<(u64, Vec<u8>)>)>
+) -> Result<(Option<(u64, Key)>, Vec<(u64, Vec<u8>)>)>
 where
     F: FnOnce(&mut Leaf) -> Result<()>,
 {
@@ -515,6 +527,32 @@ where
         // Leaf node
         let mut leaf = Leaf::from_node(&node, csum_type)?;
         mutate_fn(&mut leaf)?;
+
+        // `mutate_fn` may have deleted the leaf's last item. Emitting it anyway
+        // and letting the parent keep pointing at it is what corrupted the USB
+        // test stick on 2026-08-23: five zero-item leaves, all correctly
+        // checksummed and `flags 0x1(WRITTEN)`, still linked from the FS_TREE
+        // root. `btrfs check` reported them as `Wrong key of child node/leaf,
+        // wanted: (299, 108, 2678784), have: (0, 0, 0)`, and every item that
+        // had lived in those leaves was simply gone — missing inode items,
+        // missing csums, directory entries pointing at inodes that no longer
+        // existed. Our own reader hit the same leaves from the other side, as
+        // `CorruptFs("btrfs node has no items")` out of `cursor.rs`.
+        //
+        // So report the removal upward instead and let the parent drop the
+        // entry. The block is freed rather than allocated-and-emitted: nothing
+        // will reference it, so writing it at all would only leak metadata.
+        //
+        // Unlike `cow_descend_insert`, which never produces an empty leaf by
+        // construction, this path can and does — every `delete_item` call in
+        // `txn/delete.rs`, `txn/rename.rs`, and `extent_tree.rs` arrives here.
+        //
+        // A *root* leaf is exempt: it has no parent to dangle from, so zero
+        // items is a legal shape for it (that is what an empty csum tree is).
+        if leaf.items.is_empty() && !is_root {
+            freed.push((bytenr, 0));
+            return Ok((None, Vec::new()));
+        }
 
         let target_bytenr = if is_already_new {
             bytenr
@@ -531,14 +569,17 @@ where
 
         let emitted = leaf.emit(node_size)?;
         let first_key = leaf.items.first().map(|it| it.key).unwrap_or(*target_key);
-        Ok((target_bytenr, first_key, vec![(target_bytenr, emitted)]))
+        Ok((
+            Some((target_bytenr, first_key)),
+            vec![(target_bytenr, emitted)],
+        ))
     } else {
         // Interior node
         let mut interior = InteriorNode::from_node(&node, csum_type)?;
         let child_idx = node.child_for(target_key)?;
         let child_ptr = node.key_ptr(child_idx)?;
 
-        let (new_child_bytenr, new_child_key, mut emitted_blocks) = cow_descend(
+        let (child_res, mut emitted_blocks) = cow_descend(
             fs,
             pending,
             child_ptr.blockptr,
@@ -549,15 +590,42 @@ where
             allocator,
             allocated,
             freed,
+            false,
             mutate_fn,
         )?;
 
-        // Update child pointer in interior node. See the matching comment in
-        // cow_descend_insert above: the key must always be propagated, even
-        // for child_idx == 0, or the parent's minimum goes stale.
-        interior.entries[child_idx].blockptr = new_child_bytenr;
-        interior.entries[child_idx].generation = generation;
-        interior.entries[child_idx].key = new_child_key;
+        match child_res {
+            // Update child pointer in interior node. See the matching comment
+            // in cow_descend_insert above: the key must always be propagated,
+            // even for child_idx == 0, or the parent's minimum goes stale.
+            Some((new_child_bytenr, new_child_key)) => {
+                interior.entries[child_idx].blockptr = new_child_bytenr;
+                interior.entries[child_idx].generation = generation;
+                interior.entries[child_idx].key = new_child_key;
+            }
+            // The child emptied out and removed itself. Drop the entry rather
+            // than re-pointing it at a leaf that no longer exists; this is the
+            // other half of the empty-leaf fix above.
+            //
+            // Deliberately *not* followed by merging this node with a sibling
+            // if it is left underfull: btrfs, unlike a textbook B-tree, has no
+            // minimum-occupancy rule. Only empty nodes are illegal, and a
+            // sparse tree is a performance question, not a correctness one.
+            // Leaving the rebalance out keeps this to the one invariant that
+            // actually matters.
+            None => {
+                interior.entries.remove(child_idx);
+            }
+        }
+
+        // Removing that entry can empty this node in turn, so the removal has
+        // to propagate all the way up rather than stopping one level above the
+        // leaf — an empty interior node dangling from *its* parent is the same
+        // corruption one level higher.
+        if interior.entries.is_empty() && !is_root {
+            freed.push((bytenr, level));
+            return Ok((None, emitted_blocks));
+        }
 
         let target_bytenr = if is_already_new {
             bytenr
@@ -576,7 +644,7 @@ where
         let first_key = interior.entries.first().map(|e| e.key).unwrap_or(*target_key);
         emitted_blocks.push((target_bytenr, emitted));
 
-        Ok((target_bytenr, first_key, emitted_blocks))
+        Ok((Some((target_bytenr, first_key)), emitted_blocks))
     }
 }
 

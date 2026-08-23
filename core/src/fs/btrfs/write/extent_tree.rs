@@ -471,7 +471,28 @@ pub(crate) fn record_cow_result(
         blocks_to_add.push((b, lvl, owner));
     }
     for &(b, lvl) in &res.freed {
-        blocks_to_remove.push((b, lvl));
+        // A block allocated *and* freed inside one transaction needs no extent
+        // item at all — it never existed as far as any committed tree is
+        // concerned. Cancel the pending add instead of queueing a matching
+        // remove: the convergence loop below drains removes before adds within
+        // a round, so a block appearing in both lists would try to delete a
+        // METADATA_ITEM that had not been inserted yet.
+        //
+        // Before the empty-leaf fix in cow.rs this could not happen — `freed`
+        // only ever held pre-existing blocks, because a leaf already CoW'd this
+        // transaction takes the `is_already_new` path and frees nothing. Now a
+        // leaf can be CoW'd by one delete and emptied by the next, which is
+        // exactly how four leaves emptied in a single generation on the test
+        // stick.
+        if let Some(pos) = blocks_to_add.iter().position(|&(add_b, _, _)| add_b == b) {
+            blocks_to_add.remove(pos);
+            // Drop the stale contents too: the address goes back to the
+            // allocator here, so leaving it in `pending_blocks` would let a
+            // later reuse of the same address read the emptied node back.
+            pending_blocks.remove(&b);
+        } else {
+            blocks_to_remove.push((b, lvl));
+        }
         allocator.free_metadata(b, node_size)?;
     }
     for (b, data) in &res.emitted_blocks {
