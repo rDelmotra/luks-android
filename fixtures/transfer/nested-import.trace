@@ -1,0 +1,14 @@
+begin
+write	0	40	7
+finish	/dst/Photos	.transfer-tmp-0
+rename	/dst/Photos	.transfer-tmp-0	/dst/Photos	existing.txt
+mkdir	/dst	Notes
+begin
+write	0	11	19
+finish	/dst/Notes	small.txt
+mkdir	/dst/Notes	Deep
+begin
+write	0	1048576	3
+write	1048576	524288	3
+finish	/dst/Notes/Deep	big.bin
+mkdir	/dst	Empty

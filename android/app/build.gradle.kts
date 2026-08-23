@@ -73,6 +73,18 @@ android {
     }
 }
 
+// TreeImportTraceTest compares TreeImporter's recorded operation sequence
+// against the checked-in traces the Rust kernel oracle replays. Gradle cannot
+// see that dependency on its own: editing a trace leaves the test task
+// up-to-date, so it does not rerun and a drifted fixture passes. Measured --
+// a deliberately corrupted trace reported BUILD SUCCESSFUL until --rerun-tasks
+// forced it. Declaring the directory as an input closes that.
+tasks.withType<Test>().configureEach {
+    inputs.dir(rootProject.layout.projectDirectory.dir("../fixtures/transfer"))
+        .withPropertyName("transferTraceFixtures")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+}
+
 // Gradle has no idea Cargo exists. Rather than a plugin that breaks on every
 // AGP bump, the contract is: run tools/build-android-libs.sh, then build. This
 // check turns "forgot to run it" from an UnsatisfiedLinkError at runtime into a
