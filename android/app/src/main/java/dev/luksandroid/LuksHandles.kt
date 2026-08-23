@@ -87,8 +87,18 @@ data class SubvolumeInfo(
  * [isSubvolume] marks a btrfs subvolume boundary. It is still a directory and
  * opens like one; the flag exists because it is a different tree underneath,
  * and may be a read-only snapshot.
+ *
+ * [size] and [mtime] are zero for a subvolume, and zero (rather than absent)
+ * if the native side could not read the entry's inode — a listing degrades
+ * a bad entry to unknown metadata instead of failing outright.
  */
-data class Entry(val name: String, val type: String, val isSubvolume: Boolean = false) {
+data class Entry(
+    val name: String,
+    val type: String,
+    val isSubvolume: Boolean = false,
+    val size: Long = 0,
+    val mtime: Long = 0,
+) {
     val isDir: Boolean get() = type == "dir"
 }
 
@@ -255,6 +265,8 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
                 e.getString("name"),
                 e.getString("type"),
                 e.optBoolean("isSubvolume"),
+                e.optLong("size"),
+                e.optLong("mtime"),
             )
         }
     }
@@ -268,6 +280,8 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
                 e.getString("name"),
                 e.getString("type"),
                 e.optBoolean("isSubvolume"),
+                e.optLong("size"),
+                e.optLong("mtime"),
             )
         }
     }

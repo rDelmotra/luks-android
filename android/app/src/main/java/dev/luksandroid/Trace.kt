@@ -74,8 +74,9 @@ object Trace {
      * Non-identifying summary of a [Throwable] safe to pass into [e]: the
      * exception's class name and, if it's a `LuksException`, its error code.
      * Never the throwable itself, never `.message` — both can embed drive
-     * paths (see `LuksError::{NotFound,NotADirectory,IsADirectory}` in
-     * core/src/error.rs, surfaced via `Fail::parts()` in jni/src/lib.rs).
+     * paths (see `LuksError::{NotFound,NotADirectory,IsADirectory,
+     * DirectoryNotEmpty}` in core/src/error.rs, surfaced via `Fail::parts()`
+     * in jni/src/lib.rs).
      */
     fun throwableSummary(t: Throwable): String {
         val code = (t as? LuksException)?.code

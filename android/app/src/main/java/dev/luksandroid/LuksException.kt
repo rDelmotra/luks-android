@@ -28,6 +28,7 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isItemTooLarge: Boolean get() = code == ITEM_TOO_LARGE
     val isMutexPoisoned: Boolean get() = code == MUTEX_POISONED
     val isCancelled: Boolean get() = code == CANCELLED
+    val isDirectoryNotEmpty: Boolean get() = code == DIRECTORY_NOT_EMPTY
 
     override fun toString(): String = "LuksException[$code] ${message.orEmpty()}"
 
@@ -82,5 +83,12 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * The operation was interrupted via a cancellation token.
          */
         const val CANCELLED = 19
+
+        /**
+         * A directory delete found a child it does not know how to remove (a
+         * symlink, say) partway through recursion. The directory itself was
+         * found and is real — it just still has something in it.
+         */
+        const val DIRECTORY_NOT_EMPTY = 20
     }
 }

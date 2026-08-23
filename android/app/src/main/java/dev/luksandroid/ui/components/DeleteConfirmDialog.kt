@@ -26,12 +26,17 @@ fun DeleteConfirmDialog(
     onConfirm: () -> Unit,
     isDeleting: Boolean = false,
     errorMessage: String? = null,
+    count: Int = 1,
 ) {
     AlertDialog(
         onDismissRequest = { if (!isDeleting) onDismissRequest() },
         title = {
             Text(
-                text = if (isDir) "Delete Folder?" else "Delete File?",
+                text = when {
+                    count > 1 -> "Delete $count items?"
+                    isDir -> "Delete Folder?"
+                    else -> "Delete File?"
+                },
                 style = MaterialTheme.typography.titleLarge,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -42,7 +47,11 @@ fun DeleteConfirmDialog(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
-                    text = "Are you sure you want to permanently delete \"$itemName\"?",
+                    text = if (count > 1) {
+                        "Are you sure you want to permanently delete these $count items?"
+                    } else {
+                        "Are you sure you want to permanently delete \"$itemName\"?"
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 if (isDir) {

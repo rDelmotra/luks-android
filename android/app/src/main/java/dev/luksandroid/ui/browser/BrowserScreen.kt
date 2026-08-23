@@ -11,7 +11,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,6 +44,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -65,7 +66,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -87,7 +87,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.luksandroid.Entry
-import dev.luksandroid.FileInfo
 import dev.luksandroid.LuksException
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.StatFsInfo
@@ -359,18 +358,30 @@ object BrowserIcons {
 }
 
 /**
- * Enhanced directory item with lazily populated metadata.
+ * A directory entry paired with the full path it's reached at, along with
+ * the metadata that came back with it from `listDir`.
  */
 data class BrowserItem(
     val entry: Entry,
     val fullPath: String,
-    val sizeBytes: Long? = null,
-    val mtime: Long? = null,
+    val sizeBytes: Long = entry.size,
+    val mtime: Long = entry.mtime,
 ) {
     val name: String get() = entry.name
     val type: String get() = entry.type
     val isDir: Boolean get() = entry.isDir
     val isSubvolume: Boolean get() = entry.isSubvolume
+}
+
+/**
+ * What [BrowserScreen] sorts a directory listing by. Directories always
+ * group before files regardless of field — this only orders within that
+ * grouping, matching the convention every mainstream file manager uses.
+ */
+enum class SortField(val label: String) {
+    NAME("Name"),
+    SIZE("Size"),
+    DATE("Date"),
 }
 
 data class ChecksumResult(
@@ -451,10 +462,11 @@ fun BrowserScreen(
 
     var currentPath by remember { mutableStateOf("/") }
     var entries by remember { mutableStateOf<List<Entry>>(unlockedState.entries) }
-    val itemDetails = remember { mutableStateMapOf<String, FileInfo>() }
     var statFsInfo by remember { mutableStateOf<StatFsInfo?>(null) }
     var isRefreshing by remember { mutableStateOf(false) }
     var isSlackLimitReached by remember { mutableStateOf(false) }
+    var sortField by remember { mutableStateOf(SortField.NAME) }
+    var sortAscending by remember { mutableStateOf(true) }
 
     // Dialog state
     var showNewFolderDialog by remember { mutableStateOf(false) }
@@ -468,6 +480,14 @@ fun BrowserScreen(
     var deletingItem by remember { mutableStateOf<BrowserItem?>(null) }
     var isDeleting by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
+
+    // Multi-select state. A set of full paths rather than indices, so it
+    // survives a re-sort or a background refresh of the same directory
+    // without pointing at the wrong row.
+    var selectedPaths by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var confirmingDeleteSelection by remember { mutableStateOf(false) }
+    var isDeletingSelection by remember { mutableStateOf(false) }
+    var deleteSelectionError by remember { mutableStateOf<String?>(null) }
 
     var activeChecksum by remember { mutableStateOf<ChecksumResult?>(null) }
     var pendingExportItem by remember { mutableStateOf<BrowserItem?>(null) }
@@ -520,29 +540,7 @@ fun BrowserScreen(
                 entries = list
                 currentPath = path
                 isSlackLimitReached = false
-
-                // Pre-fetch metadata in background
-                if (scope.isActive) {
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            list.forEach { entry ->
-                                val itemPath = joinPath(path, entry.name)
-                                if (!itemDetails.containsKey(itemPath)) {
-                                    try {
-                                        val info = LuksSession.withLease { v -> v.fileInfo(itemPath) }
-                                        withContext(Dispatchers.Main) {
-                                            itemDetails[itemPath] = info
-                                        }
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (_: Exception) {}
-                                }
-                            }
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {}
-                    }
-                }
+                selectedPaths = emptySet()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
@@ -763,16 +761,70 @@ fun BrowserScreen(
         }
     }
 
-    val browserItems = remember(entries, itemDetails.toMap(), currentPath) {
-        entries.map { entry ->
-            val full = joinPath(currentPath, entry.name)
-            val info = itemDetails[full]
-            BrowserItem(
-                entry = entry,
-                fullPath = full,
-                sizeBytes = info?.size,
-                mtime = info?.mtime,
-            )
+    val browserItems = remember(entries, currentPath, sortField, sortAscending) {
+        val items = entries.map { entry -> BrowserItem(entry = entry, fullPath = joinPath(currentPath, entry.name)) }
+        val byField = when (sortField) {
+            SortField.NAME -> compareBy<BrowserItem> { it.name.lowercase() }
+            SortField.SIZE -> compareBy<BrowserItem> { it.sizeBytes }
+            SortField.DATE -> compareBy<BrowserItem> { it.mtime }
+        }
+        val directed = if (sortAscending) byField else byField.reversed()
+        // Directories always float to the top, independent of the chosen
+        // field — sorting a mix of folders and files by size or date is not
+        // a comparison any file manager actually shows the user.
+        items.sortedWith(compareByDescending<BrowserItem> { it.isDir }.then(directed))
+    }
+
+    val selectedItems = remember(browserItems, selectedPaths) {
+        browserItems.filter { it.fullPath in selectedPaths }
+    }
+    // A subvolume can be selected (for a plain "N selected" count), but not
+    // batch-deleted — the same rule the per-item menu already enforces.
+    val canDeleteSelection = canWriteVolume && !isSubvolumeReadOnly &&
+        selectedItems.isNotEmpty() && selectedItems.none { it.isSubvolume }
+
+    // Batch delete. Sequential rather than concurrent: deletes go through the
+    // same TransferManager write mutex as everything else on this volume, so
+    // parallel calls would just queue behind one another anyway, and doing it
+    // one at a time lets a mid-batch failure stop with a clear "N of M"
+    // rather than a pile of concurrent errors.
+    fun handleDeleteSelected() {
+        if (!scope.isActive) return
+        val toDelete = selectedItems.filterNot { it.isSubvolume }
+        if (toDelete.isEmpty()) return
+        isDeletingSelection = true
+        deleteSelectionError = null
+        scope.launch {
+            var deleted = 0
+            try {
+                withContext(Dispatchers.IO) {
+                    for (item in toDelete) {
+                        LuksSession.withLease { v -> v.deleteFile(item.fullPath) }
+                        deleted++
+                    }
+                }
+                confirmingDeleteSelection = false
+                selectedPaths = emptySet()
+                if (scope.isActive) {
+                    scope.launch {
+                        snackbarHostState.showSnackbar(
+                            if (deleted == 1) "Deleted 1 item" else "Deleted $deleted items",
+                        )
+                    }
+                }
+                loadDirectory(currentPath)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: LuksException) {
+                Trace.err(e.code, "delete_file")
+                deleteSelectionError = "Deleted $deleted of ${toDelete.size}: [${e.code}] ${e.message}"
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Trace.err(-1, "delete_file")
+                deleteSelectionError = "Deleted $deleted of ${toDelete.size}: ${e.message ?: "failed"}"
+            } finally {
+                isDeletingSelection = false
+            }
         }
     }
 
@@ -824,71 +876,95 @@ fun BrowserScreen(
                 .padding(horizontal = 16.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            // Header Bar
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = volumeInfo.label.ifBlank { "Encrypted Volume" },
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = "${volumeInfo.fsType.uppercase()} · ${formatSize(volumeInfo.sizeBytes)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
+            // Header Bar — replaced by a selection action bar while
+            // selectedPaths is non-empty.
+            if (selectedPaths.isNotEmpty()) {
+                SelectionActionBar(
+                    selectedCount = selectedPaths.size,
+                    totalCount = browserItems.size,
+                    canDelete = canDeleteSelection,
+                    onSelectAll = { selectedPaths = browserItems.map { it.fullPath }.toSet() },
+                    onClear = { selectedPaths = emptySet() },
+                    onDelete = {
+                        deleteSelectionError = null
+                        confirmingDeleteSelection = true
+                    },
+                )
+            } else {
                 Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    IconButton(
-                        onClick = { loadDirectory(currentPath) },
-                        enabled = !isRefreshing,
-                    ) {
-                        if (isRefreshing) {
-                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        } else {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "Refresh Directory",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = volumeInfo.label.ifBlank { "Encrypted Volume" },
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = "${volumeInfo.fsType.uppercase()} · ${formatSize(volumeInfo.sizeBytes)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
 
-                    OutlinedButton(
-                        onClick = {
-                            if (scope.isActive) {
-                                scope.launch {
-                                    try {
-                                        onLockRequested()
-                                        LuksSession.lock()
-                                    } catch (e: CancellationException) {
-                                        throw e
-                                    } catch (e: Exception) {
-                                        if (e is CancellationException) throw e
-                                        Trace.err(-1, "lock")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        SortMenuButton(
+                            field = sortField,
+                            ascending = sortAscending,
+                            onChange = { field, ascending ->
+                                sortField = field
+                                sortAscending = ascending
+                            },
+                        )
+
+                        IconButton(
+                            onClick = { loadDirectory(currentPath) },
+                            enabled = !isRefreshing,
+                        ) {
+                            if (isRefreshing) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Refresh Directory",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                if (scope.isActive) {
+                                    scope.launch {
+                                        try {
+                                            onLockRequested()
+                                            LuksSession.lock()
+                                        } catch (e: CancellationException) {
+                                            throw e
+                                        } catch (e: Exception) {
+                                            if (e is CancellationException) throw e
+                                            Trace.err(-1, "lock")
+                                        }
                                     }
                                 }
-                            }
-                        },
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Lock,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Lock")
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Lock")
+                        }
                     }
                 }
             }
@@ -1141,6 +1217,15 @@ fun BrowserScreen(
                             onChecksum = {
                                 calculateChecksum(item)
                             },
+                            selectionActive = selectedPaths.isNotEmpty(),
+                            isSelected = item.fullPath in selectedPaths,
+                            onToggleSelect = {
+                                selectedPaths = if (item.fullPath in selectedPaths) {
+                                    selectedPaths - item.fullPath
+                                } else {
+                                    selectedPaths + item.fullPath
+                                }
+                            },
                         )
                         HorizontalDivider(
                             modifier = Modifier.padding(horizontal = 8.dp),
@@ -1184,11 +1269,139 @@ fun BrowserScreen(
         )
     }
 
+    if (confirmingDeleteSelection) {
+        DeleteConfirmDialog(
+            itemName = "",
+            isDir = selectedItems.any { it.isDir },
+            count = selectedItems.size,
+            onDismissRequest = { if (!isDeletingSelection) confirmingDeleteSelection = false },
+            onConfirm = { handleDeleteSelected() },
+            isDeleting = isDeletingSelection,
+            errorMessage = deleteSelectionError,
+        )
+    }
+
     activeChecksum?.let { result ->
         ChecksumResultDialog(
             result = result,
             onDismissRequest = { activeChecksum = null },
         )
+    }
+}
+
+/**
+ * Replaces the normal header while one or more items are selected.
+ */
+/**
+ * Trigger + menu for choosing [SortField] and direction. Text-only by
+ * design: the extended Material icon pack (which is where a "sort" glyph
+ * would come from) is not a dependency of this app, and this app owns the
+ * data being sorted outright — no server round trip, no plugin surface,
+ * just a comparator over a list already in memory.
+ */
+@Composable
+fun SortMenuButton(
+    field: SortField,
+    ascending: Boolean,
+    onChange: (SortField, Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val arrow = if (ascending) "↑" else "↓"
+
+    Box(modifier = modifier) {
+        TextButton(onClick = { expanded = true }) {
+            Text("${field.label} $arrow")
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false },
+        ) {
+            for (candidate in SortField.entries) {
+                val isCurrent = candidate == field
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            "${candidate.label} ${if (isCurrent && !ascending) "↓" else "↑"}",
+                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                        )
+                    },
+                    leadingIcon = if (isCurrent) {
+                        { Icon(imageVector = Icons.Default.Check, contentDescription = null) }
+                    } else {
+                        null
+                    },
+                    onClick = {
+                        expanded = false
+                        // Tapping the already-active field flips direction —
+                        // tapping a different one switches to it ascending,
+                        // which is the order someone reaches for a field the
+                        // first time.
+                        onChange(candidate, if (isCurrent) !ascending else true)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun SelectionActionBar(
+    selectedCount: Int,
+    totalCount: Int,
+    canDelete: Boolean,
+    onSelectAll: () -> Unit,
+    onClear: () -> Unit,
+    onDelete: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            IconButton(onClick = onClear) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Clear selection",
+                )
+            }
+            Text(
+                text = "$selectedCount selected",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            TextButton(
+                onClick = onSelectAll,
+                enabled = selectedCount < totalCount,
+            ) {
+                Text("Select all")
+            }
+            IconButton(
+                onClick = onDelete,
+                enabled = canDelete,
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Delete,
+                    contentDescription = "Delete selected",
+                    tint = if (canDelete) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -1204,6 +1417,9 @@ fun BrowserItemRow(
     onRename: () -> Unit,
     onDelete: () -> Unit,
     onChecksum: () -> Unit,
+    selectionActive: Boolean = false,
+    isSelected: Boolean = false,
+    onToggleSelect: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
@@ -1211,39 +1427,46 @@ fun BrowserItemRow(
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onOpen)
+            .combinedClickable(
+                onClick = { if (selectionActive) onToggleSelect() else onOpen() },
+                onLongClick = onToggleSelect,
+            )
             .padding(horizontal = 8.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        // Type Icon
-        Surface(
-            shape = RoundedCornerShape(8.dp),
-            color = when {
-                item.isSubvolume -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
-                item.isDir -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
-                item.type == "symlink" -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
-                else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-            },
-            modifier = Modifier.size(40.dp),
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    imageVector = when {
-                        item.isSubvolume -> BrowserIcons.Subvolume
-                        item.isDir -> BrowserIcons.Folder
-                        item.type == "symlink" -> BrowserIcons.Symlink
-                        else -> BrowserIcons.File
-                    },
-                    contentDescription = item.type,
-                    tint = when {
-                        item.isSubvolume -> MaterialTheme.colorScheme.tertiary
-                        item.isDir -> MaterialTheme.colorScheme.primary
-                        item.type == "symlink" -> MaterialTheme.colorScheme.secondary
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    modifier = Modifier.size(22.dp),
-                )
+        // Type Icon, replaced by a checkbox once selection mode is active.
+        if (selectionActive) {
+            Checkbox(checked = isSelected, onCheckedChange = { onToggleSelect() })
+        } else {
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = when {
+                    item.isSubvolume -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.5f)
+                    item.isDir -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.4f)
+                    item.type == "symlink" -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
+                    else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                },
+                modifier = Modifier.size(40.dp),
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = when {
+                            item.isSubvolume -> BrowserIcons.Subvolume
+                            item.isDir -> BrowserIcons.Folder
+                            item.type == "symlink" -> BrowserIcons.Symlink
+                            else -> BrowserIcons.File
+                        },
+                        contentDescription = item.type,
+                        tint = when {
+                            item.isSubvolume -> MaterialTheme.colorScheme.tertiary
+                            item.isDir -> MaterialTheme.colorScheme.primary
+                            item.type == "symlink" -> MaterialTheme.colorScheme.secondary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
             }
         }
 
@@ -1286,13 +1509,11 @@ fun BrowserItemRow(
             val subtitle = buildString {
                 if (item.isDir) {
                     append("Folder")
-                } else if (item.sizeBytes != null) {
-                    append(formatSize(item.sizeBytes))
                 } else {
-                    append("File")
+                    append(formatSize(item.sizeBytes))
                 }
 
-                if (item.mtime != null && item.mtime > 0L) {
+                if (item.mtime > 0L) {
                     val formattedTime = formatTimestamp(item.mtime)
                     if (formattedTime.isNotEmpty()) {
                         append(" · $formattedTime")
@@ -1307,8 +1528,9 @@ fun BrowserItemRow(
             )
         }
 
-        // Action Menu (3-dots)
-        Box {
+        // Action Menu (3-dots) — hidden during selection; batch actions live
+        // in the SelectionActionBar instead.
+        if (!selectionActive) Box {
             IconButton(onClick = { menuExpanded = true }) {
                 Icon(
                     imageVector = Icons.Default.MoreVert,
