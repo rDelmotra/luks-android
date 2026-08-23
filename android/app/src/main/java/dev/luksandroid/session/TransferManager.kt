@@ -27,6 +27,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.nio.ByteBuffer
+import dev.luksandroid.transfer.CollisionMode
+import dev.luksandroid.transfer.TransferCancelledException
+import dev.luksandroid.transfer.TransferProgress
+import dev.luksandroid.transfer.stoppedSummary
+import dev.luksandroid.transfer.treeProgressLabel
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -47,6 +52,21 @@ data class TransferItem(
     val error: String?,
     /** Raw [LuksException.code] behind [error], when the failure came from one. Null otherwise. */
     val errorCode: Int? = null,
+    /**
+     * Tree-transfer progress. Zero and null for a single-file transfer, which
+     * has no meaningful file count and no path below itself.
+     *
+     * A byte total alone is not enough for a directory copy: on a tree of
+     * thousands of small files the bar barely moves per file, and "nothing is
+     * happening" is precisely the reading that caused the 2026-08-23 incident.
+     * [currentPath] is what makes it legible -- it changes constantly even when
+     * the percentage does not.
+     */
+    val filesDone: Int = 0,
+    val filesTotal: Int = 0,
+    val currentPath: String? = null,
+    /** True when [totalBytes] is a lower bound, so the UI must not claim a precise percentage. */
+    val totalIsLowerBound: Boolean = false,
 )
 
 /**
@@ -219,6 +239,131 @@ open class TransferController {
                 }.onFailure { t ->
                     if (t !is CancellationException) {
                         Trace.err(LuksException.GENERIC, "import")
+                    }
+                }
+            } finally {
+                activeJobs.remove(transferId)
+            }
+        }
+        activeJobs[transferId] = job
+        return transferId
+    }
+
+    /**
+     * Enumerates and prechecks a directory transfer without starting it.
+     *
+     * Runs under a session lease but deliberately *not* under [transferMutex]:
+     * this phase only reads, and holding the write lock across a user-facing
+     * dialog would block every other transfer for as long as someone leaves the
+     * prompt on screen.
+     */
+    suspend fun prepareDirectoryTransfer(
+        context: Context,
+        direction: TransferType,
+        path: String,
+        treeUri: Uri,
+    ): DirectoryTransferRequest = withContext(Dispatchers.IO) {
+        LuksSession.withLease { volume ->
+            if (direction == TransferType.IMPORT) {
+                prepareDirectoryImport(context, volume, path, treeUri)
+            } else {
+                prepareDirectoryExport(context, volume, path, treeUri)
+            }
+        }
+    }
+
+    /**
+     * Runs an already-prechecked directory transfer on the manager's own scope.
+     *
+     * [request] must have come from [prepareDirectoryTransfer] and [mode] must
+     * be an option its prompt actually allowed -- offering keep-both where the
+     * precheck blocked it is how a transfer fails halfway, which is the whole
+     * thing this design exists to avoid.
+     */
+    fun startDirectoryTransfer(
+        context: Context,
+        direction: TransferType,
+        request: DirectoryTransferRequest,
+        treeUri: Uri,
+        mode: CollisionMode,
+    ): Long {
+        val transferId = nextTransferId.getAndIncrement()
+        _transfers.update {
+            listOf(
+                TransferItem(
+                    id = transferId,
+                    name = request.rootName,
+                    type = direction,
+                    totalBytes = request.plan.totalBytes,
+                    transferredBytes = 0L,
+                    speedBytesPerSec = 0L,
+                    etaSeconds = 0L,
+                    state = TransferState.QUEUED,
+                    cancelToken = 0L,
+                    error = null,
+                    filesTotal = request.plan.fileCount,
+                    totalIsLowerBound = request.plan.hasUnknownSizes,
+                ),
+            ) + it
+        }
+
+        val job = managerScope.launch {
+            try {
+                runCatching {
+                    transferMutex.withLock {
+                        if (isTransferCancelled(transferId)) return@withLock
+                        updateTransfer(transferId) { it.copy(state = TransferState.RUNNING) }
+
+                        val started = System.currentTimeMillis()
+                        val outcome = LuksSession.withLease { volume ->
+                            val onProgress: (TransferProgress) -> Unit = { p ->
+                                val elapsed = System.currentTimeMillis() - started
+                                val speed = if (elapsed > 0) (p.bytesDone * 1000L) / elapsed else 0L
+                                val label = treeProgressLabel(p, elapsed)
+                                updateTransfer(transferId) {
+                                    it.copy(
+                                        transferredBytes = p.bytesDone,
+                                        speedBytesPerSec = speed,
+                                        etaSeconds = label.etaSeconds ?: 0L,
+                                        filesDone = p.filesDone,
+                                        currentPath = p.currentPath,
+                                    )
+                                }
+                            }
+                            val cancelled = { isTransferCancelled(transferId) }
+                            if (direction == TransferType.IMPORT) {
+                                runDirectoryImport(context, volume, request, treeUri, mode, onProgress, cancelled)
+                            } else {
+                                runDirectoryExport(context, volume, request, treeUri, mode, onProgress, cancelled)
+                            }
+                        }
+
+                        // A tree transfer reports its own outcome rather than
+                        // throwing (§5.2: what already landed is kept), so the
+                        // terminal state is set from that outcome, not from
+                        // whether an exception escaped.
+                        updateTransfer(transferId) {
+                            it.copy(
+                                state = when {
+                                    outcome.succeeded -> TransferState.COMPLETED
+                                    outcome.failure is TransferCancelledException -> TransferState.CANCELLED
+                                    else -> TransferState.FAILED
+                                },
+                                filesDone = outcome.filesCopied + outcome.filesSkipped,
+                                transferredBytes = outcome.bytesCopied,
+                                currentPath = outcome.stoppedAtPath ?: it.currentPath,
+                                error = if (outcome.succeeded) null else stoppedSummary(outcome, request.plan.fileCount),
+                                errorCode = (outcome.failure as? LuksException)?.code,
+                                etaSeconds = 0L,
+                            )
+                        }
+                    }
+                }.onFailure { t ->
+                    if (t !is CancellationException) {
+                        Trace.err(LuksException.GENERIC, "directory_transfer")
+                        updateTransfer(transferId) {
+                            it.copy(state = TransferState.FAILED, error = t.message ?: "unknown error")
+                        }
                     }
                 }
             } finally {

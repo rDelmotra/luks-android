@@ -49,6 +49,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -93,11 +94,17 @@ import dev.luksandroid.StatFsInfo
 import dev.luksandroid.Trace
 import dev.luksandroid.formatSize
 import dev.luksandroid.formatTimestamp
+import dev.luksandroid.session.DirectoryTransferRequest
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
 import dev.luksandroid.session.TransferManager
 import dev.luksandroid.session.TransferState
 import dev.luksandroid.session.TransferType
+import dev.luksandroid.transfer.CollisionMode
+import dev.luksandroid.transfer.Refusal
+import dev.luksandroid.transfer.TransferProgress
+import dev.luksandroid.transfer.TransferPrompt
+import dev.luksandroid.transfer.treeProgressLabel
 import dev.luksandroid.ui.components.BreadcrumbBar
 import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
@@ -679,6 +686,79 @@ fun BrowserScreen(
         }
     }
 
+    // ---- Directory transfer (notes/feature-directory-transfer.md Pass 5) ----
+    //
+    // Three phases, and the UI only exists because of the middle one: enumerate
+    // the tree, precheck it, and resolve whatever it asks *before* any byte
+    // moves (§3.1). Nothing here starts a transfer directly.
+
+    // Set while walking + prechecking. A large tree is fast but not instant,
+    // and an unexplained pause after picking a folder reads as a hang.
+    var preparingDirection by remember { mutableStateOf<TransferType?>(null) }
+    var directoryRefusal by remember { mutableStateOf<TransferPrompt.Refused?>(null) }
+    // The prepared request, held while the user answers the collision prompt.
+    var pendingDirectory by remember {
+        mutableStateOf<Triple<TransferType, DirectoryTransferRequest, Uri>?>(null)
+    }
+    var collisionChoice by remember { mutableStateOf<TransferPrompt.NeedsCollisionChoice?>(null) }
+    // The folder the user asked to export, held across the tree picker.
+    var pendingExportFolder by remember { mutableStateOf<BrowserItem?>(null) }
+
+    fun beginDirectoryTransfer(direction: TransferType, path: String, treeUri: Uri) {
+        if (!scope.isActive) return
+        preparingDirection = direction
+        scope.launch {
+            try {
+                val request = TransferManager.prepareDirectoryTransfer(context, direction, path, treeUri)
+                when (val prompt = request.prompt) {
+                    is TransferPrompt.Refused -> {
+                        // The ext4 entry ceiling is the same condition the
+                        // browser already tracks reactively; surfacing it here
+                        // is the proactive half the precheck exists to add.
+                        if (prompt.reasons.any { it is Refusal.DirectoryEntryCeilingExceeded }) {
+                            isSlackLimitReached = true
+                        }
+                        directoryRefusal = prompt
+                    }
+                    is TransferPrompt.NeedsCollisionChoice -> {
+                        pendingDirectory = Triple(direction, request, treeUri)
+                        collisionChoice = prompt
+                    }
+                    is TransferPrompt.ReadyToRun -> {
+                        activeTransferId = TransferManager.startDirectoryTransfer(
+                            context, direction, request, treeUri, CollisionMode.SKIP,
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Trace.err(-1, "prepare_directory_transfer")
+                snackbarHostState.showSnackbar(
+                    "Could not read that folder: ${e.message ?: e::class.simpleName}",
+                )
+            } finally {
+                preparingDirection = null
+            }
+        }
+    }
+
+    val folderImporter = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        beginDirectoryTransfer(TransferType.IMPORT, currentPath, uri)
+    }
+
+    val folderExporter = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        val source = pendingExportFolder
+        pendingExportFolder = null
+        if (uri == null || source == null) return@rememberLauncherForActivityResult
+        beginDirectoryTransfer(TransferType.EXPORT, source.fullPath, uri)
+    }
+
     // SHA-256 Checksum Calculation
     fun calculateChecksum(item: BrowserItem) {
         activeTransferId = TransferManager.startHash(item.fullPath) { result ->
@@ -891,6 +971,18 @@ fun BrowserScreen(
                         Icon(
                             imageVector = BrowserIcons.CreateFolder,
                             contentDescription = "New Folder",
+                            modifier = Modifier.size(24.dp),
+                        )
+                    }
+
+                    SmallFloatingActionButton(
+                        onClick = { folderImporter.launch(null) },
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    ) {
+                        Icon(
+                            imageVector = BrowserIcons.CreateFolder,
+                            contentDescription = "Import Folder",
                             modifier = Modifier.size(24.dp),
                         )
                     }
@@ -1130,16 +1222,38 @@ fun BrowserScreen(
                         modifier = Modifier.padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
+                        // A directory transfer's percentage is computed through
+                        // the same honesty rules the rest of the feature uses:
+                        // no percentage at all when the total is only a lower
+                        // bound and has already been passed, rather than a bar
+                        // pinned at 100% while files are still copying.
+                        val treeLabel = if (transfer.filesTotal > 0) {
+                            treeProgressLabel(
+                                TransferProgress(
+                                    filesDone = transfer.filesDone,
+                                    filesTotal = transfer.filesTotal,
+                                    bytesDone = transfer.transferredBytes,
+                                    bytesTotal = transfer.totalBytes,
+                                    bytesTotalIsLowerBound = transfer.totalIsLowerBound,
+                                    currentPath = transfer.currentPath.orEmpty(),
+                                ),
+                                elapsedMs = 0L,
+                            )
+                        } else null
+
                         val statusText = if (transfer.state == TransferState.QUEUED) {
                             "(Queued)"
                         } else {
-                            val pct = if (transfer.totalBytes > 0) {
-                                (transfer.transferredBytes * 100 / transfer.totalBytes).toInt()
-                            } else 0
                             val speedStr = if (transfer.speedBytesPerSec > 0) {
                                 " · %.1f MiB/s".format(transfer.speedBytesPerSec.toDouble() / (1L shl 20))
                             } else ""
-                            "$pct%$speedStr"
+                            val pctStr = when {
+                                treeLabel != null -> treeLabel.percent?.let { "$it%" } ?: "…"
+                                transfer.totalBytes > 0 ->
+                                    "${(transfer.transferredBytes * 100 / transfer.totalBytes).toInt()}%"
+                                else -> "0%"
+                            }
+                            "$pctStr$speedStr"
                         }
                         val operation = when (transfer.type) {
                             TransferType.IMPORT -> "Importing"
@@ -1168,17 +1282,60 @@ fun BrowserScreen(
                             )
                         }
 
-                        LinearProgressIndicator(
-                            progress = {
-                                if (transfer.state != TransferState.QUEUED && transfer.totalBytes > 0) {
-                                    (transfer.transferredBytes.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
-                                } else 0f
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp)),
-                        )
+                        // The line that would have prevented 2026-08-23. On a
+                        // tree of thousands of small files the percentage
+                        // barely moves, and "nothing is happening" is exactly
+                        // what the user concluded before locking the session
+                        // mid-copy. The file count and the current path both
+                        // change constantly, so the copy is visibly alive even
+                        // when the bar is not.
+                        treeLabel?.let { label ->
+                            Text(
+                                text = "${label.files} · ${label.bytes}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            )
+                            if (label.currentPath.isNotEmpty()) {
+                                Text(
+                                    text = label.currentPath,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    maxLines = 1,
+                                    // Start, not end: the tail of a path is the
+                                    // filename, which is the part that
+                                    // identifies what is moving right now.
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+
+                        val fraction = when {
+                            transfer.state == TransferState.QUEUED -> 0f
+                            treeLabel != null -> treeLabel.percent?.let { it / 100f }
+                            transfer.totalBytes > 0 ->
+                                (transfer.transferredBytes.toFloat() / transfer.totalBytes.toFloat()).coerceIn(0f, 1f)
+                            else -> 0f
+                        }
+
+                        if (fraction == null) {
+                            // Indeterminate rather than a number we cannot
+                            // stand behind: the total is a lower bound and has
+                            // already been passed.
+                            LinearProgressIndicator(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(2.dp)),
+                            )
+                        } else {
+                            LinearProgressIndicator(
+                                progress = { fraction },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(4.dp)
+                                    .clip(RoundedCornerShape(2.dp)),
+                            )
+                        }
                     }
                 }
             }
@@ -1246,8 +1403,13 @@ fun BrowserScreen(
                                 }
                             },
                             onExport = {
-                                pendingExportItem = item
-                                exporter.launch(item.name)
+                                if (item.isDir) {
+                                    pendingExportFolder = item
+                                    folderExporter.launch(null)
+                                } else {
+                                    pendingExportItem = item
+                                    exporter.launch(item.name)
+                                }
                             },
                             onRename = {
                                 renameError = null
@@ -1328,6 +1490,124 @@ fun BrowserScreen(
         ChecksumResultDialog(
             result = result,
             onDismissRequest = { activeChecksum = null },
+        )
+    }
+
+    // ---- Directory transfer dialogs ----------------------------------------
+
+    preparingDirection?.let { direction ->
+        val what = if (direction == TransferType.IMPORT) "folder to import" else "folder to export"
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Reading the $what") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Text(
+                        "Counting files and checking there is room, before anything is copied.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            // No dismiss button: this phase is read-only and short, and a
+            // half-cancelled enumeration has nothing to clean up but also
+            // nothing useful to report.
+            confirmButton = {},
+        )
+    }
+
+    directoryRefusal?.let { refused ->
+        AlertDialog(
+            onDismissRequest = { directoryRefusal = null },
+            title = { Text("This folder cannot be copied") },
+            // The precheck's whole purpose: say why now, in full, rather than
+            // failing at 80% with a partial tree on the drive.
+            text = { Text(refused.message) },
+            confirmButton = {
+                TextButton(onClick = { directoryRefusal = null }) { Text("OK") }
+            },
+        )
+    }
+
+    collisionChoice?.let { choice ->
+        val pending = pendingDirectory
+        fun run(mode: CollisionMode) {
+            collisionChoice = null
+            pendingDirectory = null
+            if (pending != null) {
+                activeTransferId = TransferManager.startDirectoryTransfer(
+                    context, pending.first, pending.second, pending.third, mode,
+                )
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = {
+                collisionChoice = null
+                pendingDirectory = null
+            },
+            title = {
+                Text(
+                    if (choice.fileCollisions.size == 1) "1 file already exists"
+                    else "${choice.fileCollisions.size} files already exist",
+                )
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Choose once for all of them. Folders with the same name are always merged.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    // A few names, not all of them: a list of 300 is not a
+                    // decision aid, and the count above already carries the scale.
+                    for (c in choice.fileCollisions.take(5)) {
+                        Text(
+                            "• ${c.relativePath}",
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    if (choice.fileCollisions.size > 5) {
+                        Text(
+                            "…and ${choice.fileCollisions.size - 5} more",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (!choice.allowKeepBoth) {
+                        Text(
+                            "“Keep both” is unavailable: a folder here is at the limit for how " +
+                                "many entries it can hold, so the extra copies would not fit.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (choice.sizeIsLowerBound) {
+                        Text(
+                            "Some files did not report a size, so the total may be larger than estimated.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(onClick = { run(CollisionMode.SKIP) }) { Text("Skip") }
+                    TextButton(
+                        onClick = { run(CollisionMode.KEEP_BOTH) },
+                        enabled = choice.allowKeepBoth,
+                    ) { Text("Keep both") }
+                    TextButton(onClick = { run(CollisionMode.REPLACE) }) { Text("Replace") }
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        collisionChoice = null
+                        pendingDirectory = null
+                    },
+                ) { Text("Cancel") }
+            },
         )
     }
 }
@@ -1586,22 +1866,26 @@ fun BrowserItemRow(
                 expanded = menuExpanded,
                 onDismissRequest = { menuExpanded = false },
             ) {
-                if (!item.isDir) {
-                    DropdownMenuItem(
-                        text = { Text("Export to phone") },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = BrowserIcons.Download,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        },
-                        onClick = {
-                            menuExpanded = false
-                            onExport()
-                        },
-                    )
+                // Outside the file-only block: a folder exports too, as a
+                // recursive copy (Pass 4). The caller routes by type -- a file
+                // through CreateDocument, a folder through OpenDocumentTree.
+                DropdownMenuItem(
+                    text = { Text(if (item.isDir) "Export folder to phone" else "Export to phone") },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = BrowserIcons.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(20.dp),
+                        )
+                    },
+                    enabled = !item.isSubvolume,
+                    onClick = {
+                        menuExpanded = false
+                        onExport()
+                    },
+                )
 
+                if (!item.isDir) {
                     DropdownMenuItem(
                         text = { Text("SHA-256 Checksum") },
                         leadingIcon = {
