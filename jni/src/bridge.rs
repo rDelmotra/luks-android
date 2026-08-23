@@ -102,6 +102,11 @@ pub mod code {
     pub const MUTEX_POISONED: i32 = 18;
     /// An operation was cancelled via cancellation token.
     pub const CANCELLED: i32 = 19;
+    /// A directory delete refused because it still has a child the recursive
+    /// delete does not know how to remove (a symlink, say). Distinct from
+    /// `NOT_FOUND`, which the other path-shape refusals share: this directory
+    /// exists and was found, it just is not empty.
+    pub const DIRECTORY_NOT_EMPTY: i32 = 20;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -132,6 +137,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         SessionPoisoned => code::MUTEX_POISONED,
         Cancelled => code::CANCELLED,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
+        DirectoryNotEmpty(_) => code::DIRECTORY_NOT_EMPTY,
         ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) => code::TRANSPORT,
         Io { .. } => code::IO,
         ChecksumMismatch
@@ -749,9 +755,6 @@ impl VolumeHandle {
         let items: Vec<Value> = entries
             .iter()
             .map(|e| {
-                // A size lookup per entry costs an inode read each. On a USB 2.0
-                // link that is the difference between an instant listing and a
-                // visible stall, so sizes are fetched lazily by `fileInfo`.
                 json!({
                     "name": e.name,
                     "inode": e.inode,
@@ -760,6 +763,11 @@ impl VolumeHandle {
                     // says that `inode` above is a tree id rather than an
                     // inode number.
                     "isSubvolume": e.is_subvolume,
+                    // Zero for a subvolume, or if the entry's inode could not
+                    // be read — see the comment at the DirEntry construction
+                    // site in each filesystem's directory listing.
+                    "size": e.size,
+                    "mtime": e.mtime,
                 })
             })
             .collect();
@@ -796,6 +804,8 @@ impl VolumeHandle {
                     "inode": e.inode,
                     "type": type_name(e.file_type),
                     "isSubvolume": e.is_subvolume,
+                    "size": e.size,
+                    "mtime": e.mtime,
                 })
             })
             .collect();
@@ -1720,6 +1730,10 @@ mod tests {
         );
         assert_eq!(error_code(&LuksError::SessionPoisoned), code::MUTEX_POISONED);
         assert_eq!(error_code(&LuksError::Cancelled), code::CANCELLED);
+        assert_eq!(
+            error_code(&LuksError::DirectoryNotEmpty("x".into())),
+            code::DIRECTORY_NOT_EMPTY
+        );
     }
 
     #[test]

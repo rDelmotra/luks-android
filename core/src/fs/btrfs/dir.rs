@@ -47,6 +47,29 @@ impl<D: ReadAt> Btrfs<D> {
             match parse_dir_entries(data) {
                 Ok(entries) => {
                     for e in entries {
+                        // A subvolume's `location` is a tree id, not an inode
+                        // in *this* tree — reading it as one would land on an
+                        // unrelated file in this tree that happens to share
+                        // the number. Its own size/mtime live in a different
+                        // tree entirely, so it is reported as unknown here
+                        // rather than fetched, which would need a second
+                        // `tree_root` resolution per subvolume entry.
+                        //
+                        // For an ordinary entry the inode read reuses the
+                        // upper levels of the same tree just walked for
+                        // `DIR_INDEX`, which the node cache already holds —
+                        // so this costs one new leaf read per entry, not a
+                        // fresh descent from the root. A read failure (a
+                        // dangling or corrupt entry) degrades to zero rather
+                        // than failing the whole listing: one bad entry
+                        // should not make a directory unbrowsable.
+                        let (size, mtime) = if e.is_subvolume() {
+                            (0, 0)
+                        } else {
+                            self.read_inode(tree, e.location.objectid)
+                                .map(|inode| (inode.size, inode.mtime))
+                                .unwrap_or((0, 0))
+                        };
                         out.push(DirEntry {
                             name: e.name_lossy(),
                             // For a subvolume this is a tree id rather than an
@@ -55,6 +78,8 @@ impl<D: ReadAt> Btrfs<D> {
                             inode: e.location.objectid,
                             file_type: e.file_type,
                             is_subvolume: e.is_subvolume(),
+                            size,
+                            mtime,
                         });
                     }
                     Ok(true)

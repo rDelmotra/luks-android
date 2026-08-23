@@ -33,6 +33,10 @@ use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::FS_TREE_OBJECTID;
 use crate::fs::btrfs::Btrfs;
 
+/// How deep `delete_file`'s directory recursion may descend before refusing.
+/// See `delete_file_at_depth`.
+const MAX_DELETE_DEPTH: usize = 1024;
+
 impl<D: WriteAt> Btrfs<D> {
     /// Update the modification timestamp (`mtime`) of the file at `path`.
     pub fn set_mtime(&mut self, path: &str, mtime_sec: u64, mtime_nsec: u32) -> Result<()> {
@@ -146,8 +150,66 @@ impl<D: WriteAt> Btrfs<D> {
         self.finish_file(writer, parent_dir_path, filename)
     }
 
-    /// Delete the regular file at `path`.
+    /// Delete the file or directory at `path`. A directory is emptied first,
+    /// depth-first, one committed transaction per child — the same shape as
+    /// deleting each child by hand, so a mid-tree failure (an unsupported
+    /// child type, a symlink, a subvolume boundary) leaves exactly what it
+    /// would if a caller had stopped there themselves, rather than a
+    /// half-applied larger operation.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        // `.` and `..` are never real stored entries on btrfs (see
+        // `list_dir_by_inode`'s doc comment), but `resolve_no_follow` silently
+        // drops `.` components while this function's own root check only
+        // trims `/`. Left unchecked, a path like "/foo/." resolves to "/foo"
+        // itself rather than erroring, so this function would recurse into
+        // and delete every child of "/foo" before the low-level transaction
+        // finally failed trying to remove an entry literally named ".",
+        // reporting failure after having already deleted everything inside.
+        // "/." reaches the same way for the whole volume. Refused outright
+        // before any resolution happens, rather than trusting a raw string
+        // split to agree with what `resolve_no_follow` considers "root" or
+        // "this directory".
+        if path.split('/').any(|c| c == "." || c == "..") {
+            return Err(LuksError::UnsupportedFsFeature(
+                "delete path containing '.' or '..' components".into(),
+            ));
+        }
+        self.delete_file_at_depth(path, 0)
+    }
+
+    fn delete_file_at_depth(&mut self, path: &str, depth: usize) -> Result<()> {
+        // A real directory tree is nowhere near this deep; the bound exists
+        // only to turn a cycle in corrupt on-disk data (a child entry whose
+        // location aliases one of its own ancestors) into a clean error
+        // instead of an unbounded recursion that aborts the process.
+        if depth > MAX_DELETE_DEPTH {
+            return Err(LuksError::CorruptFs(
+                "directory delete recursed past a sane depth — likely a cycle",
+            ));
+        }
+
+        // Checked here too, not just by `Transaction::delete_file` below: that
+        // guard only runs after this function would already have recursed
+        // into every top-level child and deleted the whole volume out from
+        // under it.
+        if path.trim_matches('/').is_empty() {
+            return Err(LuksError::IsADirectory("/".into()));
+        }
+
+        let located = self.resolve_no_follow(self.fs_tree(), path)?;
+        if located.inode.file_type().is_dir() && located.tree.objectid == FS_TREE_OBJECTID {
+            let children = self.list_dir_by_inode(located.tree.bytenr, located.inode.objectid)?;
+            let base = path.trim_end_matches('/');
+            for child in children {
+                let child_path = if base.is_empty() {
+                    format!("/{}", child.name)
+                } else {
+                    format!("{base}/{}", child.name)
+                };
+                self.delete_file_at_depth(&child_path, depth + 1)?;
+            }
+        }
+
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),

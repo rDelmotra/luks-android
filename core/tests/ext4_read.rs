@@ -254,6 +254,22 @@ fn reports_file_metadata() {
     }
 }
 
+#[test]
+fn a_directory_listing_reports_size_and_mtime_matching_file_info() {
+    for name in IMAGES {
+        let data = image(name);
+        let fs = Ext4::mount(&data).unwrap();
+
+        let entries = fs.list_dir("/").unwrap();
+        let entry = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        let info = fs.file_info("/hello.txt").unwrap();
+
+        assert_eq!(entry.size, info.size, "{name}");
+        assert_eq!(entry.mtime, info.mtime, "{name}");
+        assert_eq!(entry.size, 11, "{name}");
+    }
+}
+
 // --- symlinks --------------------------------------------------------------
 
 #[test]

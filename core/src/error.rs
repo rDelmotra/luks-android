@@ -115,6 +115,16 @@ pub enum LuksError {
     #[error("is a directory: {0}")]
     IsADirectory(String),
 
+    /// The low-level single-transaction delete refuses a directory that still
+    /// has children — deleting only its own metadata while entries under it
+    /// remain would orphan them (their storage never freed, their names
+    /// unreachable). The recursive delete empties a directory before this is
+    /// ever reached; surfacing here means recursion stopped partway — at a
+    /// child type it doesn't delete yet, or a concurrent change — not that
+    /// this call itself did anything wrong.
+    #[error("directory is not empty: {0}")]
+    DirectoryNotEmpty(String),
+
     #[error("too many levels of symbolic links resolving {0}")]
     SymlinkLoop(String),
 

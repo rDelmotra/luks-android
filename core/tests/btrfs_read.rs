@@ -946,6 +946,32 @@ fn reads_inode_metadata() {
 }
 
 #[test]
+fn a_directory_listing_reports_size_and_mtime_matching_file_info() {
+    let fs = mount("plain.img");
+    let entries = fs.list_dir("/").unwrap();
+    let entry = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+    let info = fs.file_info("/hello.txt").unwrap();
+
+    assert_eq!(entry.size, info.size);
+    assert_eq!(entry.mtime, info.mtime);
+    assert_eq!(entry.size, 12); // "hello btrfs\n"
+}
+
+#[test]
+fn a_subvolume_entry_reports_zero_size_and_mtime() {
+    // A subvolume's `location` field is a tree id, not an inode in the
+    // listing directory's own tree — reading it as one would either error or,
+    // worse, silently land on an unrelated file that happens to share the
+    // number. Reporting unknown metadata is the only safe answer here.
+    let fs = mount("subvol.img");
+    let entries = fs.list_dir("/").unwrap();
+    let home = entries.iter().find(|e| e.name == "home").unwrap();
+    assert!(home.is_subvolume);
+    assert_eq!(home.size, 0);
+    assert_eq!(home.mtime, 0);
+}
+
+#[test]
 fn a_symlink_is_reported_as_one_rather_than_followed() {
     // Following needs the extent reader, which does not exist yet. The
     // important part is that it does not silently resolve to something else.

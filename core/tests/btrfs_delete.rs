@@ -247,3 +247,111 @@ fn delete_refusal_gates() {
     // Deleting non-existent file should fail with NotFound
     assert!(matches!(fs.delete_file("/nonexistent.txt"), Err(LuksError::NotFound(_))));
 }
+
+#[test]
+fn a_dot_component_is_refused_rather_than_silently_resolving_to_an_ancestor() {
+    // `resolve_no_follow` drops `.` components entirely, so without an
+    // explicit guard "/tree/." resolves to "/tree" itself and this function
+    // would recurse into and delete every child of "/tree" before the
+    // low-level transaction failed trying to remove an item literally named
+    // "." — reporting failure *after* having already deleted everything
+    // inside. This proves the guard fires before any of that happens: the
+    // tree survives completely intact.
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_directory("/", "tree").expect("mkdir tree");
+    fs.create_file_with_data("/tree", "a.txt", b"hello").expect("create a.txt");
+    fs.create_directory("/tree", "nested").expect("mkdir nested");
+    fs.create_file_with_data("/tree/nested", "b.txt", b"world")
+        .expect("create b.txt");
+    // A name that merely *starts* with a dot is a real, ordinary name and
+    // must not be caught by the same guard.
+    fs.create_file_with_data("/tree", ".hidden", b"x").expect("create .hidden");
+
+    for bad in ["/.", "/tree/.", "/tree/..", "..", "/tree/nested/.."] {
+        assert!(
+            matches!(fs.delete_file(bad), Err(LuksError::UnsupportedFsFeature(_))),
+            "expected {bad:?} to be refused"
+        );
+    }
+
+    // Nothing was touched: the whole tree, and the rest of the root, is
+    // exactly as it was.
+    assert!(fs.list_dir("/").unwrap().iter().any(|e| e.name == "tree"));
+    assert_eq!(fs.list_dir("/tree").unwrap().len(), 3);
+    assert_eq!(fs.list_dir("/tree/nested").unwrap().len(), 1);
+    assert_eq!(fs.read_file("/tree/a.txt").unwrap(), b"hello");
+
+    // And an ordinary dotfile deletes normally.
+    fs.delete_file("/tree/.hidden").expect("delete .hidden");
+    assert!(!fs.list_dir("/tree").unwrap().iter().any(|e| e.name == ".hidden"));
+}
+
+#[test]
+fn deleting_an_empty_directory_succeeds() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_directory("/", "empty").expect("mkdir");
+    assert!(fs.list_dir("/").unwrap().iter().any(|e| e.name == "empty"));
+
+    fs.delete_file("/empty").expect("delete empty dir");
+    assert!(!fs.list_dir("/").unwrap().iter().any(|e| e.name == "empty"));
+
+    drop(fs);
+    assert!(run_verify_script(&temp_img), "oracle check failed");
+}
+
+#[test]
+fn deleting_a_directory_recursively_removes_files_and_nested_subdirectories() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_directory("/", "tree").expect("mkdir tree");
+    fs.create_file_with_data("/tree", "a.txt", b"hello").expect("create a.txt");
+    fs.create_directory("/tree", "nested").expect("mkdir nested");
+    fs.create_file_with_data("/tree/nested", "b.txt", b"world")
+        .expect("create b.txt");
+
+    // Sanity: the tree is really there before it's deleted.
+    assert_eq!(fs.list_dir("/tree").unwrap().len(), 2);
+    assert_eq!(fs.list_dir("/tree/nested").unwrap().len(), 1);
+
+    fs.delete_file("/tree").expect("recursive delete");
+
+    assert!(!fs.list_dir("/").unwrap().iter().any(|e| e.name == "tree"));
+    assert!(matches!(fs.read_file("/tree/a.txt"), Err(LuksError::NotFound(_))));
+
+    drop(fs);
+    assert!(run_verify_script(&temp_img), "oracle check failed");
+}
+
+#[test]
+fn the_low_level_transaction_refuses_a_directory_that_still_has_children() {
+    // Defense in depth: `Btrfs::delete_file` empties a directory before it
+    // ever reaches `Transaction::delete_file`, so this guard should be
+    // unreachable in practice — proving it fires anyway is what makes that
+    // "should be" load-bearing rather than assumed.
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    fs.create_directory("/", "has_stuff").expect("mkdir");
+    fs.create_file_with_data("/has_stuff", "inside.txt", b"x")
+        .expect("create file inside");
+
+    let res = luks_core::fs::btrfs::write::Transaction::delete_file(&fs, "/has_stuff", 0, 0);
+    assert!(matches!(res, Err(LuksError::DirectoryNotEmpty(_))));
+}

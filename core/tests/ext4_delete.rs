@@ -179,19 +179,148 @@ fn deleting_a_nonexistent_file_returns_not_found() {
 }
 
 #[test]
-fn deleting_a_directory_is_refused() {
-    let path = scratch("csum-uuid-4k.img", "delete-dir");
+fn deleting_the_root_directory_is_refused() {
+    let path = scratch("csum-uuid-4k.img", "delete-root");
     let mut fs = open(&path);
-    
-    // Refuse root directory
-    let res1 = fs.delete_file("/");
-    assert!(res1.is_err());
-    assert!(matches!(res1.unwrap_err(), luks_core::error::LuksError::IsADirectory(_)));
 
-    // Refuse resolving intermediate or existing directories as files
-    let res2 = fs.delete_file("/lost+found");
-    assert!(res2.is_err());
-    assert!(matches!(res2.unwrap_err(), luks_core::error::LuksError::IsADirectory(_)));
+    let res = fs.delete_file("/");
+    assert!(res.is_err());
+    assert!(matches!(res.unwrap_err(), luks_core::error::LuksError::IsADirectory(_)));
+}
+
+#[test]
+fn a_dot_component_is_refused_rather_than_silently_resolving_to_an_ancestor() {
+    // `resolve`/`resolve_no_follow` collapse `.` and `..` during path
+    // resolution, but this function's own root check and its `rsplit_once`
+    // name-split operate on the raw, un-normalized string. Without an
+    // explicit guard, "/tree/." would resolve to "/tree" itself, so this
+    // function would recurse into and delete every child of "/tree" before
+    // the final `unlink_file(parent, ".")` failed name validation —
+    // reporting failure *after* everything inside was already gone. This
+    // proves the guard fires first: the tree survives completely intact.
+    let path = scratch("big-4k.img", "dot-component-refused");
+    let mut fs = open(&path);
+
+    let top = fs.create_directory(2, "tree").expect("mkdir tree");
+    fs.create_file(top as u64, "a.txt", b"hello", FileType::Regular)
+        .expect("create a.txt");
+    let nested = fs.create_directory(top, "nested").expect("mkdir nested");
+    fs.create_file(nested as u64, "b.txt", b"world", FileType::Regular)
+        .expect("create b.txt");
+    // A name that merely *starts* with a dot is a real, ordinary name and
+    // must not be caught by the same guard.
+    fs.create_file(top as u64, ".hidden", b"x", FileType::Regular)
+        .expect("create .hidden");
+    fs.flush().expect("flush");
+
+    for bad in ["/.", "/tree/.", "/tree/..", "..", "/tree/nested/.."] {
+        let res = fs.delete_file(bad);
+        assert!(
+            matches!(res, Err(luks_core::error::LuksError::UnsupportedFsFeature(_))),
+            "expected {bad:?} to be refused, got {res:?}"
+        );
+    }
+
+    assert!(fs.list_dir("/").unwrap().iter().any(|e| e.name == "tree"));
+    assert_eq!(fs.list_dir("/tree").unwrap().len(), 3);
+    assert_eq!(fs.list_dir("/tree/nested").unwrap().len(), 1);
+
+    fs.delete_file("/tree/.hidden").expect("delete .hidden");
+    assert!(!fs.list_dir("/tree").unwrap().iter().any(|e| e.name == ".hidden"));
+}
+
+#[test]
+fn deleting_an_empty_directory_removes_it_and_restores_the_parent_link_count() {
+    let path = scratch("big-4k.img", "delete-empty-dir");
+    let mut fs = open(&path);
+
+    let links_before = fs.read_inode(2).unwrap().links;
+    fs.create_directory(2, "empty").expect("mkdir");
+    fs.flush().expect("flush");
+    assert_eq!(
+        fs.read_inode(2).unwrap().links,
+        links_before + 1,
+        "create_directory bumps the parent's link count for the new '..'"
+    );
+
+    fs.delete_file("/empty").expect("delete empty dir");
+    fs.flush().expect("flush");
+
+    assert!(!fs
+        .list_dir("/")
+        .unwrap()
+        .iter()
+        .any(|e| e.name == "empty"));
+    assert_eq!(
+        fs.read_inode(2).unwrap().links,
+        links_before,
+        "deleting the subdirectory must give back the link its '..' added"
+    );
+}
+
+#[test]
+fn deleting_a_directory_recursively_removes_files_and_nested_subdirectories() {
+    let path = scratch("big-4k.img", "delete-recursive-dir");
+    let mut fs = open(&path);
+
+    let top = fs.create_directory(2, "tree").expect("mkdir tree");
+    fs.create_file(top as u64, "a.txt", b"hello", FileType::Regular)
+        .expect("create a.txt");
+    let nested = fs.create_directory(top, "nested").expect("mkdir nested");
+    fs.create_file(nested as u64, "b.txt", b"world", FileType::Regular)
+        .expect("create b.txt");
+    fs.flush().expect("flush");
+
+    // Sanity: the tree is really there before it's deleted.
+    assert_eq!(fs.list_dir("/tree").unwrap().len(), 2);
+    assert_eq!(fs.list_dir("/tree/nested").unwrap().len(), 1);
+
+    fs.delete_file("/tree").expect("recursive delete");
+    fs.flush().expect("flush");
+
+    assert!(!fs.list_dir("/").unwrap().iter().any(|e| e.name == "tree"));
+    // Every inode involved must actually be gone, not just unreachable —
+    // re-reading by number should fail rather than return a zeroed record
+    // that still looks plausible.
+    assert!(fs.resolve_no_follow("/tree").is_err());
+    assert!(fs.resolve_no_follow("/tree/a.txt").is_err());
+    assert!(fs.resolve_no_follow("/tree/nested").is_err());
+    assert!(fs.resolve_no_follow("/tree/nested/b.txt").is_err());
+}
+
+#[test]
+fn deleting_a_directory_recursively_leaves_e2fsck_clean() {
+    let Some(script) = verify_script() else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    for name in FIXTURES {
+        let path = scratch(name, "clean-recursive-delete");
+        {
+            let mut fs = open(&path);
+            let top = fs.create_directory(2, "tree").expect("mkdir tree");
+            fs.create_file(top as u64, "a.txt", b"hello", FileType::Regular)
+                .expect("create a.txt");
+            let nested = fs.create_directory(top, "nested").expect("mkdir nested");
+            fs.create_file(nested as u64, "b.txt", b"world", FileType::Regular)
+                .expect("create b.txt");
+            fs.flush().expect("flush");
+
+            fs.delete_file("/tree").expect("recursive delete");
+            fs.flush().expect("flush");
+        }
+
+        let output = Command::new(&script)
+            .arg(&path)
+            .output()
+            .expect("run verify-ext4.sh");
+        assert!(
+            output.status.success(),
+            "{name}: e2fsck reported problems after recursive delete:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 #[test]

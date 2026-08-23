@@ -53,10 +53,31 @@ impl Transaction {
                 "subvolume file deletion not yet supported".into(),
             ));
         }
-        if located_target.inode.file_type().is_dir() {
-            return Err(LuksError::IsADirectory(path.to_string()));
-        }
-        if !located_target.inode.file_type().is_file() {
+        let target_is_dir = located_target.inode.file_type().is_dir();
+        if target_is_dir {
+            // DIR_INDEX and DIR_ITEM always come in pairs per entry (see
+            // `list_dir_by_inode`), so one DIR_INDEX item proves the
+            // directory has at least one child. Below, deleting a directory
+            // reuses the same generic "every item keyed under this objectid"
+            // sweep as deleting a file's own metadata — for a directory that
+            // sweep would also catch its children's DIR_ITEM/DIR_INDEX
+            // entries (they're keyed under the *parent's* objectid), erasing
+            // the names without freeing what they pointed to. Refusing a
+            // non-empty directory here is what prevents that.
+            let mut has_children = false;
+            fs.for_each_item(
+                fs.fs_tree().bytenr,
+                located_target.inode.objectid,
+                DIR_INDEX_KEY,
+                &mut |_, _| {
+                    has_children = true;
+                    Ok(false)
+                },
+            )?;
+            if has_children {
+                return Err(LuksError::DirectoryNotEmpty(path.to_string()));
+            }
+        } else if !located_target.inode.file_type().is_file() {
             return Err(LuksError::UnsupportedFsFeature(
                 "deleting non-regular files is not supported".into(),
             ));
