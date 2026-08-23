@@ -471,20 +471,48 @@ class LuksProxyCallbackTest {
         assertFalse(PendingDocuments.isPending(docId))
     }
 
+    /**
+     * DEFECT 3: a write-mode proxy that closes without a single onWrite is a genuinely empty
+     * file, not an abandoned create -- the platform's own FileSystemProvider leaves a real
+     * empty file behind in this situation, and this provider now does too (via a streaming
+     * write begun and finished with zero chunks, exactly like
+     * jni/tests/write_path.rs::a_zero_byte_streaming_write_finishes_cleanly proves is safe
+     * and durable at the native layer).
+     */
     @Test
-    fun testWrite_onReleaseWithNoWrites_materializesNothing() {
+    fun testWrite_onReleaseWithNoWrites_materializesAnEmptyFile() {
         val docId = PendingDocuments.register("/", "untouched.bin")
         val callback = LuksWriteProxyCallback(session = session, documentId = docId)
 
         callback.onRelease()
 
-        assertTrue(testVolume.writtenFiles.isEmpty())
+        assertEquals(1, testVolume.writtenFiles.size)
+        val (parentPath, name, combined) = testVolume.writtenFiles.single()
+        assertEquals("/", parentPath)
+        assertEquals("untouched.bin", name)
+        assertEquals(0, combined.size)
         assertTrue(testVolume.abandonedWriters.isEmpty())
-        // The registration is dropped rather than left open for a second attempt: a caller
-        // that created a document and closed it unwritten has abandoned it, and a surviving
-        // entry would keep queryDocument reporting a 0-byte file that never materializes --
-        // visible to the user as a real file they cannot open.
+        // The registration is consumed once the file is real, same as a written file.
         assertFalse(PendingDocuments.isPending(docId))
+    }
+
+    /**
+     * The transfer-wide mutex must be released after materializing a zero-byte file exactly
+     * as it would be after a non-empty one -- otherwise every empty-file create through SAF
+     * would permanently wedge every subsequent write.
+     */
+    @Test
+    fun testWrite_onReleaseWithNoWrites_releasesTheTransferLockAfterMaterializing() {
+        val docId = PendingDocuments.register("/", "untouched2.bin")
+        val callback = LuksWriteProxyCallback(session = session, documentId = docId)
+
+        callback.onRelease()
+
+        val stillFree = runBlocking { dev.luksandroid.session.TransferManager.tryAcquireForSafWrite(100L) }
+        assertTrue("the SAF write lock must be free after materializing an empty file", stillFree)
+        if (stillFree) {
+            dev.luksandroid.session.TransferManager.releaseSafWriteLock()
+        }
     }
 
     @Test

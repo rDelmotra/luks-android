@@ -222,13 +222,51 @@ open class LuksProxyCallback(
             return
         }
 
-        // No onWrite call ever arrived on this stream: the caller created a document and then
-        // abandoned it before writing anything. Drop the registration, or the provider keeps
-        // synthesizing a 0-byte row for a document that will never exist until the session
-        // locks. Read-mode proxies never reach here at all (see the early return above): they
-        // never owned a pending entry to drop.
-        PendingDocuments.remove(documentId)
-        releaseWriteLockIfHeld()
+        // No onWrite call ever arrived on this stream.
+        val pending = PendingDocuments.get(documentId)
+        if (pending == null) {
+            // Either this callback was never registered as pending (a callback built
+            // directly, as tests do, against an id createDocument never issued) or the
+            // registry was cleared out from underneath us by a session lock/detach -- either
+            // way there is nothing to materialize against.
+            PendingDocuments.remove(documentId)
+            releaseWriteLockIfHeld()
+            return
+        }
+
+        // DEFECT 3: a write-mode proxy that closes without a single onWrite is a genuinely
+        // empty file the caller created and immediately closed -- not an abandoned create.
+        // The platform's own FileSystemProvider leaves a real empty file behind in exactly
+        // this situation; this provider used to differ only because materializing one meant
+        // claiming the native writer during a release path that did not otherwise hold it.
+        // It does now: claim the transfer-wide mutex first, exactly like the first onWrite of
+        // a non-empty stream would, then begin a streaming write and finish it with zero
+        // chunks. Proven durable by the jni suite's
+        // a_zero_byte_streaming_write_finishes_cleanly (jni/tests/write_path.rs).
+        val acquired = try {
+            runBlocking { TransferManager.tryAcquireForSafWrite() }
+        } catch (t: Throwable) {
+            false
+        }
+        if (!acquired) {
+            // Cannot safely materialize without exclusive access to the native writer, and
+            // the caller has already closed its descriptor -- there is no second chance to
+            // retry from here. Drop the pending registration rather than leave it to
+            // synthesize a 0-byte row for a document that will never exist.
+            PendingDocuments.remove(documentId)
+            return
+        }
+        writeLockHeld = true
+
+        val emptyWriter = try {
+            runBlocking { session.withLease { it.beginFileStreaming() } }
+        } catch (t: Throwable) {
+            Trace.e("LuksProxyCallback: beginFileStreaming for an empty file failed: ${throwableSummary(t)}")
+            PendingDocuments.remove(documentId)
+            releaseWriteLockIfHeld()
+            return
+        }
+        finishOrAbandon(emptyWriter)
     }
 
     /**
