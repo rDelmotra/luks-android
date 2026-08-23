@@ -128,7 +128,13 @@ object TreeImporter {
                         dirsCreated++
                     }
                 }
-                fireProgress(entry.relativePath, bytesCopied, force = false)
+                // A whole entry finished: fire unconditionally, not throttled
+                // like the intra-file chunk callback below. Entries are already
+                // rate-limited by I/O, and StateFlow conflates bursts, so this
+                // cannot flood the UI -- it is what keeps a many-small-files
+                // transfer looking alive instead of stuck at 0% until it
+                // finishes (the exact shape of 2026-08-23).
+                fireProgress(entry.relativePath, bytesCopied, force = true)
                 continue
             }
 
@@ -143,7 +149,7 @@ object TreeImporter {
                 when (collisionMode) {
                     CollisionMode.SKIP -> {
                         filesSkipped++
-                        fireProgress(entry.relativePath, bytesCopied, force = false)
+                        fireProgress(entry.relativePath, bytesCopied, force = true)
                         continue
                     }
 
@@ -160,7 +166,7 @@ object TreeImporter {
                         destination.recordCreatedFile(parentDir, targetName)
                         bytesCopied += written
                         filesCopied++
-                        fireProgress(entry.relativePath, bytesCopied, force = false)
+                        fireProgress(entry.relativePath, bytesCopied, force = true)
                     }
 
                     CollisionMode.REPLACE -> {
@@ -192,7 +198,7 @@ object TreeImporter {
                         destination.recordCreatedFile(parentDir, name)
                         bytesCopied += written
                         filesCopied++
-                        fireProgress(entry.relativePath, bytesCopied, force = false)
+                        fireProgress(entry.relativePath, bytesCopied, force = true)
                     }
                 }
                 continue
@@ -210,7 +216,7 @@ object TreeImporter {
             destination.recordCreatedFile(parentDir, name)
             bytesCopied += written
             filesCopied++
-            fireProgress(entry.relativePath, bytesCopied, force = false)
+            fireProgress(entry.relativePath, bytesCopied, force = true)
         }
 
         fireProgress(lastPath, bytesCopied, force = true)

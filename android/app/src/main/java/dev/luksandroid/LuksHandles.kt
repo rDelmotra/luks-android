@@ -439,9 +439,24 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             LuksNative.nativeWriteChunk(handle, writerHandle, data, len)
         }
 
+        // Reused across every chunk this writer streams, not reallocated per
+        // call: a directory import can stream thousands of chunks through one
+        // FileWriter's whole lifetime (one writer per file, many chunks per
+        // writer), and allocating a fresh off-heap ByteBuffer for each one is
+        // real, measurable overhead that single-file import never pays --
+        // it reads straight into one direct buffer for the file's duration.
+        // Grown, never shrunk, so a later larger chunk (should not happen at
+        // today's fixed chunk size, but this must not silently truncate if it
+        // ever does) still fits.
+        private var scratch: java.nio.ByteBuffer? = null
+
         open fun write(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size) {
             require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "invalid slice bounds" }
-            val buf = java.nio.ByteBuffer.allocateDirect(length)
+            val buf = scratch.let { existing ->
+                if (existing != null && existing.capacity() >= length) existing
+                else java.nio.ByteBuffer.allocateDirect(length).also { scratch = it }
+            }
+            buf.clear()
             buf.put(bytes, offset, length)
             buf.flip()
             write(buf, length)

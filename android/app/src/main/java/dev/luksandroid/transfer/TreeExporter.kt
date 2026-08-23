@@ -181,7 +181,10 @@ object TreeExporter {
                         dirsCreated++
                     }
                 }
-                fireProgress(entry.relativePath, bytesCopied, force = false)
+                // A whole entry finished: fire unconditionally, not throttled
+                // like the intra-file chunk callback below -- see TreeImporter's
+                // reasoning.
+                fireProgress(entry.relativePath, bytesCopied, force = true)
                 continue
             }
 
@@ -194,7 +197,7 @@ object TreeExporter {
 
             if (existing == false && collisionMode == CollisionMode.SKIP) {
                 filesSkipped++
-                fireProgress(entry.relativePath, bytesCopied, force = false)
+                fireProgress(entry.relativePath, bytesCopied, force = true)
                 continue
             }
 
@@ -241,7 +244,7 @@ object TreeExporter {
             state.recordCreatedFile(parentId, created)
             bytesCopied += written
             filesCopied++
-            fireProgress(entry.relativePath, bytesCopied, force = false)
+            fireProgress(entry.relativePath, bytesCopied, force = true)
         }
 
         fireProgress(lastPath, bytesCopied, force = true)
