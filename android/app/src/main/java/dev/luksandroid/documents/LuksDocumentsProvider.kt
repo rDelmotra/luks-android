@@ -13,6 +13,7 @@ import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
 import android.webkit.MimeTypeMap
 import dev.luksandroid.LuksException
+import dev.luksandroid.LuksVolume
 import dev.luksandroid.R
 import dev.luksandroid.Trace
 import dev.luksandroid.session.LuksSession
@@ -124,6 +125,67 @@ open class LuksDocumentsProvider(
                 projection.map { it }.toTypedArray()
             } else {
                 defaultProjection
+            }
+        }
+
+        /**
+         * Whether [name] already refers to something at [parentPath] -- either a real,
+         * on-disk entry (via [LuksVolume.listDir]) or a still-pending, not-yet-materialized
+         * document (via [PendingDocuments]).
+         *
+         * TOCTOU note: this check and whatever the caller does with its answer are not
+         * atomic with each other. Something else (an external tool touching the same
+         * volume, or an unrelated create racing this one) can still claim the name in the
+         * gap between this call returning and the caller's native op committing. That
+         * window is real and is not closed here -- see [renameDocument] and the class doc
+         * on [LuksProxyCallback] for how each caller copes with what slips through it.
+         */
+        internal fun nameExistsAt(volume: LuksVolume, parentPath: String, name: String): Boolean {
+            val docId = if (parentPath == "/") "/$name" else "$parentPath/$name"
+            if (PendingDocuments.isPending(docId)) return true
+            return volume.listDir(parentPath).any { it.name == name }
+        }
+
+        /**
+         * Picks a name that does not collide with anything already at [parentPath] --
+         * on-disk or still-pending, per [nameExistsAt] -- starting from [desiredName] and
+         * appending " (1)", " (2)", ... before the extension, the same scheme
+         * `FileSystemProvider.createDocument` uses on the platform. SAF's `createDocument`
+         * contract explicitly allows a provider to return a different display name than the
+         * one requested, which is why it returns an id rather than void.
+         *
+         * A name with no extension, or one that starts with a dot ("`.gitignore`"), is
+         * treated as pure stem with no extension -- the same rule most file managers use.
+         * The result is kept within a 255-byte (UTF-8) filename, truncating the stem so the
+         * numbering and extension both survive.
+         *
+         * Used up front by [createDocument] (see DEFECT 2) and, as defence in depth, by
+         * [LuksProxyCallback.onRelease] when `finishFile` rejects the already-checked name at
+         * commit time -- see that class's doc for why a byte-preserving retry is not possible
+         * there even with this helper.
+         */
+        internal fun uniqueDocumentName(volume: LuksVolume, parentPath: String, desiredName: String): String {
+            if (!nameExistsAt(volume, parentPath, desiredName)) return desiredName
+
+            val dotIndex = desiredName.lastIndexOf('.')
+            val (stem, ext) = if (dotIndex > 0) {
+                desiredName.substring(0, dotIndex) to desiredName.substring(dotIndex)
+            } else {
+                desiredName to ""
+            }
+
+            val maxBytes = 255
+            var n = 1
+            while (true) {
+                val suffix = " ($n)"
+                var candidateStem = stem
+                var candidate = "$candidateStem$suffix$ext"
+                while (candidate.toByteArray(Charsets.UTF_8).size > maxBytes && candidateStem.isNotEmpty()) {
+                    candidateStem = candidateStem.dropLast(1)
+                    candidate = "$candidateStem$suffix$ext"
+                }
+                if (!nameExistsAt(volume, parentPath, candidate)) return candidate
+                n++
             }
         }
     }
@@ -549,6 +611,42 @@ open class LuksDocumentsProvider(
                     val lastSlash = docId.lastIndexOf('/')
                     val parentPath = if (lastSlash <= 0) "/" else docId.substring(0, lastSlash)
                     val oldName = docId.substring(lastSlash + 1)
+
+                    // DEFECT 1: the native rename implements POSIX semantics -- a collision on
+                    // the destination name is not refused, it is FREED (its extents released,
+                    // its dentry replaced): core/src/fs/btrfs/write/txn/rename.rs and
+                    // core/src/fs/ext4/file.rs both do this deliberately. Android's own
+                    // FileSystemProvider.renameDocument fails on collision rather than
+                    // overwriting, and this provider must match that or a rename onto an
+                    // existing name silently and irreversibly destroys it. Skipped entirely
+                    // for a no-op rename (newName == oldName): that is not a collision, it is
+                    // the file colliding with itself.
+                    //
+                    // This check and the native rename below are not atomic with each other --
+                    // see nameExistsAt's doc comment. That window is accepted, not pretended
+                    // away: closing it would need a native check-and-rename primitive this
+                    // codebase does not have.
+                    // DEFECT 1: the native rename implements POSIX semantics -- a collision on
+                    // the destination name is not refused, it is FREED (its extents released,
+                    // its dentry replaced): core/src/fs/btrfs/write/txn/rename.rs and
+                    // core/src/fs/ext4/file.rs both do this deliberately. Android's own
+                    // FileSystemProvider.renameDocument fails on collision rather than
+                    // overwriting, and this provider must match that or a rename onto an
+                    // existing name silently and irreversibly destroys it. Skipped entirely
+                    // for a no-op rename (newName == oldName): that is not a collision, it is
+                    // the file colliding with itself.
+                    //
+                    // This check and the native rename below are not atomic with each other --
+                    // see nameExistsAt's doc comment. That window is accepted, not pretended
+                    // away: closing it would need a native check-and-rename primitive this
+                    // codebase does not have.
+                    if (newName != oldName && nameExistsAt(volume, parentPath, newName)) {
+                        throw LuksException(
+                            "a document with that name already exists here",
+                            LuksException.ALREADY_EXISTS,
+                        )
+                    }
+
                     volume.rename(parentPath, oldName, parentPath, newName)
                     val newDocId = if (parentPath == "/") "/$newName" else "$parentPath/$newName"
                     runCatching {

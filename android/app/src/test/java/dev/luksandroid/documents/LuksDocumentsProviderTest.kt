@@ -435,6 +435,67 @@ class LuksDocumentsProviderTest {
     }
 
     /**
+     * DEFECT 1: renameDocument must refuse a rename onto a name that already exists,
+     * matching the platform's own FileSystemProvider rather than the native layer's POSIX
+     * semantics (which silently free the destination's extents -- see
+     * core/src/fs/btrfs/write/txn/rename.rs and core/src/fs/ext4/file.rs). The native
+     * `rename` call must never even be reached once a collision is detected -- that is the
+     * only proof that nothing was destroyed.
+     */
+    @Test
+    fun testRenameDocument_refusesWhenDestinationNameAlreadyExists() {
+        testVolume.entriesMap["/"] = listOf(
+            Entry("keep_me.txt", "file"),
+            Entry("old_name.txt", "file"),
+        )
+
+        try {
+            provider.renameDocument("/old_name.txt", "keep_me.txt")
+            fail("Expected an exception when renaming onto an existing name")
+        } catch (e: IllegalStateException) {
+            // Success: ALREADY_EXISTS maps to IllegalStateException via mapLuksException,
+            // the same path a native-side collision would take.
+        }
+
+        // The native rename must never have been called -- the destination survives.
+        assertTrue("rename must not reach the volume once a collision is detected", testVolume.renamedFiles.isEmpty())
+    }
+
+    /**
+     * DEFECT 1 (pending-document half): a rename must also be refused when the destination
+     * name is claimed by a still-pending (not yet materialized) document, not only by a
+     * real on-disk entry -- otherwise a rename could collide with a file mid-upload that
+     * `listDir` cannot see yet.
+     */
+    @Test
+    fun testRenameDocument_refusesWhenDestinationNameIsPending() {
+        testVolume.entriesMap["/"] = listOf(Entry("old_name.txt", "file"))
+        PendingDocuments.register("/", "incoming.txt")
+
+        try {
+            provider.renameDocument("/old_name.txt", "incoming.txt")
+            fail("Expected an exception when renaming onto a pending document's name")
+        } catch (e: IllegalStateException) {
+            // Success
+        }
+        assertTrue(testVolume.renamedFiles.isEmpty())
+    }
+
+    /**
+     * A no-op rename (new name equal to the current name) is not a collision with itself
+     * and must be allowed through to the native layer unchanged.
+     */
+    @Test
+    fun testRenameDocument_sameNameIsNotTreatedAsACollision() {
+        testVolume.entriesMap["/"] = listOf(Entry("same.txt", "file"))
+
+        val newDocId = provider.renameDocument("/same.txt", "same.txt")
+
+        assertEquals("/same.txt", newDocId)
+        assertEquals(listOf("/", "same.txt", "/", "same.txt"), testVolume.renamedFiles.last())
+    }
+
+    /**
      * Test Pass M.5: the provider must never advertise or act on a write capability the
      * loaded .so cannot deliver. With `writeSupported` false (the fake's default, matching
      * a build without dangerous-write-support), createDocument refuses both kinds and
