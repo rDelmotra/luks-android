@@ -49,6 +49,33 @@ class TransferPrecheckTest {
     private fun subvol(id: Long, name: String, path: String, readOnly: Boolean) =
         SubvolumeInfo(id = id, name = name, path = path, readOnly = readOnly)
 
+    // ---- duplicate names within the source itself ----
+
+    @Test
+    fun `two source entries with the same path are refused`() {
+        // A local filesystem cannot produce this, but SAF display names are not
+        // unique -- cloud providers allow two documents with one name in a
+        // folder. Unchecked, the second write silently overwrites the first and
+        // the import still reports success.
+        val p = plan(file("a.jpg"), file("b.jpg"), file("a.jpg"))
+
+        val v = precheckTransfer(p, destination())
+
+        assertTrue("duplicate source names must refuse, got $v", v is Verdict.Refused)
+        assertTrue((v as Verdict.Refused).reasons.any { it is Refusal.DuplicateSourceNames })
+    }
+
+    @Test
+    fun `the same name in two different folders is not a duplicate`() {
+        // The control: "a.jpg" in two different directories is completely
+        // ordinary and must not trip the check.
+        val p = plan(dir("one"), dir("two"), file("one/a.jpg"), file("two/a.jpg"))
+
+        val v = precheckTransfer(p, destination())
+
+        assertTrue("distinct folders must not refuse, got $v", v is Verdict.Proceed)
+    }
+
     // ---- collisions do not consume new directory slots ----
 
     @Test

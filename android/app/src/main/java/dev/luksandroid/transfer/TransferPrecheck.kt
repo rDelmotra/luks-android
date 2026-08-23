@@ -65,6 +65,11 @@ sealed class Refusal(val message: String) {
     )
 
     class ReadOnlyDestination(reason: String) : Refusal(reason)
+
+    class DuplicateSourceNames(val relativePath: String) : Refusal(
+        "The source reports two entries named '$relativePath' in the same folder. " +
+            "One would silently overwrite the other, so this must be resolved at the source."
+    )
 }
 
 /** A file-vs-file name collision at the leaves: the user decides keep-both / replace / skip. */
@@ -124,7 +129,20 @@ fun precheckTransfer(plan: TransferPlan, destination: Destination): Verdict {
         refusals += Refusal.InsufficientSpace(needed, destination.statFs.availableBytes, plan.hasUnknownSizes)
     }
 
-    // 2. Collisions, split by type. Computed once and reused for the ceiling's
+    // 2. Two source entries with the same path. A local filesystem cannot
+    // produce this, but SAF display names are not guaranteed unique and cloud
+    // providers do allow two documents with one name in a folder. The walker
+    // reports the source faithfully, so it is caught here: unchecked, the
+    // second write would silently overwrite the first and the copy would look
+    // like it succeeded.
+    val seenPaths = HashSet<String>()
+    for (entry in plan.entries) {
+        if (!seenPaths.add(entry.relativePath)) {
+            refusals += Refusal.DuplicateSourceNames(entry.relativePath)
+        }
+    }
+
+    // 3. Collisions, split by type. Computed once and reused for the ceiling's
     // temp-slot count below.
     val fileCollisionCountByDir = mutableMapOf<String, Int>()
     val dirMergeCountByDir = mutableMapOf<String, Int>()
@@ -145,7 +163,7 @@ fun precheckTransfer(plan: TransferPlan, destination: Destination): Verdict {
         }
     }
 
-    // 3. The ext4 directory-entry ceiling. btrfs has no such limit -- skip
+    // 4. The ext4 directory-entry ceiling. btrfs has no such limit -- skip
     // entirely rather than run a check that can never fire.
     if (destination.fsType == "ext4") {
         val ceiling = ext4DirectoryEntryCeiling(destination.statFs.blockSize)
@@ -182,7 +200,7 @@ fun precheckTransfer(plan: TransferPlan, destination: Destination): Verdict {
         }
     }
 
-    // 4. Read-only btrfs subvolume destination.
+    // 5. Read-only btrfs subvolume destination.
     val (readOnly, reason) = isPathInsideReadOnlySubvolume(destination.targetPath, destination.fsType, destination.subvolumes)
     if (readOnly) {
         refusals += Refusal.ReadOnlyDestination(reason ?: "Destination is inside a read-only subvolume.")
