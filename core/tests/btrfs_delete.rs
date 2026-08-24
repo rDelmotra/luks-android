@@ -355,3 +355,42 @@ fn the_low_level_transaction_refuses_a_directory_that_still_has_children() {
     let res = luks_core::fs::btrfs::write::Transaction::delete_file(&fs, "/has_stuff", 0, 0);
     assert!(matches!(res, Err(LuksError::DirectoryNotEmpty(_))));
 }
+
+#[test]
+fn deleting_deep_tree_collapses_root_and_allows_subsequent_creation() {
+    let temp_img = copy_to_temp("mixed-4k.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+    // 1. Create many files to force an interior split (tree level >= 1)
+    let payload = vec![0xAB; 2048];
+    for i in 0..40 {
+        fs.create_file_with_data("/", &format!("split_file_{i:03}.bin"), &payload)
+            .expect("create file to induce split");
+    }
+
+    let entries_before = fs.list_dir("/").expect("list dir");
+    assert!(entries_before.len() >= 40);
+
+    // 2. Delete all created files — this empties leaves and shrinks interior nodes
+    for entry in entries_before {
+        if entry.name != "." && entry.name != ".." && entry.name != "lost+found" {
+            let path = format!("/{}", entry.name);
+            fs.delete_file(&path).expect("delete file");
+        }
+    }
+
+    // 3. Now create a new file in the emptied / collapsed tree
+    let new_file_data = b"fresh file in collapsed root";
+    fs.create_file_with_data("/", "after_delete.txt", new_file_data)
+        .expect("create file in collapsed tree must succeed");
+
+    let read_back = fs.read_file("/after_delete.txt").expect("read back file");
+    assert_eq!(read_back, new_file_data);
+
+    drop(fs);
+    assert!(run_verify_script(&temp_img), "oracle check failed");
+}
+

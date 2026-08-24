@@ -349,6 +349,9 @@ impl Node {
     /// a corruption case: searching for `(inode, DIR_INDEX, 0)` in a tree whose
     /// first key is higher is an ordinary way to start a directory scan.
     pub fn child_for(&self, key: &Key) -> Result<usize> {
+        if self.nr_items == 0 {
+            return Err(LuksError::CorruptFs("btrfs interior node has no child pointers"));
+        }
         let bound = self.lower_bound(key)?;
         if bound < self.nr_items && self.key(bound)? == *key {
             return Ok(bound);

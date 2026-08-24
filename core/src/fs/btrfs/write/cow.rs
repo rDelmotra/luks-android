@@ -71,15 +71,15 @@ pub fn cow_tree_insert<D: ReadAt>(
         &mut freed,
     )?;
 
+    let root_node = read_node(fs, pending, root_bytenr)?;
+    let chunk_tree_uuid = root_node.chunk_tree_uuid();
+
     if !extra_siblings.is_empty() {
-        // The root itself split! We must create a new interior root node at level root_level + 1
+        // The root itself split! We must create a new interior root node
         let sb = fs.superblock();
-        let new_root_level = root_level + 1;
+        let new_root_level = if root_node.nr_items == 0 { 1 } else { root_level + 1 };
         let new_root_bytenr = allocator.allocate_metadata_for_owner(sb.node_size, owner)?;
         allocated.push((new_root_bytenr, new_root_level));
-
-        let root_node = read_node(fs, pending, root_bytenr)?;
-        let chunk_tree_uuid = root_node.chunk_tree_uuid();
 
         let mut entries = vec![crate::fs::btrfs::write::node::InteriorEntry {
             key: left_first_key,
@@ -117,9 +117,10 @@ pub fn cow_tree_insert<D: ReadAt>(
             freed,
         })
     } else {
+        let actual_root_level = if root_node.nr_items == 0 { 0 } else { root_level };
         Ok(CowResult {
             new_root_bytenr: left_bytenr,
-            new_root_level: root_level,
+            new_root_level: actual_root_level,
             emitted_blocks: emitted,
             allocated,
             freed,
@@ -218,9 +219,22 @@ fn cow_descend_insert<D: ReadAt>(
 
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
 
-    if level == 0 {
-        // Leaf node
-        let mut leaf = Leaf::from_node(&node, csum_type)?;
+    if level == 0 || node.nr_items == 0 {
+        // Leaf node (or recovering from an emptied interior root node)
+        let mut leaf = if node.is_leaf() {
+            Leaf::from_node(&node, csum_type)?
+        } else {
+            Leaf {
+                bytenr: node.bytenr(),
+                generation: node.generation,
+                owner: node.owner,
+                flags: 1, // WRITTEN
+                metadata_uuid: node.metadata_uuid(),
+                chunk_tree_uuid: node.chunk_tree_uuid(),
+                csum_type,
+                items: Vec::new(),
+            }
+        };
         let needed = crate::fs::btrfs::tree::ITEM_SIZE + target_data.len();
 
         if needed <= leaf.free_space(node_size) {
@@ -486,13 +500,13 @@ where
     // items violates nothing (a freshly-`mkfs`'d csum tree looks exactly like
     // that). Reaching `None` here would mean that contract was broken, so fail
     // closed rather than write a tree with no root at all.
-    let (new_root_bytenr, _) = root_res.ok_or(LuksError::CorruptFs(
+    let (new_root_bytenr, _, new_root_level) = root_res.ok_or(LuksError::CorruptFs(
         "btrfs CoW removed the tree root; a root has no parent to be removed from",
     ))?;
 
     Ok(CowResult {
         new_root_bytenr,
-        new_root_level: root_level,
+        new_root_level,
         emitted_blocks: emitted,
         allocated,
         freed,
@@ -512,7 +526,7 @@ fn cow_descend<D: ReadAt, F>(
     freed: &mut Vec<(u64, u8)>,
     is_root: bool,
     mutate_fn: F,
-) -> Result<(Option<(u64, Key)>, Vec<(u64, Vec<u8>)>)>
+) -> Result<(Option<(u64, Key, u8)>, Vec<(u64, Vec<u8>)>)>
 where
     F: FnOnce(&mut Leaf) -> Result<()>,
 {
@@ -570,7 +584,7 @@ where
         let emitted = leaf.emit(node_size)?;
         let first_key = leaf.items.first().map(|it| it.key).unwrap_or(*target_key);
         Ok((
-            Some((target_bytenr, first_key)),
+            Some((target_bytenr, first_key, 0)),
             vec![(target_bytenr, emitted)],
         ))
     } else {
@@ -598,7 +612,7 @@ where
             // Update child pointer in interior node. See the matching comment
             // in cow_descend_insert above: the key must always be propagated,
             // even for child_idx == 0, or the parent's minimum goes stale.
-            Some((new_child_bytenr, new_child_key)) => {
+            Some((new_child_bytenr, new_child_key, _)) => {
                 interior.entries[child_idx].blockptr = new_child_bytenr;
                 interior.entries[child_idx].generation = generation;
                 interior.entries[child_idx].key = new_child_key;
@@ -622,9 +636,42 @@ where
         // to propagate all the way up rather than stopping one level above the
         // leaf — an empty interior node dangling from *its* parent is the same
         // corruption one level higher.
-        if interior.entries.is_empty() && !is_root {
+        if interior.entries.is_empty() {
+            if !is_root {
+                freed.push((bytenr, level));
+                return Ok((None, emitted_blocks));
+            } else {
+                // The root interior node has completely emptied out!
+                // An empty tree must be represented as a leaf at level 0 with 0 items,
+                // never an interior node with 0 entries.
+                let target_bytenr = allocator.allocate_metadata_for_owner(node_size, owner)?;
+                allocated.push((target_bytenr, 0));
+                freed.push((bytenr, level));
+
+                let empty_leaf = Leaf {
+                    bytenr: target_bytenr,
+                    generation,
+                    owner,
+                    flags: 1, // WRITTEN
+                    metadata_uuid: node.metadata_uuid(),
+                    chunk_tree_uuid: node.chunk_tree_uuid(),
+                    csum_type,
+                    items: Vec::new(),
+                };
+                let emitted = empty_leaf.emit(node_size)?;
+                emitted_blocks.push((target_bytenr, emitted));
+                return Ok((Some((target_bytenr, *target_key, 0)), emitted_blocks));
+            }
+        }
+
+        // If this is the root node and it has collapsed to exactly 1 child pointer,
+        // we can shrink the tree height by adopting the single child as the new root.
+        if is_root && interior.entries.len() == 1 {
+            let child_entry = &interior.entries[0];
+            let child_bytenr = child_entry.blockptr;
+            let child_key = child_entry.key;
             freed.push((bytenr, level));
-            return Ok((None, emitted_blocks));
+            return Ok((Some((child_bytenr, child_key, level - 1)), emitted_blocks));
         }
 
         let target_bytenr = if is_already_new {
@@ -644,7 +691,7 @@ where
         let first_key = interior.entries.first().map(|e| e.key).unwrap_or(*target_key);
         emitted_blocks.push((target_bytenr, emitted));
 
-        Ok((Some((target_bytenr, first_key)), emitted_blocks))
+        Ok((Some((target_bytenr, first_key, level)), emitted_blocks))
     }
 }
 

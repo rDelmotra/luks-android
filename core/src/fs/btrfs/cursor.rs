@@ -41,7 +41,7 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         let mut path = Vec::new();
         let mut node = fs.read_node(root)?;
 
-        while !node.is_leaf() {
+        while !node.is_leaf() && node.nr_items > 0 {
             let i = node.child_for(key)?;
             let ptr = node.key_ptr(i)?;
             let child = fs.read_node(ptr.blockptr)?;
