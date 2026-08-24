@@ -465,10 +465,10 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         open fun finish(parentPath: String, name: String): Long {
             check(writerHandle != 0L) { "writer is closed" }
             check(handle != 0L) { "volume is closed" }
-            val result = LuksNative.nativeFinishFile(handle, writerHandle, parentPath, name)
+            val wh = writerHandle
             writerHandle = 0
             activeWriters -= this
-            return result
+            return LuksNative.nativeFinishFile(handle, wh, parentPath, name)
         }
 
         open fun abandon() {
