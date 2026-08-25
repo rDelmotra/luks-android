@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 use crate::fs::btrfs::TreeRoot;
 
+#[allow(unused_imports)]
 pub(crate) use crate::fs::btrfs::write::extent_tree::{
     converge_and_finalize, find_max_inode, record_cow_result,
 };
