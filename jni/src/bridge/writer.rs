@@ -79,10 +79,18 @@ impl VolumeHandle {
             }
             (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => {
                 let ino = btrfs.finish_file(w, parent_path, name)?;
-                // btrfs commits the transaction inside finish_file
+                // btrfs adds to the active batch inside finish_file; explicitly call commit_active_batch later
                 Ok(ino)
             }
             _ => unreachable!("writer type mismatch"),
+        }
+    }
+
+    pub fn commit_active_batch(&self) -> Result<()> {
+        let mut fs = self.fs_for_writing()?;
+        match &mut *fs {
+            Fs::Ext4(_) => Ok(()), // Ext4 commits immediately in finish_file
+            Fs::Btrfs(btrfs) => btrfs.commit_active_batch(),
         }
     }
 

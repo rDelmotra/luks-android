@@ -165,6 +165,7 @@ internal object LuksNative {
     external fun nativeBeginFileStreaming(handle: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
+    external fun nativeCommitActiveBatch(handle: Long)
     external fun nativeCloseWriter(handle: Long, writer: Long)
     external fun nativeDeleteFile(handle: Long, path: String)
     external fun nativeCreateDirectory(handle: Long, parentPath: String, name: String): Long

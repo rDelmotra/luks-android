@@ -100,7 +100,7 @@ fn test_interval_set_properties() {
 }
 
 #[test]
-fn test_negative_control_reintroduce_b2_catches_double_allocation_before_disk_write() {
+fn test_interval_set_prevents_overlap() {
     let img = copy_to_temp("plain.img");
     let file_len = fs::metadata(&img).unwrap().len();
 
@@ -200,6 +200,7 @@ fn test_batch_handed_out_ledger_guard_in_real_workload() {
             let ino = fs.finish_file(writer, "/", &filename).expect("finish file");
             assert!(ino >= 256 + i as u64);
         }
+        fs.commit_active_batch().expect("commit");
     }
 
     let (ok, out) = run_verify_btrfs(&img);

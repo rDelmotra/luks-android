@@ -207,6 +207,7 @@ fn test_cross_file_batch_allocator_stays_in_sync_with_disk() {
             .allocator()
             .clone();
 
+        fs.commit_active_batch().expect("commit");
         let disk_extent_tree = ExtentTree::read(&mut fs).expect("read extent tree from disk");
         let disk_allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
             &disk_extent_tree,

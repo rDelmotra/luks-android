@@ -89,6 +89,7 @@ object TreeImporter {
 
         fun stop(entryPath: String, cause: Throwable): TransferOutcome {
             fireProgress(entryPath, bytesCopied, force = true)
+            try { volume.commitActiveBatch() } catch (ignored: Throwable) {}
             return TransferOutcome(
                 filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause, stats.snapshot(),
             )
@@ -223,6 +224,7 @@ object TreeImporter {
         }
 
         fireProgress(lastPath, bytesCopied, force = true)
+        try { volume.commitActiveBatch() } catch (ignored: Throwable) {}
         return TransferOutcome(
             filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null, stats.snapshot(),
         )

@@ -328,7 +328,7 @@ impl Batch {
             idx
         } else {
             let mut max_dir_index = 1u64;
-            fs.for_each_item(self.fs_root.0, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
+            fs.for_each_item(fs.fs_tree().bytenr, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
                 if key.offset > max_dir_index {
                     max_dir_index = key.offset;
                 }

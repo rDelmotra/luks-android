@@ -371,8 +371,13 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     open fun deleteFile(path: String) {
-        check(handle != 0L) { "volume is closed" }
+        if (handle == 0L) throw IllegalStateException("volume is closed")
         LuksNative.nativeDeleteFile(handle, path)
+    }
+
+    open fun commitActiveBatch() {
+        if (handle == 0L) throw IllegalStateException("volume is closed")
+        LuksNative.nativeCommitActiveBatch(handle)
     }
 
     open fun createDirectory(parentPath: String, name: String): Long {

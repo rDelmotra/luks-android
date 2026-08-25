@@ -405,11 +405,14 @@ impl<D: ReadAt> Btrfs<D> {
         #[cfg(feature = "dangerous-write-support")]
         {
             let detailed_stat = (|| -> Result<crate::fs::StatFs> {
-                let extent_tree = write::extent_tree::ExtentTree::read(self)?;
-                let free_space_map = write::alloc::FreeSpaceMap::from_extent_tree_and_chunk_map(
-                    &extent_tree,
-                    self.chunk_map(),
-                )?;
+                let free_space_map = if let Some(ref batch) = self.active_batch {
+                    batch.allocator.clone()
+                } else {
+                    write::alloc::FreeSpaceMap::from_extent_tree_and_chunk_map(
+                        &write::extent_tree::ExtentTree::read(self)?,
+                        self.chunk_map(),
+                    )?
+                };
 
                 let mut free_data = 0u64;
                 let mut free_metadata = 0u64;

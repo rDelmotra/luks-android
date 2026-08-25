@@ -828,6 +828,22 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
 
 #[cfg(feature = "dangerous-write-support")]
 #[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCommitActiveBatch<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let start = std::time::Instant::now();
+        vol.commit_active_batch()?;
+        log::i(&format!("nativeCommitActiveBatch: committed in {} ms", start.elapsed().as_millis()));
+        Ok(())
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,

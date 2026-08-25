@@ -254,6 +254,9 @@ impl<D: WriteAt> Btrfs<D> {
     /// runs) from the allocator used for this chunk's own metadata CoW, so
     /// the new metadata blocks cannot land inside them.
     pub(crate) fn allocate_data_chunk_excluding(&mut self, reserved: &[(u64, u64)]) -> Result<u64> {
+        if self.active_batch.is_some() {
+            self.commit_active_batch()?;
+        }
         let (txn, new_chunk) = Transaction::allocate_data_chunk_excluding(self, reserved)?;
         self.chunks.insert(new_chunk.clone());
         let logical = new_chunk.logical;
