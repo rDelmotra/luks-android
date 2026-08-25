@@ -33,7 +33,7 @@ pub struct Batch {
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
     pub next_ino: u64,
     pub next_dir_index: HashMap<u64, u64>,
-    pub parents: HashMap<String, (u64, u64)>,
+    pub parents: HashMap<String, (u64, u32, u32)>, // path -> (ino, uid, gid)
 }
 
 impl Batch {
@@ -170,16 +170,26 @@ impl Batch {
             declared_size
         };
 
-        let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
-        if !located_parent.inode.file_type().is_dir() {
-            return Err(LuksError::NotADirectory(parent_path.to_string()));
-        }
-        if located_parent.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume file creation not yet supported".into(),
-            ));
-        }
-        let parent_ino = located_parent.inode.objectid;
+        let (parent_ino, parent_uid, parent_gid) =
+            if let Some(&(ino, uid, gid)) = self.parents.get(parent_path) {
+                (ino, uid, gid)
+            } else {
+                let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
+                if !located_parent.inode.file_type().is_dir() {
+                    return Err(LuksError::NotADirectory(parent_path.to_string()));
+                }
+                if located_parent.tree.objectid != FS_TREE_OBJECTID {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "subvolume file creation not yet supported".into(),
+                    ));
+                }
+                let ino = located_parent.inode.objectid;
+                let uid = located_parent.inode.uid;
+                let gid = located_parent.inode.gid;
+                self.parents
+                    .insert(parent_path.to_string(), (ino, uid, gid));
+                (ino, uid, gid)
+            };
 
         // Check if exists using pending-aware search
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
@@ -201,14 +211,22 @@ impl Batch {
         let new_ino = self.next_ino;
         self.next_ino += 1;
 
-        let mut max_dir_index = 1u64;
-        fs.for_each_item(fs.fs_tree().bytenr, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
-            if key.offset > max_dir_index {
-                max_dir_index = key.offset;
-            }
-            Ok(true)
-        })?;
-        let dir_index = max_dir_index + 1;
+        let dir_index = if let Some(next_idx) = self.next_dir_index.get_mut(&parent_ino) {
+            let idx = *next_idx;
+            *next_idx += 1;
+            idx
+        } else {
+            let mut max_dir_index = 1u64;
+            fs.for_each_item(self.fs_root.0, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
+                if key.offset > max_dir_index {
+                    max_dir_index = key.offset;
+                }
+                Ok(true)
+            })?;
+            let idx = max_dir_index + 1;
+            self.next_dir_index.insert(parent_ino, idx + 1);
+            idx
+        };
 
         let mut fs_root_bytenr = self.fs_root.0;
         let mut fs_root_level = self.fs_root.1;
@@ -312,8 +330,8 @@ impl Batch {
             let mut data = node::build_empty_inode_item(
                 new_generation,
                 mode,
-                located_parent.inode.uid,
-                located_parent.inode.gid,
+                parent_uid,
+                parent_gid,
                 1,
                 now_sec,
                 now_nsec,
@@ -421,13 +439,12 @@ impl Batch {
         // 7. CoW CSUM_TREE: insert EXTENT_CSUM items covering all data runs (if CSUM tree is present and non-empty)
         if !checksums.is_empty() {
             if let Ok(csum_root) = fs.tree_root(crate::fs::btrfs::tree::CSUM_TREE_OBJECTID) {
-                let mut csum_root_bytenr = self.csum_root.map(|(b, _)| b).unwrap_or(csum_root.bytenr);
+                let mut csum_root_bytenr =
+                    self.csum_root.map(|(b, _)| b).unwrap_or(csum_root.bytenr);
                 let mut csum_root_level = self.csum_root.map(|(_, l)| l).unwrap_or(csum_root.level);
 
-                let csum_items = node::build_extent_csum_items_from_checksums(
-                    sb.node_size,
-                    checksums,
-                )?;
+                let csum_items =
+                    node::build_extent_csum_items_from_checksums(sb.node_size, checksums)?;
 
                 for (range_start, csum_payload) in csum_items {
                     let csum_key = Key::new(
@@ -463,6 +480,47 @@ impl Batch {
         }
 
         Ok(new_ino)
+    }
+
+    /// Commit the current batch state to disk and re-arm the batch for the next file
+    /// while preserving the cached allocator, next_ino, next_dir_index, and parent directory cache.
+    pub fn commit_and_rearm<D: WriteAt>(&mut self, fs: &mut Btrfs<D>) -> Result<Transaction> {
+        let mut new_fs_tree = fs.fs_tree();
+        new_fs_tree.bytenr = self.fs_root.0;
+        new_fs_tree.level = self.fs_root.1;
+        new_fs_tree.generation = self.generation;
+
+        let pending_blocks = std::mem::take(&mut self.pending_blocks);
+        let blocks_to_add = std::mem::take(&mut self.blocks_to_add);
+        let blocks_to_remove = std::mem::take(&mut self.blocks_to_remove);
+        let data_extents_to_add = std::mem::take(&mut self.data_extents_to_add);
+
+        let txn = converge_and_finalize(
+            fs,
+            self.generation,
+            new_fs_tree,
+            self.csum_root,
+            None,
+            None,
+            None,
+            pending_blocks,
+            Vec::new(),
+            self.allocator.clone(),
+            blocks_to_add,
+            blocks_to_remove,
+            data_extents_to_add,
+            Vec::new(),
+        )?;
+
+        if let Some(ref final_alloc) = txn.final_allocator {
+            self.allocator = final_alloc.clone();
+            self.allocator.unpin_freed();
+        }
+        self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
+        self.csum_root = None;
+        self.generation = txn.new_generation;
+
+        Ok(txn)
     }
 
     /// Commit the batch into a Transaction ready to be committed to disk.

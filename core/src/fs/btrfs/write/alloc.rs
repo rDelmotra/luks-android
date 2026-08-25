@@ -620,6 +620,64 @@ impl FreeSpaceMap {
         Ok(())
     }
 
+    /// Unpin freed ranges after a transaction has committed, returning them to available `free_ranges`
+    /// for the next transaction (excluding any superblock mirror exclusion zones).
+    pub fn unpin_freed(&mut self) {
+        for bg in &mut self.block_groups {
+            if bg.pinned_freed.is_empty() {
+                continue;
+            }
+            let mut all_free = Vec::new();
+            all_free.extend_from_slice(&bg.free_ranges);
+            all_free.extend_from_slice(&bg.pinned_freed);
+            bg.pinned_freed.clear();
+            all_free.sort_by_key(|r| r.start);
+
+            let mut merged: Vec<FreeRange> = Vec::new();
+            for r in all_free {
+                if let Some(last) = merged.last_mut() {
+                    if last.start + last.length >= r.start {
+                        let end = (last.start + last.length).max(r.start + r.length);
+                        last.length = end - last.start;
+                        continue;
+                    }
+                }
+                merged.push(r);
+            }
+
+            // Subtract excluded ranges (superblock mirrors)
+            for excl in &bg.excluded_ranges {
+                let e_start = excl.start;
+                let e_end = excl.start + excl.length;
+                let mut new_merged = Vec::new();
+                for r in merged {
+                    let r_start = r.start;
+                    let r_end = r.start + r.length;
+                    if e_end <= r_start || e_start >= r_end {
+                        new_merged.push(r);
+                    } else {
+                        if r_start < e_start {
+                            new_merged.push(FreeRange {
+                                start: r_start,
+                                length: e_start - r_start,
+                            });
+                        }
+                        if r_end > e_end {
+                            new_merged.push(FreeRange {
+                                start: e_end,
+                                length: r_end - e_end,
+                            });
+                        }
+                    }
+                }
+                merged = new_merged;
+            }
+
+            bg.free_ranges = merged;
+            bg.total_free_bytes = bg.free_ranges.iter().map(|r| r.length).sum();
+        }
+    }
+
     /// Emit the complete list of `FREE_SPACE_INFO` and `FREE_SPACE_EXTENT` items
     /// for the Free Space Tree, combining existing free ranges with blocks freed
     /// in this transaction.

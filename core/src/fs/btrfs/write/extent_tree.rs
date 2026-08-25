@@ -1148,5 +1148,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         new_fs_tree,
         pending_blocks,
         pending_data,
+        final_allocator: Some(allocator),
     })
 }

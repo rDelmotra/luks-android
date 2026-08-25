@@ -47,6 +47,12 @@ fn run_verify_btrfs(img_path: &std::path::Path) -> (bool, String) {
         .join("tools")
         .join("verify-btrfs.sh");
 
+    assert!(script.exists(), "verify-btrfs.sh must exist at {:?}", script);
+
+    if !common::oracle::gate() {
+        return (true, "skipped (ALLOW_NO_ORACLE)".to_string());
+    }
+
     let out = Command::new(&script)
         .arg(img_path)
         .output()

@@ -45,15 +45,17 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
-        let extent_tree = ExtentTree::read(self)?;
-        let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, self.chunk_map())?;
-
         let sector_size = self.superblock().sector_size as u64;
         let disk_num_bytes = if size == 0 {
             0
         } else {
             ((size + sector_size - 1) / sector_size) * sector_size
         };
+
+        if self.active_batch.is_none() {
+            self.active_batch = Some(Batch::open(self)?);
+        }
+        let mut allocator = self.active_batch.as_ref().unwrap().allocator.clone();
 
         let mut total_free_data: u64 = allocator
             .block_groups
@@ -75,6 +77,9 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 .filter(|bg| crate::fs::btrfs::write::alloc::bg_holds_data(bg.block_group.flags))
                 .map(|bg| bg.total_free_bytes)
                 .sum();
+            if let Some(ref mut batch) = self.active_batch {
+                batch.allocator = allocator.clone();
+            }
         }
 
         let mut data_runs = Vec::new();
@@ -96,9 +101,16 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     for &(run_bytenr, run_len) in &data_runs {
                         allocator.mark_allocated(run_bytenr, run_len)?;
                     }
+                    if let Some(ref mut batch) = self.active_batch {
+                        batch.allocator = allocator.clone();
+                    }
                 }
                 Err(e) => return Err(e),
             }
+        }
+
+        if let Some(ref mut batch) = self.active_batch {
+            batch.allocator = allocator.clone();
         }
 
         Ok(BtrfsFileWriter {
@@ -120,8 +132,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
-        let extent_tree = ExtentTree::read(self)?;
-        let allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, self.chunk_map())?;
+        if self.active_batch.is_none() {
+            self.active_batch = Some(Batch::open(self)?);
+        }
+        let allocator = self.active_batch.as_ref().unwrap().allocator.clone();
 
         Ok(BtrfsFileWriter {
             size: 0,
@@ -158,16 +172,23 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                         Err(LuksError::FilesystemFull) => {
                             self.allocate_data_chunk_excluding(&writer.data_runs)?;
                             let extent_tree = ExtentTree::read(self)?;
-                            writer.allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
+                            let mut new_alloc = FreeSpaceMap::from_extent_tree_and_chunk_map(
                                 &extent_tree,
                                 self.chunk_map(),
                             )?;
                             for &(run_bytenr, run_len) in &writer.data_runs {
-                                writer.allocator.mark_allocated(run_bytenr, run_len)?;
+                                new_alloc.mark_allocated(run_bytenr, run_len)?;
+                            }
+                            writer.allocator = new_alloc;
+                            if let Some(ref mut batch) = self.active_batch {
+                                batch.allocator = writer.allocator.clone();
                             }
                         }
                         Err(e) => return Err(e),
                     }
+                }
+                if let Some(ref mut batch) = self.active_batch {
+                    batch.allocator = writer.allocator.clone();
                 }
             }
         } else if end > writer.size {
@@ -317,16 +338,20 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         parent_path: &str,
         name: &str,
     ) -> Result<u64> {
-        let mut batch = Batch::open_with_allocator(self, writer.allocator.clone())?;
+        let mut batch = if let Some(b) = self.active_batch.take() {
+            b
+        } else {
+            Batch::open_with_allocator(self, writer.allocator.clone())?
+        };
         let ino = batch.add_writer(self, &writer, parent_path, name)?;
-        let txn = batch.commit(self)?;
+        let txn = batch.commit_and_rearm(self)?;
         commit_transaction(self, txn)?;
+        self.active_batch = Some(batch);
         Ok(ino)
     }
 
     pub fn abandon_file(&mut self, _writer: BtrfsFileWriter) {
-        // Safe to drop; extents mapped in memory but not linked to any tree yet, so they leak only in this run but will be valid on remount.
-        // The real way to handle this without a transaction is just drop, as they aren't recorded in the extent tree.
+        self.active_batch = None;
     }
 }
 

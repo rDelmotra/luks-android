@@ -107,6 +107,8 @@ pub struct Btrfs<D: ReadAt> {
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
     nodes: cache::NodeCache,
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) active_batch: Option<write::Batch>,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -143,6 +145,8 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            #[cfg(feature = "dangerous-write-support")]
+            active_batch: None,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;

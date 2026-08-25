@@ -40,8 +40,24 @@ use crate::fs::btrfs::Btrfs;
 const MAX_DELETE_DEPTH: usize = 1024;
 
 impl<D: WriteAt> Btrfs<D> {
+    /// Commit any active batch session before performing non-batch operations.
+    pub fn commit_active_batch(&mut self) -> Result<()> {
+        if let Some(batch) = self.active_batch.take() {
+            if !batch.pending_blocks.is_empty()
+                || !batch.blocks_to_add.is_empty()
+                || !batch.blocks_to_remove.is_empty()
+                || !batch.data_extents_to_add.is_empty()
+            {
+                let txn = batch.commit(self)?;
+                commit_transaction(self, txn)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Update the modification timestamp (`mtime`) of the file at `path`.
     pub fn set_mtime(&mut self, path: &str, mtime_sec: u64, mtime_nsec: u32) -> Result<()> {
+        self.commit_active_batch()?;
         let located = self.resolve_no_follow(self.fs_tree(), path)?;
         if located.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
@@ -60,6 +76,7 @@ impl<D: WriteAt> Btrfs<D> {
 
     /// Create an empty regular file named `filename` in the directory at `parent_dir_path`.
     pub fn create_file(&mut self, parent_dir_path: &str, filename: &str) -> Result<()> {
+        self.commit_active_batch()?;
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),
@@ -72,6 +89,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// Create a new directory named `name` inside `parent_path`.
     /// Performs this in a transaction and returns the new directory's inode number.
     pub fn create_directory(&mut self, parent_path: &str, name: &str) -> Result<u64> {
+        self.commit_active_batch()?;
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),
@@ -84,6 +102,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// Create a new directory named `name` inside `parent_ino`.
     /// Performs this in a transaction and returns the new directory's inode number.
     pub fn create_directory_in_dir(&mut self, parent_ino: u64, name: &str) -> Result<u64> {
+        self.commit_active_batch()?;
         let located_parent = self.read_inode(self.fs_tree().bytenr, parent_ino)?;
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
@@ -110,6 +129,7 @@ impl<D: WriteAt> Btrfs<D> {
         new_parent: &str,
         new_name: &str,
     ) -> Result<()> {
+        self.commit_active_batch()?;
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),
@@ -121,6 +141,7 @@ impl<D: WriteAt> Btrfs<D> {
 
     /// Write `data` into the regular file at `path`.
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        self.commit_active_batch()?;
         let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => (d.as_secs(), d.subsec_nanos()),
             Err(_) => (0, 0),
@@ -159,6 +180,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// would if a caller had stopped there themselves, rather than a
     /// half-applied larger operation.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        self.commit_active_batch()?;
         // `.` and `..` are never real stored entries on btrfs (see
         // `list_dir_by_inode`'s doc comment), but `resolve_no_follow` silently
         // drops `.` components while this function's own root check only

@@ -47,4 +47,5 @@ pub struct Transaction {
     pub new_fs_tree: TreeRoot,
     pub pending_blocks: HashMap<u64, Vec<u8>>,
     pub pending_data: Vec<(u64, Vec<u8>)>,
+    pub final_allocator: Option<crate::fs::btrfs::write::alloc::FreeSpaceMap>,
 }
