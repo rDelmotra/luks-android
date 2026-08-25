@@ -288,6 +288,8 @@ fn probe_streaming_write_counts(fixture_name: &str) -> (usize, usize) {
 
     fs_.finish_file(writer, "/", STREAM_FILE_NAME)
         .expect("uninterrupted finish_file must succeed");
+    fs_.commit_active_batch()
+        .expect("uninterrupted commit must succeed");
     let after_finish = fs_.device().attempted.load(Ordering::SeqCst);
 
     drop(fs_);
@@ -358,7 +360,18 @@ fn run_interrupted_streaming(fixture_name: &str, budget: usize, tag: &str) -> In
         (false, true)
     } else {
         match fs_.finish_file(writer, "/", STREAM_FILE_NAME) {
-            Ok(_) => (true, false),
+            Ok(_) => match fs_.commit_active_batch() {
+                Ok(_) => (true, false),
+                Err(e) => {
+                    match e {
+                        LuksError::Io { .. } => {}
+                        other => panic!(
+                            "expected simulated I/O failure in commit at budget={budget}, got {other:?}"
+                        ),
+                    }
+                    (false, false)
+                }
+            },
             Err(e) => {
                 match e {
                     LuksError::Io { .. } => {}

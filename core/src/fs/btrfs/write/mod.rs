@@ -45,11 +45,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// Commit any active batch session before performing non-batch operations.
     pub fn commit_active_batch(&mut self) -> Result<()> {
         if let Some(batch) = self.active_batch.take() {
-            if !batch.pending_blocks.is_empty()
-                || !batch.blocks_to_add.is_empty()
-                || !batch.blocks_to_remove.is_empty()
-                || !batch.data_extents_to_add.is_empty()
-            {
+            if batch.has_uncommitted_files() {
                 let txn = batch.commit(self)?;
                 commit_transaction(self, txn)?;
             }
@@ -172,7 +168,9 @@ impl<D: WriteAt> Btrfs<D> {
         if !data.is_empty() {
             self.write_chunk(&mut writer, data)?;
         }
-        self.finish_file(writer, parent_dir_path, filename)
+        let ino = self.finish_file(writer, parent_dir_path, filename)?;
+        self.commit_active_batch()?;
+        Ok(ino)
     }
 
     /// Delete the file or directory at `path`. A directory is emptied first,

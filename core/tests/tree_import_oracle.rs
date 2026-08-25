@@ -185,14 +185,15 @@ fn replay(fs: &mut Btrfs<FileDevice>, ops: &[Op]) {
                 fs.delete_file(&path).unwrap_or_else(|e| panic!("op {i}: delete {path}: {e:?}"));
             }
             Op::Abandon => {
-                // Dropping the writer is what abandoning is: nothing was ever
-                // linked into a directory, so there is nothing to unwind.
-                writer = None;
+                if let Some(w) = writer.take() {
+                    fs.abandon_file(w);
+                }
             }
         }
     }
 
     assert!(writer.is_none(), "trace ended with a file writer still open");
+    fs.commit_active_batch().expect("commit trailing batch");
 }
 
 // ---- the oracle ------------------------------------------------------------

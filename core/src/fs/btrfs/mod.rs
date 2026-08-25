@@ -207,6 +207,12 @@ impl<D: ReadAt> Btrfs<D> {
     /// cache the top of each tree is re-read once per operation — which
     /// measured as 88% of all device reads on a large file. See [`cache`].
     pub fn read_node(&self, logical: u64) -> Result<Node> {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            if let Some(raw) = batch.pending_blocks.get(&logical) {
+                return Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid);
+            }
+        }
         if let Some(node) = self.nodes.get(logical) {
             return Ok(node);
         }
@@ -317,16 +323,15 @@ impl<D: ReadAt> Btrfs<D> {
         })
     }
 
-    /// The top-level tree — where browsing starts.
-    ///
-    /// This is FS_TREE (id 5), which is what the kernel shows for a mount with
-    /// `subvol=/`, and every subvolume is reachable from it by path because
-    /// resolution crosses subvolume boundaries. Starting at
-    /// [`default_subvolume`](Self::default_subvolume) instead would match a
-    /// plain `mount` but hide everything outside it — on openSUSE the default
-    /// is a snapshot several levels down, and choosing it would make the live
-    /// filesystem unbrowsable.
     pub fn fs_tree(&self) -> TreeRoot {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            let mut root = self.fs_tree;
+            root.bytenr = batch.fs_root.0;
+            root.level = batch.fs_root.1;
+            root.generation = batch.generation;
+            return root;
+        }
         self.fs_tree
     }
 

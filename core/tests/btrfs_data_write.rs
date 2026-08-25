@@ -340,6 +340,7 @@ fn write_file_streamed_chunks_on_plain_img() {
     let readback = fs.read_file("/streamed_file.bin").expect("readback");
     assert_eq!(readback, test_data);
 
+    fs.commit_active_batch().expect("commit active batch");
     drop(fs);
 
     let dev_ro = FileDevice::open(&temp_img).expect("open ro");

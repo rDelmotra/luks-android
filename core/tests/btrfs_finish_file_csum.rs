@@ -255,6 +255,7 @@ fn test_kernel_oracle_scrub_on_chunked_and_tail_padded_writes() {
     let ino2 = fs.finish_file(writer2, "/", "streamed_large.bin").expect("finish 2");
     assert!(ino2 >= 256);
 
+    fs.commit_active_batch().expect("commit");
     drop(fs);
 
     // Verify persistence and correctness on remount
@@ -297,6 +298,7 @@ fn test_deliberate_corrupted_checksums_fails_scrub() {
         .expect("finish_file");
     assert!(ino >= 256);
 
+    fs.commit_active_batch().expect("commit");
     drop(fs);
 
     // If oracle is available, verify that btrfs scrub catches the checksum error and verify script FAILS
@@ -353,6 +355,7 @@ fn test_mixed_4k_multi_item_csum_live_checksums_oracle() {
     let ino = fs.finish_file(writer, "/", "mixed_5mb.bin").expect("finish_file");
     assert!(ino >= 256);
 
+    fs.commit_active_batch().expect("commit");
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);

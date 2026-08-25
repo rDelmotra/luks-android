@@ -343,15 +343,49 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         } else {
             Batch::open_with_allocator(self, writer.allocator.clone())?
         };
-        let ino = batch.add_writer(self, &writer, parent_path, name)?;
-        let txn = batch.commit_and_rearm(self)?;
-        commit_transaction(self, txn)?;
-        self.active_batch = Some(batch);
-        Ok(ino)
+
+        let mark = batch.mark();
+        let ino_res = batch.add_writer(self, &writer, parent_path, name);
+
+        match ino_res {
+            Ok(ino) => {
+                if batch.should_commit() {
+                    let txn = batch.commit_and_rearm(self)?;
+                    commit_transaction(self, txn)?;
+                }
+                self.active_batch = Some(batch);
+                Ok(ino)
+            }
+            Err(e) => {
+                batch.rollback(mark);
+                for &(bytenr, run_len) in &writer.data_runs {
+                    let _ = batch.allocator.free_data(bytenr, run_len);
+                    batch.handed_out.remove(bytenr, run_len);
+                }
+                if batch.has_uncommitted_files() {
+                    if let Ok(txn) = batch.commit_and_rearm(self) {
+                        let _ = commit_transaction(self, txn);
+                    }
+                }
+                self.active_batch = Some(batch);
+                Err(e)
+            }
+        }
     }
 
-    pub fn abandon_file(&mut self, _writer: BtrfsFileWriter) {
-        self.active_batch = None;
+    pub fn abandon_file(&mut self, writer: BtrfsFileWriter) {
+        if let Some(mut batch) = self.active_batch.take() {
+            for &(bytenr, run_len) in &writer.data_runs {
+                let _ = batch.allocator.free_data(bytenr, run_len);
+                batch.handed_out.remove(bytenr, run_len);
+            }
+            if batch.has_uncommitted_files() {
+                if let Ok(txn) = batch.commit_and_rearm(self) {
+                    let _ = commit_transaction(self, txn);
+                }
+            }
+            self.active_batch = Some(batch);
+        }
     }
 }
 
@@ -474,6 +508,7 @@ mod tests {
             .finish_file(writer, "/", "fragmented_test.bin")
             .expect("finish file");
         assert!(ino >= 256);
+        fs.commit_active_batch().expect("commit");
 
         // Verify reader sees correct file content
         let readback = fs.read_file("/fragmented_test.bin").expect("read file");

@@ -275,6 +275,7 @@ fn test_streaming_large_file_triggers_chunk_allocation_and_oracle_clean() {
     assert_eq!(readback.len(), target_file_size);
     assert_eq!(sha256_hex(&readback), expected_sha256);
 
+    fs.commit_active_batch().expect("commit");
     drop(fs);
 
     // 5. Remount read-only and verify persistence
@@ -501,6 +502,7 @@ fn test_large_file_chunk_alloc_across_all_fixtures() {
         let readback = fs.read_file("/fixture_large.bin").unwrap();
         assert_eq!(sha256_hex(&readback), expected_sha);
 
+        fs.commit_active_batch().expect("commit");
         drop(fs);
 
         // Oracle

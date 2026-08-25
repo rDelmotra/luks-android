@@ -91,6 +91,9 @@ fn test_cross_file_batch_sequential_writes() {
             assert!(ino >= 256 + i as u64);
         }
 
+        // Commit trailing active batch before in-session readbacks
+        fs.commit_active_batch().expect("commit active batch");
+
         // Readback within same mount session
         for (name, expected_sha) in &expected_shas {
             let readback = fs.read_file(&format!("/{}", name)).expect("read_file");
@@ -153,6 +156,9 @@ fn test_cross_file_batch_interleaved_with_dir_and_delete() {
         let mut w4 = fs.begin_file(400).expect("begin 4");
         fs.write_chunk(&mut w4, &[0xDD; 400]).expect("write 4");
         fs.finish_file(w4, "/", "file4.bin").expect("finish 4");
+
+        // Commit active batch before verifying readbacks
+        fs.commit_active_batch().expect("commit active batch");
 
         // 7. Verify surviving files read back correctly
         let r2 = fs.read_file("/subfolder/file2.bin").expect("read f2");

@@ -299,6 +299,7 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
         .expect("finish streamed file");
     assert!(ino >= 256);
 
+    fs.commit_active_batch().expect("commit");
     drop(fs);
 
     // Remount read-only: chunk allocation must have persisted.
@@ -416,6 +417,7 @@ fn streaming_unknown_size_write_on_mixed_block_group_no_longer_corrupts_the_allo
                 .finish_file(writer, "/", "streamed_mixed_forced_alloc.bin")
                 .expect("finish streamed file");
             assert!(ino >= 256);
+            fs.commit_active_batch().expect("commit");
             drop(fs);
             assert!(run_verify_script(&img), "oracle check must pass clean");
             assert!(

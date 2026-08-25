@@ -141,6 +141,7 @@ fn streaming_unknown_size_write_multimegabyte() {
             .expect("read streamed file");
         assert_eq!(readback.len(), total_size);
         assert_eq!(readback, payload);
+        fs.commit_active_batch().expect("commit");
     }
 
     // Remount read-only and verify SHA256
@@ -180,6 +181,7 @@ fn streaming_unknown_size_zero_length_file() {
             .read_file("/empty_streamed.bin")
             .expect("read empty file");
         assert!(readback.is_empty());
+        fs.commit_active_batch().expect("commit");
     }
 
     assert!(run_verify_script(&img), "oracle check passed");
@@ -208,6 +210,7 @@ fn streaming_unknown_size_on_mixed_4k_img() {
 
         let readback = fs.read_file("/streamed_4k.bin").expect("readback");
         assert_eq!(readback, payload);
+        fs.commit_active_batch().expect("commit");
     }
 
     assert!(run_verify_script(&img), "oracle check passed for mixed-4k");

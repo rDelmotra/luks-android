@@ -5,6 +5,7 @@
 //! full-tree scans and amortize transaction commit overhead.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
@@ -23,6 +24,23 @@ use crate::fs::btrfs::write::node;
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::Btrfs;
 
+/// Snapshot of batch state taken before adding a file, enabling single-file rollback.
+#[derive(Debug, Clone)]
+pub struct FileMark {
+    pub allocator: FreeSpaceMap,
+    pub fs_root: (u64, u8),
+    pub csum_root: Option<(u64, u8)>,
+    pub pending_blocks: HashMap<u64, Vec<u8>>,
+    pub blocks_to_add: Vec<(u64, u8, u64)>,
+    pub blocks_to_remove: Vec<(u64, u8)>,
+    pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
+    pub next_ino: u64,
+    pub next_dir_index: HashMap<u64, u64>,
+    pub handed_out: IntervalSet,
+    pub accumulated_files: usize,
+    pub accumulated_data_bytes: u64,
+}
+
 pub struct Batch {
     pub generation: u64,
     pub allocator: FreeSpaceMap,
@@ -36,6 +54,9 @@ pub struct Batch {
     pub next_dir_index: HashMap<u64, u64>,
     pub parents: HashMap<String, (u64, u32, u32)>, // path -> (ino, uid, gid)
     pub handed_out: IntervalSet,
+    pub accumulated_files: usize,
+    pub accumulated_data_bytes: u64,
+    pub start_time: Instant,
 }
 
 impl Batch {
@@ -73,7 +94,75 @@ impl Batch {
             next_dir_index: HashMap::new(),
             parents: HashMap::new(),
             handed_out: IntervalSet::new(),
+            accumulated_files: 0,
+            accumulated_data_bytes: 0,
+            start_time: Instant::now(),
         })
+    }
+
+    /// Take a snapshot mark of current batch state before attempting to add a file.
+    pub fn mark(&self) -> FileMark {
+        FileMark {
+            allocator: self.allocator.clone(),
+            fs_root: self.fs_root,
+            csum_root: self.csum_root,
+            pending_blocks: self.pending_blocks.clone(),
+            blocks_to_add: self.blocks_to_add.clone(),
+            blocks_to_remove: self.blocks_to_remove.clone(),
+            data_extents_to_add: self.data_extents_to_add.clone(),
+            next_ino: self.next_ino,
+            next_dir_index: self.next_dir_index.clone(),
+            handed_out: self.handed_out.clone(),
+            accumulated_files: self.accumulated_files,
+            accumulated_data_bytes: self.accumulated_data_bytes,
+        }
+    }
+
+    /// Roll back to a previously captured mark (reverting single failed file).
+    pub fn rollback(&mut self, mark: FileMark) {
+        self.allocator = mark.allocator;
+        self.fs_root = mark.fs_root;
+        self.csum_root = mark.csum_root;
+        self.pending_blocks = mark.pending_blocks;
+        self.blocks_to_add = mark.blocks_to_add;
+        self.blocks_to_remove = mark.blocks_to_remove;
+        self.data_extents_to_add = mark.data_extents_to_add;
+        self.next_ino = mark.next_ino;
+        self.next_dir_index = mark.next_dir_index;
+        self.handed_out = mark.handed_out;
+        self.accumulated_files = mark.accumulated_files;
+        self.accumulated_data_bytes = mark.accumulated_data_bytes;
+    }
+
+    /// Whether this batch holds any uncommitted file mutations.
+    pub fn has_uncommitted_files(&self) -> bool {
+        self.accumulated_files > 0
+            || !self.pending_blocks.is_empty()
+            || !self.blocks_to_add.is_empty()
+            || !self.blocks_to_remove.is_empty()
+            || !self.data_extents_to_add.is_empty()
+    }
+
+    /// Check if batch commit threshold policy is satisfied:
+    /// - 16 files
+    /// - 8 MiB pending metadata memory
+    /// - 64 MiB written data
+    /// - 2.0s wall clock time
+    pub fn should_commit(&self) -> bool {
+        if self.accumulated_files >= 16 {
+            return true;
+        }
+        let pending_bytes: usize = self.pending_blocks.values().map(|v| v.len()).sum();
+        if pending_bytes >= 8 * 1024 * 1024 {
+            return true;
+        }
+        if self.accumulated_data_bytes >= 64 * 1024 * 1024 {
+            return true;
+        }
+        if self.start_time.elapsed() >= std::time::Duration::from_secs(2) {
+            return true;
+        }
+        false
     }
 
     /// Record an allocated range in the double-allocation ledger guard.
@@ -522,6 +611,9 @@ impl Batch {
             }
         }
 
+        self.accumulated_files += 1;
+        self.accumulated_data_bytes += size;
+
         Ok(new_ino)
     }
 
@@ -563,6 +655,9 @@ impl Batch {
         self.csum_root = None;
         self.generation = txn.new_generation;
         self.handed_out.clear();
+        self.accumulated_files = 0;
+        self.accumulated_data_bytes = 0;
+        self.start_time = Instant::now();
 
         Ok(txn)
     }
