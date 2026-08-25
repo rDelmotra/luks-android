@@ -18,6 +18,7 @@ use crate::fs::btrfs::write::extent_tree::{
     converge_and_finalize, find_item_in_tree, find_max_inode, record_cow_result, ExtentTree,
 };
 use crate::fs::btrfs::write::file::BtrfsFileWriter;
+use crate::fs::btrfs::write::interval_set::IntervalSet;
 use crate::fs::btrfs::write::node;
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::Btrfs;
@@ -34,6 +35,7 @@ pub struct Batch {
     pub next_ino: u64,
     pub next_dir_index: HashMap<u64, u64>,
     pub parents: HashMap<String, (u64, u32, u32)>, // path -> (ino, uid, gid)
+    pub handed_out: IntervalSet,
 }
 
 impl Batch {
@@ -70,7 +72,19 @@ impl Batch {
             next_ino,
             next_dir_index: HashMap::new(),
             parents: HashMap::new(),
+            handed_out: IntervalSet::new(),
         })
+    }
+
+    /// Record an allocated range in the double-allocation ledger guard.
+    /// Fails immediately if an overlapping range was already handed out.
+    pub fn record_allocation(&mut self, start: u64, length: u64) -> Result<()> {
+        if !self.handed_out.insert(start, length) {
+            return Err(LuksError::CorruptFs(
+                "double allocation detected in batch allocation ledger",
+            ));
+        }
+        Ok(())
     }
 
     /// Add a written file into this batch session via its writer.
@@ -170,6 +184,13 @@ impl Batch {
             declared_size
         };
 
+        // Record data runs into double-allocation ledger
+        for &(bytenr, run_len) in data_runs {
+            if run_len > 0 {
+                self.record_allocation(bytenr, run_len)?;
+            }
+        }
+
         let (parent_ino, parent_uid, parent_gid) =
             if let Some(&(ino, uid, gid)) = self.parents.get(parent_path) {
                 (ino, uid, gid)
@@ -207,6 +228,7 @@ impl Batch {
         }
 
         let sb = fs.superblock();
+        let node_size = sb.node_size as u64;
         let new_generation = self.generation;
         let new_ino = self.next_ino;
         self.next_ino += 1;
@@ -260,6 +282,9 @@ impl Batch {
                 Ok(())
             },
         )?;
+        for &(bytenr, _level) in &res.allocated {
+            self.record_allocation(bytenr, node_size)?;
+        }
         record_cow_result(
             &res,
             &mut self.blocks_to_add,
@@ -285,6 +310,9 @@ impl Batch {
             new_generation,
             &mut self.allocator,
         )?;
+        for &(bytenr, _level) in &res.allocated {
+            self.record_allocation(bytenr, node_size)?;
+        }
         record_cow_result(
             &res,
             &mut self.blocks_to_add,
@@ -310,6 +338,9 @@ impl Batch {
             new_generation,
             &mut self.allocator,
         )?;
+        for &(bytenr, _level) in &res.allocated {
+            self.record_allocation(bytenr, node_size)?;
+        }
         record_cow_result(
             &res,
             &mut self.blocks_to_add,
@@ -351,6 +382,9 @@ impl Batch {
             new_generation,
             &mut self.allocator,
         )?;
+        for &(bytenr, _level) in &res.allocated {
+            self.record_allocation(bytenr, node_size)?;
+        }
         record_cow_result(
             &res,
             &mut self.blocks_to_add,
@@ -377,6 +411,9 @@ impl Batch {
             new_generation,
             &mut self.allocator,
         )?;
+        for &(bytenr, _level) in &res.allocated {
+            self.record_allocation(bytenr, node_size)?;
+        }
         record_cow_result(
             &res,
             &mut self.blocks_to_add,
@@ -412,6 +449,9 @@ impl Batch {
                     new_generation,
                     &mut self.allocator,
                 )?;
+                for &(bytenr, _level) in &res.allocated {
+                    self.record_allocation(bytenr, node_size)?;
+                }
                 record_cow_result(
                     &res,
                     &mut self.blocks_to_add,
@@ -463,6 +503,9 @@ impl Batch {
                         new_generation,
                         &mut self.allocator,
                     )?;
+                    for &(bytenr, _level) in &res.allocated {
+                        self.record_allocation(bytenr, node_size)?;
+                    }
                     record_cow_result(
                         &res,
                         &mut self.blocks_to_add,
@@ -519,6 +562,7 @@ impl Batch {
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
         self.csum_root = None;
         self.generation = txn.new_generation;
+        self.handed_out.clear();
 
         Ok(txn)
     }

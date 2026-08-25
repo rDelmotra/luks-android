@@ -12,6 +12,7 @@ pub mod exclude;
 pub mod extent_tree;
 pub mod file;
 pub mod gate;
+pub mod interval_set;
 pub mod node;
 pub mod txn;
 
@@ -27,6 +28,7 @@ pub use exclude::compute_sb_exclusions;
 pub use extent_tree::{
     AllocatedExtent, BlockGroupItem, ExtentItem, ExtentTree, InlineBackref, MetadataItem,
 };
+pub use interval_set::IntervalSet;
 pub use node::{InteriorEntry, InteriorNode, Leaf, LeafItem};
 pub use txn::Transaction;
 
