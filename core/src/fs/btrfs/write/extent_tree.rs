@@ -802,164 +802,20 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         extent_root_level = ext_res.new_root_level;
     }
 
-    // 4. Fixed-point loop to drain pending blocks_to_add and blocks_to_remove into EXTENT_TREE.
-    // High-fragmentation 4K-node filesystems or multi-extent transfers drain in 1-3 rounds
-    // now that FST and block-group updates are hoisted out of this loop.
+    let mut fst_bytenr_opt: Option<u64> = None;
+
+    // 4. Fixed-point loop to record allocations and update root pointers until convergence.
+    // High-fragmentation 4K-node filesystems or multi-extent transfers can take
+    // up to ~15 rounds of extent-tree CoW feedback before reaching 0 pending blocks.
     const MAX_CONVERGENCE_ROUNDS: u32 = 30;
-    let mut _initial_rounds = 0;
-    for _iteration in 0..MAX_CONVERGENCE_ROUNDS {
-        if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
-            break;
-        }
-        _initial_rounds += 1;
-
-        let to_remove = std::mem::take(&mut blocks_to_remove);
-        for (old_b, old_lvl) in to_remove {
-            let del_key = Key::new(old_b, METADATA_ITEM_KEY, old_lvl as u64);
-            let ext_res = cow_tree_mutate(
-                fs,
-                &pending_blocks,
-                extent_root_bytenr,
-                extent_root_level,
-                EXTENT_TREE_OBJECTID,
-                &del_key,
-                new_generation,
-                &mut allocator,
-                |leaf| {
-                    let _ = leaf.delete_item(&del_key)?;
-                    Ok(())
-                },
-            )?;
-
-            record_cow_result(
-                &ext_res,
-                &mut blocks_to_add,
-                &mut blocks_to_remove,
-                &mut allocator,
-                &mut pending_blocks,
-                sb.node_size,
-                EXTENT_TREE_OBJECTID,
-            )?;
-            extent_root_bytenr = ext_res.new_root_bytenr;
-            extent_root_level = ext_res.new_root_level;
-        }
-
-        let to_add = std::mem::take(&mut blocks_to_add);
-        for (alloc_bytenr, alloc_level, alloc_owner) in to_add {
-            let (meta_key, meta_data) = MetadataItem::emit_tree_block(
-                alloc_bytenr,
-                alloc_level,
-                new_generation,
-                alloc_owner,
-            );
-            let ext_res = cow_tree_insert(
-                fs,
-                &pending_blocks,
-                extent_root_bytenr,
-                extent_root_level,
-                EXTENT_TREE_OBJECTID,
-                meta_key,
-                meta_data,
-                new_generation,
-                &mut allocator,
-            )?;
-
-            record_cow_result(
-                &ext_res,
-                &mut blocks_to_add,
-                &mut blocks_to_remove,
-                &mut allocator,
-                &mut pending_blocks,
-                sb.node_size,
-                EXTENT_TREE_OBJECTID,
-            )?;
-            extent_root_bytenr = ext_res.new_root_bytenr;
-            extent_root_level = ext_res.new_root_level;
-        }
-    }
-
-    // 5. Single final pass for Free Space Tree (FST) and BLOCK_GROUP_ITEM updates.
-    // Hoisted out of the fixed-point loop so FST and block group items are rewritten
-    // exactly once per transaction rather than once per convergence round.
-
-    // 5a. Update Free Space Tree if present on this filesystem.
-    if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
-        if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
-            gate::check_free_space_tree_shape(&fst_root)?;
-
-            let fst_target = allocator.allocate_metadata(sb.node_size)?;
-            blocks_to_add.push((fst_target, 0, FREE_SPACE_TREE_OBJECTID));
-            blocks_to_remove.push((fst_root.bytenr, 0));
-            allocator.free_metadata(fst_root.bytenr, sb.node_size)?;
-
-            let old_fst_node =
-                read_node(fs, &pending_blocks, fst_root.bytenr)?;
-            let chunk_tree_uuid = old_fst_node.chunk_tree_uuid();
-            let flags = old_fst_node.flags();
-
-            let fst_leaf = Leaf {
-                bytenr: fst_target,
-                flags,
-                metadata_uuid: sb.metadata_uuid,
-                chunk_tree_uuid,
-                generation: new_generation,
-                owner: FREE_SPACE_TREE_OBJECTID,
-                csum_type: sb.csum_type,
-                items: allocator.emit_free_space_tree_items(),
-            };
-            if fst_leaf.free_space(sb.node_size) == 0 {
-                return Err(LuksError::UnsupportedFsFeature(
-                    "btrfs free-space tree no longer fits in a single leaf".into(),
-                ));
-            }
-            let fst_raw = fst_leaf.emit(sb.node_size)?;
-            pending_blocks.insert(fst_target, fst_raw);
-
-            // Update ROOT_ITEM for FREE_SPACE_TREE in ROOT_TREE
-            let fst_root_key = Key::new(FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
-            let root_res = cow_tree_mutate(
-                fs,
-                &pending_blocks,
-                root_tree_bytenr,
-                root_tree_level,
-                ROOT_TREE_OBJECTID,
-                &fst_root_key,
-                new_generation,
-                &mut allocator,
-                |leaf| {
-                    let idx = leaf.find_item(&fst_root_key).ok_or_else(|| {
-                        LuksError::NotFound("fst root item not found".into())
-                    })?;
-                    let data = &mut leaf.items[idx].data;
-                    if data.len() < 239 {
-                        return Err(LuksError::CorruptFs("root item truncated"));
-                    }
-                    data[160..168].copy_from_slice(&new_generation.to_le_bytes());
-                    data[176..184].copy_from_slice(&fst_target.to_le_bytes());
-                    data[238] = 0; // level 0
-                    Ok(())
-                },
-            )?;
-
-            record_cow_result(
-                &root_res,
-                &mut blocks_to_add,
-                &mut blocks_to_remove,
-                &mut allocator,
-                &mut pending_blocks,
-                sb.node_size,
-                ROOT_TREE_OBJECTID,
-            )?;
-            root_tree_bytenr = root_res.new_root_bytenr;
-            root_tree_level = root_res.new_root_level;
-        }
-    }
-
-    // 6. Short re-convergence loop to record metadata blocks allocated by FST/BGI updates,
-    // keep BLOCK_GROUP_ITEM used counters synchronized with actual allocations,
-    // and ensure the extent root pointer in ROOT_TREE is recorded.
     let mut converged = false;
     for _iteration in 0..MAX_CONVERGENCE_ROUNDS {
+        if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
+            // Convergence achieved
+            converged = true;
+            break;
+        }
+
         let to_remove = std::mem::take(&mut blocks_to_remove);
         for (old_b, old_lvl) in to_remove {
             let del_key = Key::new(old_b, METADATA_ITEM_KEY, old_lvl as u64);
@@ -999,6 +855,24 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 new_generation,
                 alloc_owner,
             );
+            // `cow_tree_insert`, not `cow_tree_mutate`: this is a brand new key
+            // (the block was just allocated, so no METADATA_ITEM for it can
+            // already exist), not an edit of one already in the leaf.
+            // `cow_tree_mutate`'s leaf branch has no split path at all — it
+            // calls `mutate_fn` and unconditionally emits, so once the extent
+            // tree's target leaf was full this failed closed with
+            // `FilesystemFull` even with the rest of the filesystem empty.
+            // Measured 2026-08-15: a probe against a *freshly mkfs'd, mostly
+            // empty* mixed-4k.img (no prior fragmentation) hit exactly this
+            // error via this call site at the 319th file created, long
+            // before the FS tree itself needed an interior split — meaning
+            // the "adversarial 5,557-file run hit FilesystemFull" this
+            // project's plan attributed to running out of physical space was
+            // very likely this bug, not exhausted media. `cow_tree_insert`
+            // already carries the leaf-split and root-height-increment logic
+            // this needs, and is already used for extent-tree data-extent
+            // inserts a few lines above — this just makes metadata-item
+            // inserts consistent with that.
             let ext_res = cow_tree_insert(
                 fs,
                 &pending_blocks,
@@ -1022,6 +896,101 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
             )?;
             extent_root_bytenr = ext_res.new_root_bytenr;
             extent_root_level = ext_res.new_root_level;
+        }
+
+        // Update Free Space Tree if present on this filesystem.
+        //
+        // Rewritten wholesale from the allocator's own view rather than
+        // edited in place, and therefore emitted as a single leaf — which is
+        // only correct for a single-leaf tree, so that shape is refused up
+        // front rather than silently mangled. Leaving the tree stale instead
+        // is not an option: `btrfs check` cross-checks its contents against
+        // the extent tree even with FREE_SPACE_TREE_VALID cleared (measured
+        // 2026-08-14; see the §2 correction in feature-btrfs-write.md).
+        if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
+            if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+                gate::check_free_space_tree_shape(&fst_root)?;
+
+                let fst_target = match fst_bytenr_opt {
+                    Some(b) => b,
+                    None => {
+                        let b = allocator.allocate_metadata(sb.node_size)?;
+                        blocks_to_add.push((b, 0, FREE_SPACE_TREE_OBJECTID));
+                        blocks_to_remove.push((fst_root.bytenr, 0));
+                        allocator.free_metadata(fst_root.bytenr, sb.node_size)?;
+                        fst_bytenr_opt = Some(b);
+                        b
+                    }
+                };
+
+                let old_fst_node =
+                    read_node(fs, &pending_blocks, fst_root.bytenr)?;
+                let chunk_tree_uuid = old_fst_node.chunk_tree_uuid();
+                let flags = old_fst_node.flags();
+
+                let fst_leaf = Leaf {
+                    bytenr: fst_target,
+                    flags,
+                    metadata_uuid: sb.metadata_uuid,
+                    chunk_tree_uuid,
+                    generation: new_generation,
+                    owner: FREE_SPACE_TREE_OBJECTID,
+                    csum_type: sb.csum_type,
+                    items: allocator.emit_free_space_tree_items(),
+                };
+                // The same single-leaf limit, caught from the other side: the
+                // tree can start as one leaf and still not fit in one once
+                // this write fragments free space. `emit` would report this
+                // as a bare FilesystemFull, which reads as "the drive is
+                // full" — a different and much more alarming claim than the
+                // true one, and `RULES.md` requires an error to name its own
+                // operation.
+                if fst_leaf.free_space(sb.node_size) == 0 {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "btrfs free-space tree no longer fits in a single leaf".into(),
+                    ));
+                }
+                let fst_raw = fst_leaf.emit(sb.node_size)?;
+                pending_blocks.insert(fst_target, fst_raw);
+
+                // Update ROOT_ITEM for FREE_SPACE_TREE in ROOT_TREE
+                let fst_root_key = Key::new(FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+                let root_res = cow_tree_mutate(
+                    fs,
+                    &pending_blocks,
+                    root_tree_bytenr,
+                    root_tree_level,
+                    ROOT_TREE_OBJECTID,
+                    &fst_root_key,
+                    new_generation,
+                    &mut allocator,
+                    |leaf| {
+                        let idx = leaf.find_item(&fst_root_key).ok_or_else(|| {
+                            LuksError::NotFound("fst root item not found".into())
+                        })?;
+                        let data = &mut leaf.items[idx].data;
+                        if data.len() < 239 {
+                            return Err(LuksError::CorruptFs("root item truncated"));
+                        }
+                        data[160..168].copy_from_slice(&new_generation.to_le_bytes());
+                        data[176..184].copy_from_slice(&fst_target.to_le_bytes());
+                        data[238] = 0; // level 0
+                        Ok(())
+                    },
+                )?;
+
+                record_cow_result(
+                    &root_res,
+                    &mut blocks_to_add,
+                    &mut blocks_to_remove,
+                    &mut allocator,
+                    &mut pending_blocks,
+                    sb.node_size,
+                    ROOT_TREE_OBJECTID,
+                )?;
+                root_tree_bytenr = root_res.new_root_bytenr;
+                root_tree_level = root_res.new_root_level;
+            }
         }
 
         // Update BLOCK_GROUP_ITEM in EXTENT_TREE for each block group
@@ -1109,11 +1078,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         )?;
         root_tree_bytenr = root_res.new_root_bytenr;
         root_tree_level = root_res.new_root_level;
-
-        if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
-            converged = true;
-            break;
-        }
     }
 
     // The loop above has a round cap so a bug cannot spin forever. Until now it
