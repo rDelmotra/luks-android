@@ -170,8 +170,13 @@ open class SessionController(
         try {
             return block(currentVol)
         } catch (t: Throwable) {
-            if (isFatalWritePoison(t)) {
-                onWritePoison(t.message ?: t.toString())
+            if (isFatalWriteFailure(t)) {
+                val reason = t.message ?: t.toString()
+                if ((t as LuksException).code == LuksException.WRITE_SESSION_FENCED) {
+                    onWriteSessionFenced(reason)
+                } else {
+                    onWritePoison(reason)
+                }
             }
             throw t
         } finally {
@@ -295,7 +300,10 @@ open class SessionController(
     }
 
     /**
-     * Moves session into [SessionState.Failed] upon write poison / fatal write failure.
+     * Moves session into [SessionState.Failed] because a previous write left the
+     * volume lock poisoned ([LuksException.MUTEX_POISONED] or [LuksException.PANIC]):
+     * a write panicked while holding it, so no further operation on this volume
+     * can be trusted.
      */
     suspend fun onWritePoison(reason: String) = mutex.withLock {
         Trace.err(-1, "write_poison")
@@ -303,6 +311,23 @@ open class SessionController(
         isLocking.set(false)
         teardownHandles()
         _state.value = SessionState.Failed("Write poison: $reason")
+    }
+
+    /**
+     * Moves session into [SessionState.Failed] because a transport failure left
+     * the drive's on-disk state unknown ([LuksException.WRITE_SESSION_FENCED]).
+     * Unlike [onWritePoison], nothing panicked and the volume lock is intact --
+     * so the message must not say "panic" or "poison". It names the actual
+     * remedy (unlock the volume again) instead of implying the app is broken.
+     */
+    suspend fun onWriteSessionFenced(reason: String) = mutex.withLock {
+        Trace.err(-1, "write_session_fenced")
+        Trace.e("LuksSession: write session fenced: $reason")
+        isLocking.set(false)
+        teardownHandles()
+        _state.value = SessionState.Failed(
+            "Write session fenced: $reason. Unlock the volume again to continue.",
+        )
     }
 
     /**
@@ -388,8 +413,8 @@ open class SessionController(
     }
 
     /**
-     * Whether [t] means the native volume lock is poisoned and no further
-     * operation on this volume can be trusted.
+     * Whether [t] means no further write on this volume can be trusted, so the
+     * session must be torn down rather than letting the caller retry.
      *
      * Matches on the error *code*, never on the message text. An earlier
      * version substring-matched "poison", "panic" and "corrupt" against
@@ -399,15 +424,23 @@ open class SessionController(
      * through SAF. Browsing the drive in a file manager therefore killed the
      * session and reported it as "Write poison", which was false twice over:
      * nothing had been written, and nothing was poisoned. A corrupt structure
-     * found during a read is a failure of that one operation.
+     * found during a read is a failure of that one operation. Do not widen
+     * this check to any other code, and never back to message text.
      *
-     * Only [LuksException.MUTEX_POISONED] (a previous write panicked while
-     * holding the lock) and [LuksException.PANIC] genuinely invalidate the
-     * volume, and both arrive as codes rather than prose.
+     * Three codes genuinely invalidate the volume, and all three arrive as
+     * codes rather than prose: [LuksException.MUTEX_POISONED] and
+     * [LuksException.PANIC] mean a previous write panicked while holding the
+     * volume lock; [LuksException.WRITE_SESSION_FENCED] means a previous write
+     * failed for an unrelated reason (a transport failure, say) that left the
+     * on-disk state unknown, so the write session was fenced even though
+     * nothing panicked. "Poison" used to be the whole category; it is now one
+     * of three causes of the same fatal outcome.
      */
-    private fun isFatalWritePoison(t: Throwable): Boolean {
+    private fun isFatalWriteFailure(t: Throwable): Boolean {
         val e = t as? LuksException ?: return false
-        return e.code == LuksException.MUTEX_POISONED || e.code == LuksException.PANIC
+        return e.code == LuksException.MUTEX_POISONED ||
+            e.code == LuksException.PANIC ||
+            e.code == LuksException.WRITE_SESSION_FENCED
     }
 }
 

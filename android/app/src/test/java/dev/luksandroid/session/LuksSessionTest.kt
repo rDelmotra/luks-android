@@ -204,7 +204,7 @@ class LuksSessionTest {
      * A `CorruptFs` surfacing from a *read* must fail that one read and leave the
      * session unlocked.
      *
-     * Regression test. `isFatalWritePoison` used to substring-match "corrupt",
+     * Regression test. `isFatalWriteFailure` (formerly `isFatalWritePoison`) used to substring-match "corrupt",
      * "poison" and "panic" against the exception message, so a read returning
      * `CorruptFs("btrfs node has no items")` -- raised by `Cursor::retreat_leaf`
      * while merely listing a btrfs volume through SAF -- tore the whole session
@@ -254,6 +254,68 @@ class LuksSessionTest {
         assertTrue(
             "MUTEX_POISONED must move the session to Failed, state was ${session.state.value}",
             session.state.value is SessionState.Failed,
+        )
+    }
+
+    /**
+     * Fence twin of [testMutexPoisonedFromNativeStillPoisonsTheSession]. A
+     * [LuksException.WRITE_SESSION_FENCED] means a previous write left the
+     * drive's on-disk state unknown (a transport failure, not a panic), and
+     * `isFatalWriteFailure` must still refuse further writes on this volume.
+     * The Failed message must name the fence, not claim something panicked.
+     */
+    @Test
+    fun testWriteSessionFencedFromNativeMovesSessionToFailed() = runBlocking {
+        session.startUnlockedForTest()
+
+        try {
+            session.withLease {
+                throw LuksException("usb transfer timed out mid-commit", LuksException.WRITE_SESSION_FENCED)
+            }
+            fail("Expected the fence to propagate")
+        } catch (e: LuksException) {
+            assertEquals(LuksException.WRITE_SESSION_FENCED, e.code)
+        }
+
+        val state = session.state.value
+        assertTrue(
+            "WRITE_SESSION_FENCED must move the session to Failed, state was $state",
+            state is SessionState.Failed,
+        )
+        val message = (state as SessionState.Failed).message
+        assertFalse("Fence message must not claim a panic occurred: $message", message.contains("panic"))
+        assertTrue(
+            "Fence message must name the remedy (unlock again): $message",
+            message.contains("Unlock the volume again"),
+        )
+    }
+
+    /**
+     * Negative control, the exact regression `isFatalWriteFailure` already
+     * suffered once (see [testReadSideCorruptFsDoesNotPoisonTheSession]):
+     * [LuksException.CORRUPT] raised by a *read* must not be treated as a
+     * fatal write failure. Only [LuksException.MUTEX_POISONED],
+     * [LuksException.PANIC] and [LuksException.WRITE_SESSION_FENCED] tear the
+     * session down; every other code -- including CORRUPT -- must leave the
+     * session in [SessionState.Unlocked] so the caller can keep working with
+     * the rest of the volume.
+     */
+    @Test
+    fun testCorruptFromReadDoesNotMoveSessionToFailed() = runBlocking {
+        session.startUnlockedForTest()
+
+        try {
+            session.withLease {
+                throw LuksException("btrfs node has no items", LuksException.CORRUPT)
+            }
+            fail("Expected the CorruptFs to propagate to the caller")
+        } catch (e: LuksException) {
+            assertEquals(LuksException.CORRUPT, e.code)
+        }
+
+        assertTrue(
+            "CORRUPT from a read must not move the session to Failed, state was ${session.state.value}",
+            session.state.value is SessionState.Unlocked,
         )
     }
 

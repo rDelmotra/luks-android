@@ -39,6 +39,9 @@ object UiErrorMessage {
         LuksException.ITEM_TOO_LARGE -> "The item is too large for the filesystem tree structure limits."
         LuksException.MUTEX_POISONED -> "Drive state was compromised by a previous error. Please lock and unlock the volume to retry."
         LuksException.CANCELLED -> "The operation was cancelled."
+        LuksException.WRITE_SESSION_FENCED ->
+            "A previous write left the drive's state unknown, so further writes are blocked. " +
+                "Lock and unlock the volume again to continue."
         else -> "An unexpected error occurred (code $code)."
     }
 

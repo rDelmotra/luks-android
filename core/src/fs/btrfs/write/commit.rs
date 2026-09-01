@@ -9,7 +9,7 @@
 
 use crate::device::WriteAt;
 use crate::error::Result;
-use crate::fs::btrfs::superblock::{SUPER_OFFSETS, SUPER_SIZE};
+use crate::fs::btrfs::superblock::{Superblock, SUPER_OFFSETS, SUPER_SIZE};
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::Btrfs;
 
@@ -21,6 +21,20 @@ pub fn commit_transaction<D: WriteAt>(
     // Read raw superblock copy #0 as a template.
     let mut template = vec![0u8; SUPER_SIZE];
     fs.device().read_at(SUPER_OFFSETS[0], &mut template)?;
+
+    // Verify the template before trusting a single byte of it. This used to
+    // be the only unverified superblock read in the codebase: `emit_copy`
+    // below stamps a FRESH, valid checksum over whatever `template` holds
+    // and writes the result to all three mirrors. Without this check, a
+    // transport glitch on this one read (desynced USB pipe, torn cable)
+    // would not be caught — our own checksum would certify the garbage and
+    // launder it into permanent, "verified" corruption across every
+    // mirror, surviving a replug. `Superblock::parse` is the exact
+    // mechanism every other superblock read in this codebase is checked
+    // with (magic at 0x40, then checksum per `csum_type`); reuse it here
+    // instead of duplicating the CRC/SHA256 dispatch. See
+    // notes/btrfs-recon-2026-08-30/PLAN-2026-09-01.md, item H5.
+    Superblock::parse(&template, SUPER_OFFSETS[0])?;
 
     let dev_len = fs.device().len();
 

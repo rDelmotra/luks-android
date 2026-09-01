@@ -12,10 +12,10 @@ import java.io.IOException
 class UiErrorMessageTest {
 
     /**
-     * Verify all 19 LuksException error codes map to distinct, clear, user-friendly messages.
+     * Verify all 20 LuksException error codes map to distinct, clear, user-friendly messages.
      */
     @Test
-    fun testAll19LuksErrorCodesMapped() {
+    fun testAll20LuksErrorCodesMapped() {
         val codes = listOf(
             LuksException.GENERIC to "unexpected",
             LuksException.WRONG_PASSWORD to "passphrase",
@@ -36,9 +36,10 @@ class UiErrorMessageTest {
             LuksException.ITEM_TOO_LARGE to "too large",
             LuksException.MUTEX_POISONED to "Drive state was compromised",
             LuksException.CANCELLED to "cancelled",
+            LuksException.WRITE_SESSION_FENCED to "Lock and unlock the volume again",
         )
 
-        assertEquals("Must test exactly 19 error codes", 19, codes.size)
+        assertEquals("Must test exactly 20 error codes", 20, codes.size)
 
         for ((code, keyword) in codes) {
             val msg = UiErrorMessage.getBaseMessage(code)
@@ -85,6 +86,20 @@ class UiErrorMessageTest {
 
         val noOpMsg = UiErrorMessage.getUserMessage(LuksException.CORRUPT)
         assertEquals("Drive header or filesystem metadata is damaged or corrupted.", noOpMsg)
+    }
+
+    /**
+     * The fence message must name the remedy (unlock the volume again) and
+     * must not say "panicked" -- unlike [LuksException.MUTEX_POISONED], a
+     * fence means a previous write's *transport* failed, not that anything
+     * panicked, and conflating the two sent a past investigation at the
+     * wrong layer (see `LuksException.WRITE_SESSION_FENCED`'s doc comment).
+     */
+    @Test
+    fun testWriteSessionFencedMessageNamesRemedyAndDoesNotClaimPanic() {
+        val msg = UiErrorMessage.getBaseMessage(LuksException.WRITE_SESSION_FENCED)
+        assertTrue("Fence message should name the remedy: $msg", msg.contains("unlock", ignoreCase = true))
+        assertFalse("Fence message must not claim a panic occurred: $msg", msg.contains("panic", ignoreCase = true))
     }
 
     @Test
