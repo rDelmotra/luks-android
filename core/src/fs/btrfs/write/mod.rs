@@ -53,6 +53,25 @@ impl<D: WriteAt> Btrfs<D> {
         Ok(())
     }
 
+    /// Drop any active batch **without** committing it, returning whether one
+    /// was discarded.
+    ///
+    /// For use when the drive's state is no longer trustworthy. A batch holds
+    /// allocator bookkeeping — `block_group.used` bumps, `handed_out` ranges —
+    /// that only becomes true on disk if its commit succeeds. After a
+    /// transport failure that commit cannot be trusted to have landed, so
+    /// carrying the batch forward lets a later, unrelated commit publish
+    /// counters describing writes that never happened. That is the 2026-09-01
+    /// field corruption's shape.
+    ///
+    /// Discarding loses the batch's uncommitted files. That is the intended
+    /// trade: those files' data blocks are unreferenced bytes, which btrfs
+    /// treats as free space, whereas a mismatched `used` counter is a
+    /// filesystem `btrfs check` rejects.
+    pub fn discard_active_batch(&mut self) -> bool {
+        self.active_batch.take().is_some()
+    }
+
     /// Update the modification timestamp (`mtime`) of the file at `path`.
     pub fn set_mtime(&mut self, path: &str, mtime_sec: u64, mtime_nsec: u32) -> Result<()> {
         self.commit_active_batch()?;

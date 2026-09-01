@@ -625,11 +625,10 @@ impl Batch {
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;
 
-        let pending_blocks = std::mem::take(&mut self.pending_blocks);
-        let blocks_to_add = std::mem::take(&mut self.blocks_to_add);
-        let blocks_to_remove = std::mem::take(&mut self.blocks_to_remove);
-        let data_extents_to_add = std::mem::take(&mut self.data_extents_to_add);
-
+        // `converge_and_finalize` reads the current trees and can fail before
+        // it returns a transaction. Keep the live batch untouched until it
+        // succeeds; otherwise a later commit can retain an allocator `used`
+        // counter while losing the matching extent-tree deltas.
         let txn = converge_and_finalize(
             fs,
             self.generation,
@@ -638,12 +637,12 @@ impl Batch {
             None,
             None,
             None,
-            pending_blocks,
+            self.pending_blocks.clone(),
             Vec::new(),
             self.allocator.clone(),
-            blocks_to_add,
-            blocks_to_remove,
-            data_extents_to_add,
+            self.blocks_to_add.clone(),
+            self.blocks_to_remove.clone(),
+            self.data_extents_to_add.clone(),
             Vec::new(),
         )?;
 
@@ -651,6 +650,10 @@ impl Batch {
             self.allocator = final_alloc.clone();
             self.allocator.unpin_freed();
         }
+        self.pending_blocks.clear();
+        self.blocks_to_add.clear();
+        self.blocks_to_remove.clear();
+        self.data_extents_to_add.clear();
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
         self.csum_root = None;
         self.generation = txn.new_generation;

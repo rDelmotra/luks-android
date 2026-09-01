@@ -89,7 +89,9 @@ object TreeImporter {
 
         fun stop(entryPath: String, cause: Throwable): TransferOutcome {
             fireProgress(entryPath, bytesCopied, force = true)
-            try { volume.commitActiveBatch() } catch (ignored: Throwable) {}
+            // A failed stream may have failed during a transport command whose
+            // on-device outcome is unknown. Do not start a separate metadata
+            // commit and hide its result while reporting the original failure.
             return TransferOutcome(
                 filesCopied, filesSkipped, dirsCreated, bytesCopied, entryPath, cause, stats.snapshot(),
             )
@@ -224,7 +226,13 @@ object TreeImporter {
         }
 
         fireProgress(lastPath, bytesCopied, force = true)
-        try { volume.commitActiveBatch() } catch (ignored: Throwable) {}
+        try {
+            volume.commitActiveBatch()
+        } catch (t: Throwable) {
+            return TransferOutcome(
+                filesCopied, filesSkipped, dirsCreated, bytesCopied, lastPath, t, stats.snapshot(),
+            )
+        }
         return TransferOutcome(
             filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null, stats.snapshot(),
         )

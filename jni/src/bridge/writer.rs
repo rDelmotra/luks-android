@@ -20,12 +20,14 @@ impl VolumeHandle {
     /// Begin a bounded-memory file transfer. The returned state has no volume
     /// reference, so storing it in a JNI handle cannot prolong key lifetime.
     pub fn begin_file(&self, size: u64) -> Result<crate::bridge::FileWriterEnum> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
-        match &mut *fs {
-            Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file(size)?)),
-            Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file(size)?)),
-        }
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
+            match &mut *fs {
+                Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file(size)?)),
+                Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file(size)?)),
+            }
+        })
     }
 
     /// Begin an unknown-size file transfer. Unlike `begin_file`, no upfront
@@ -33,12 +35,14 @@ impl VolumeHandle {
     /// `write_chunk`. The returned state has no volume reference, so storing
     /// it in a JNI handle cannot prolong key lifetime.
     pub fn begin_file_streaming(&self) -> Result<crate::bridge::FileWriterEnum> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
-        match &mut *fs {
-            Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file_streaming()?)),
-            Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file_streaming()?)),
-        }
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
+            match &mut *fs {
+                Fs::Ext4(ext4) => Ok(crate::bridge::FileWriterEnum::Ext4(ext4.begin_file_streaming()?)),
+                Fs::Btrfs(btrfs) => Ok(crate::bridge::FileWriterEnum::Btrfs(btrfs.begin_file_streaming()?)),
+            }
+        })
     }
 
     pub fn write_file_chunk_with_cancel(
@@ -50,12 +54,14 @@ impl VolumeHandle {
         if cancel_token != 0 && crate::bridge::is_cancelled(cancel_token) {
             return Err(LuksError::Cancelled);
         }
-        let mut fs = self.fs_for_writing()?;
-        match (&mut *fs, writer) {
-            (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.write_chunk(w, data),
-            (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.write_chunk(w, data),
-            _ => unreachable!("writer type mismatch"),
-        }
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            match (&mut *fs, writer) {
+                (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.write_chunk(w, data),
+                (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.write_chunk(w, data),
+                _ => unreachable!("writer type mismatch"),
+            }
+        })
     }
 
     pub fn write_file_chunk(&self, writer: &mut crate::bridge::FileWriterEnum, data: &[u8]) -> Result<()> {
@@ -63,6 +69,7 @@ impl VolumeHandle {
     }
 
     pub fn finish_file(&self, writer: crate::bridge::FileWriterEnum, parent_path: &str, name: &str) -> Result<u64> {
+        self.guarding_writes(move || {
         let mut fs = self.fs_for_writing()?;
         match (&mut *fs, writer) {
             (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => {
@@ -84,14 +91,17 @@ impl VolumeHandle {
             }
             _ => unreachable!("writer type mismatch"),
         }
+        })
     }
 
     pub fn commit_active_batch(&self) -> Result<()> {
-        let mut fs = self.fs_for_writing()?;
-        match &mut *fs {
-            Fs::Ext4(_) => Ok(()), // Ext4 commits immediately in finish_file
-            Fs::Btrfs(btrfs) => btrfs.commit_active_batch(),
-        }
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            match &mut *fs {
+                Fs::Ext4(_) => Ok(()), // Ext4 commits immediately in finish_file
+                Fs::Btrfs(btrfs) => btrfs.commit_active_batch(),
+            }
+        })
     }
 
     pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) {

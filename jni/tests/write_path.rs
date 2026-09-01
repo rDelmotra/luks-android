@@ -1259,3 +1259,160 @@ fn paged_directory_listing_on_ext4_and_btrfs() {
 
 
 
+
+// ---------------------------------------------------------------------
+// Write-session fencing.
+//
+// A transport failure leaves the drive's state unknown. Continuing to write
+// after one is what produced the 2026-09-01 field corruption: the failure was
+// swallowed, the batch stayed live, and a later unrelated commit published a
+// `BLOCK_GROUP_ITEM.used` the extent tree could not account for. These tests
+// pin the policy that replaced that behaviour.
+// ---------------------------------------------------------------------
+
+/// The whole point: after fencing, writes are refused and reads are not.
+///
+/// Reads staying open is a deliberate product decision, not an oversight. The
+/// drive holds the user's data; stranding it behind an error screen because a
+/// cable glitched would be a worse outcome than the one being prevented.
+#[test]
+fn a_fenced_write_session_refuses_writes_and_still_serves_reads() {
+    let path = scratch_btrfs("fence-refuses-writes");
+    let vol = unlock(&path);
+
+    vol.write_file("/", "before-fence.txt", b"written while healthy\n")
+        .expect("baseline write must succeed");
+    vol.commit_active_batch().expect("baseline commit");
+
+    assert!(
+        !vol.is_write_fenced(),
+        "vacuity: the volume must start unfenced, or the assertions below prove nothing"
+    );
+
+    vol.fence_writes(luks_core::error::LuksError::ScsiProtocol("no CSW"));
+
+    assert!(vol.is_write_fenced(), "fence_writes must latch");
+    assert!(
+        vol.fence_reason().is_some_and(|r| r.contains("no CSW")),
+        "the fence must carry the original diagnosis, not a generic message"
+    );
+
+    let err = vol
+        .write_file("/", "after-fence.txt", b"must not land\n")
+        .expect_err("a fenced session must refuse writes");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED,
+        "a fenced write must be distinguishable from a poisoned mutex, got {err:?}"
+    );
+
+    let err = vol
+        .commit_active_batch()
+        .expect_err("a fenced session must refuse to commit");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    // Reads survive.
+    let json = vol
+        .list_dir_json("/")
+        .expect("list_dir_json must survive fencing");
+    assert!(
+        json.contains("before-fence.txt"),
+        "the file written before the fence must still be listed: {json}"
+    );
+    let data = vol
+        .read_file("/before-fence.txt", 4096)
+        .expect("read_file must survive fencing");
+    assert_eq!(data, b"written while healthy\n");
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The control, and the assertion that keeps the fence from being useless.
+///
+/// If ordinary refusals fenced, an out-of-space drive or a typo'd path would
+/// force the user to unlock again. A green fence test with no control here
+/// would be satisfied by a classifier that returns `true` for everything.
+#[test]
+fn an_ordinary_refusal_does_not_fence_the_write_session() {
+    let path = scratch_btrfs("fence-control-refusal");
+    let vol = unlock(&path);
+
+    let err = vol
+        .write_file("/no-such-directory", "orphan.txt", b"nope\n")
+        .expect_err("writing into a missing directory must fail");
+    assert_ne!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED,
+        "a path refusal must not be reported as a fenced session"
+    );
+    assert!(
+        !vol.is_write_fenced(),
+        "a self-generated refusal proves the write did not happen; it must not fence: {err:?}"
+    );
+
+    // And the session is genuinely still usable, not merely unfenced by flag.
+    vol.write_file("/", "still-writable.txt", b"session survived\n")
+        .expect("the session must still accept writes after an ordinary refusal");
+    vol.commit_active_batch().expect("commit after refusal");
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Fencing must *discard* the active batch, not commit it.
+///
+/// Committing a batch whose earlier writes may or may not have landed is
+/// exactly the operation that publishes a `used` counter with no extent items
+/// behind it. Graded by `btrfs check`, not by our own reader.
+#[test]
+fn fencing_discards_the_active_batch_and_leaves_a_valid_filesystem() {
+    // `verify-image.sh`, not `verify-btrfs.sh`: `scratch_btrfs` is a LUKS
+    // container, so the oracle has to unlock it before `btrfs check` sees a
+    // filesystem at all. Same script the other btrfs bridge tests grade with.
+    let Some(script) = tool("verify-image.sh") else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+
+    let path = scratch_btrfs("fence-discards-batch");
+    {
+        let vol = unlock(&path);
+
+        vol.write_file("/", "committed.txt", b"this one is committed\n")
+            .expect("first write");
+        vol.commit_active_batch().expect("commit the first file");
+
+        // Leave a batch live and uncommitted, then fence.
+        vol.write_file("/", "uncommitted.txt", b"this one is dropped\n")
+            .expect("second write joins the active batch");
+        vol.fence_writes(luks_core::error::LuksError::UsbTransfer("timed out".into()));
+
+        assert!(vol.is_write_fenced());
+    }
+
+    let out = Command::new("bash")
+        .arg(&script)
+        .arg(&path)
+        .arg(PASSWORD_STR)
+        .output()
+        .expect("run verify-image.sh");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.status.success() && combined.contains("VERDICT: clean"),
+        "discarding a batch on fence must leave a filesystem the kernel accepts:\n{combined}"
+    );
+    assert!(
+        !combined.contains("but extent items used"),
+        "the used counter must still match the extent tree:\n{combined}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}

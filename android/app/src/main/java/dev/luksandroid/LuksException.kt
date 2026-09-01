@@ -29,6 +29,17 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isMutexPoisoned: Boolean get() = code == MUTEX_POISONED
     val isCancelled: Boolean get() = code == CANCELLED
     val isDirectoryNotEmpty: Boolean get() = code == DIRECTORY_NOT_EMPTY
+    val isWriteSessionFenced: Boolean get() = code == WRITE_SESSION_FENCED
+
+    /**
+     * Whether this failure means no further write on this volume can be
+     * trusted, so the session must be torn down rather than retried.
+     *
+     * Both codes have the same remedy -- unlock again -- but different
+     * diagnoses: [MUTEX_POISONED] is a panic under the volume lock,
+     * [WRITE_SESSION_FENCED] is a transport failure that panicked nothing.
+     */
+    val isWriteSessionDead: Boolean get() = isMutexPoisoned || isWriteSessionFenced
 
     override fun toString(): String = "LuksException[$code] ${message.orEmpty()}"
 
@@ -90,5 +101,16 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * found and is real — it just still has something in it.
          */
         const val DIRECTORY_NOT_EMPTY = 20
+
+        /**
+         * An earlier write failed in a way that left the drive's state
+         * unknown, so the write session was fenced. Every later write on this
+         * volume is refused until it is unlocked again; reads still work.
+         *
+         * Distinct from [MUTEX_POISONED], which it would otherwise be lumped
+         * in with. Reporting a timed-out cable as "a previous operation
+         * panicked" sent one investigation at the wrong layer already.
+         */
+        const val WRITE_SESSION_FENCED = 21
     }
 }

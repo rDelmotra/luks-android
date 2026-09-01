@@ -107,6 +107,16 @@ pub mod code {
     /// `NOT_FOUND`, which the other path-shape refusals share: this directory
     /// exists and was found, it just is not empty.
     pub const DIRECTORY_NOT_EMPTY: i32 = 20;
+    /// An earlier write failed in a way that left the drive's state unknown,
+    /// so the write session was fenced. Every later write on this volume is
+    /// refused until it is unlocked again; reads still work.
+    ///
+    /// Distinct from [`MUTEX_POISONED`], which it would otherwise be lumped
+    /// in with: poison means a panic, this means a transport failure that
+    /// panicked nothing. The remedy is the same but the diagnosis is not, and
+    /// reporting a timed-out cable as "a previous operation panicked" sent
+    /// one investigation at the wrong layer already.
+    pub const WRITE_SESSION_FENCED: i32 = 21;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -135,6 +145,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         WrongWriteTarget { .. } => code::WRONG_TARGET,
         UnverifiableWriteTarget { .. } => code::UNVERIFIABLE_TARGET,
         SessionPoisoned => code::MUTEX_POISONED,
+        WriteSessionFenced(_) => code::WRITE_SESSION_FENCED,
         Cancelled => code::CANCELLED,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         DirectoryNotEmpty(_) => code::DIRECTORY_NOT_EMPTY,
@@ -376,6 +387,23 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path claims it")
     )]
     device_writer: Arc<std::sync::atomic::AtomicBool>,
+    /// Why this volume's write session was fenced, if it was.
+    ///
+    /// `None` means writes are allowed. `Some(reason)` means an earlier write
+    /// failed in a way that left the drive's state unknown, so every later
+    /// write is refused until the volume is unlocked again. Reads are not
+    /// affected — see [`LuksError::WriteSessionFenced`].
+    ///
+    /// A separate latch from the `fs` mutex's poison flag because the two
+    /// catch different things: poison catches a panic under the lock, this
+    /// catches a transport failure that returned an ordinary `Err` and
+    /// panicked nothing. Before this existed only the first was fenced, and
+    /// the second — the one that actually happened on hardware — was not.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path can be fenced")
+    )]
+    write_fence: Mutex<Option<String>>,
     /// Whether *this* volume is the one holding that flag, so dropping it
     /// releases the claim only if it made it.
     #[cfg_attr(
@@ -403,8 +431,70 @@ impl VolumeHandle {
 
     /// A poisoned lock on a write operation fails immediately with `SessionPoisoned`
     /// (code 18 `MUTEX_POISONED`) to prevent mutating or flushing partially-broken state.
+    ///
+    /// The fence is checked *before* the lock, so a fenced session refuses
+    /// without waiting on whatever else holds it.
     pub fn fs_for_writing(&self) -> Result<std::sync::MutexGuard<'_, MountedFs>> {
+        if let Some(reason) = self.fence_reason() {
+            return Err(LuksError::WriteSessionFenced(reason));
+        }
         self.fs.lock().map_err(|_| LuksError::SessionPoisoned)
+    }
+
+    /// Why writes are fenced, or `None` if they are allowed.
+    pub fn fence_reason(&self) -> Option<String> {
+        self.write_fence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// Whether this volume's write session has been fenced.
+    pub fn is_write_fenced(&self) -> bool {
+        self.fence_reason().is_some()
+    }
+
+    /// End the write session: refuse all later writes and drop any active
+    /// batch without committing it.
+    ///
+    /// Idempotent, and the *first* reason wins — the original failure is the
+    /// diagnosis, and a follow-up error caused by the fence itself would bury
+    /// it. Same rule `ScsiBlockDevice::recover` already applies to a failed
+    /// reset.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn fence_writes(&self, reason: impl std::fmt::Display) {
+        let mut fence = self.write_fence.lock().unwrap_or_else(|p| p.into_inner());
+        if fence.is_some() {
+            return;
+        }
+        *fence = Some(reason.to_string());
+        drop(fence);
+
+        // Drop the batch directly through the mutex rather than through
+        // `fs_for_writing`, which is now fenced and would refuse. A poisoned
+        // lock is recovered here on purpose: discarding state is the one
+        // write-side action that is still safe after a panic, and leaving the
+        // batch live is precisely what this exists to prevent.
+        let mut fs = self.fs.lock().unwrap_or_else(|p| p.into_inner());
+        if let MountedFs::Btrfs(btrfs) = &mut *fs {
+            btrfs.discard_active_batch();
+        }
+    }
+
+    /// Run a write operation, fencing the session if it fails in a way that
+    /// leaves the drive's state unknown.
+    ///
+    /// Every write entry point goes through this, so the policy lives in one
+    /// place instead of being re-decided per call site.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn guarding_writes<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
+        let out = op();
+        if let Err(ref e) = out {
+            if e.fences_write_session() && !matches!(e, LuksError::WriteSessionFenced(_)) {
+                self.fence_writes(e);
+            }
+        }
+        out
     }
 
     #[inline]
@@ -668,6 +758,7 @@ impl DeviceHandle {
             fs: Mutex::new(fs),
             partition_offset,
             device_writer: Arc::clone(&self.dev.writer),
+            write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
         })
     }
