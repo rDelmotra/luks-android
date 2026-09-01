@@ -1416,3 +1416,369 @@ fn fencing_discards_the_active_batch_and_leaves_a_valid_filesystem() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------
+// Stage A0: fencing coverage for the mutators that previously called
+// `fs_for_writing` directly, without going through `guarding_writes`. Being
+// refused once fenced was never in question — `fs_for_writing` already
+// refuses everything. What was untested is the other direction: a transport
+// failure *inside* one of these four must be able to *trigger* the fence in
+// the first place, the same way `begin_file` / `write_file_chunk` /
+// `finish_file` / `commit_active_batch` already could.
+// ---------------------------------------------------------------------
+
+/// `write_file` refuses once the session is fenced.
+#[test]
+fn a_fenced_session_refuses_write_file() {
+    let path = scratch_btrfs("fence-write-file");
+    let vol = unlock(&path);
+
+    vol.fence_writes(luks_core::error::LuksError::ScsiProtocol("no CSW"));
+    assert!(vol.is_write_fenced());
+
+    let err = vol
+        .write_file("/", "must-not-land.txt", b"nope\n")
+        .expect_err("write_file must refuse once fenced");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `delete_file` refuses once the session is fenced.
+#[test]
+fn a_fenced_session_refuses_delete_file() {
+    let path = scratch_btrfs("fence-delete-file");
+    let vol = unlock(&path);
+
+    vol.write_file("/", "to-delete.txt", b"present\n")
+        .expect("baseline write");
+    vol.commit_active_batch().expect("baseline commit");
+
+    vol.fence_writes(luks_core::error::LuksError::UsbTransfer("timed out".into()));
+    assert!(vol.is_write_fenced());
+
+    let err = vol
+        .delete_file("/to-delete.txt")
+        .expect_err("delete_file must refuse once fenced");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `create_directory` refuses once the session is fenced.
+#[test]
+fn a_fenced_session_refuses_create_directory() {
+    let path = scratch_btrfs("fence-create-directory");
+    let vol = unlock(&path);
+
+    vol.fence_writes(luks_core::error::LuksError::ScsiCommandFailed {
+        opcode: 0x2A,
+        sense: None,
+    });
+    assert!(vol.is_write_fenced());
+
+    let err = vol
+        .create_directory("/", "must-not-exist")
+        .expect_err("create_directory must refuse once fenced");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `rename` refuses once the session is fenced.
+#[test]
+fn a_fenced_session_refuses_rename() {
+    let path = scratch_btrfs("fence-rename");
+    let vol = unlock(&path);
+
+    vol.write_file("/", "old-name.txt", b"present\n")
+        .expect("baseline write");
+    vol.commit_active_batch().expect("baseline commit");
+
+    vol.fence_writes(luks_core::error::LuksError::Io {
+        path: "/dev/sda".into(),
+        source: std::io::Error::new(std::io::ErrorKind::TimedOut, "etimedout"),
+    });
+    assert!(vol.is_write_fenced());
+
+    let err = vol
+        .rename("/", "old-name.txt", "/", "new-name.txt")
+        .expect_err("rename must refuse once fenced");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The mandatory control for the four tests above: an ordinary,
+/// self-generated refusal from one of the newly-wrapped mutators
+/// (`delete_file` on a path that was never there) must NOT fence the
+/// session. Without this, a classifier that fenced on every `Err` would
+/// satisfy the four tests above just as well as the correct one, and every
+/// missing file on the drive would force a re-unlock.
+#[test]
+fn an_ordinary_refusal_from_delete_file_does_not_fence_the_write_session() {
+    let path = scratch_btrfs("fence-control-delete");
+    let vol = unlock(&path);
+
+    let err = vol
+        .delete_file("/no-such-file.txt")
+        .expect_err("deleting a missing file must fail");
+    assert_ne!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED,
+        "a missing-file refusal must not be reported as a fenced session"
+    );
+    assert!(
+        !vol.is_write_fenced(),
+        "a self-generated refusal from delete_file proves nothing was written; \
+         it must not fence: {err:?}"
+    );
+
+    // The session must still be genuinely usable afterwards, not merely
+    // unfenced by flag: every mutator wrapped in this pass gets exercised
+    // once more here.
+    vol.write_file("/", "still-writable.txt", b"session survived\n")
+        .expect("write_file must still work after an ordinary delete_file refusal");
+    vol.create_directory("/", "still-usable-dir")
+        .expect("create_directory must still work");
+    vol.rename("/", "still-writable.txt", "/", "renamed-after-refusal.txt")
+        .expect("rename must still work");
+    vol.delete_file("/renamed-after-refusal.txt")
+        .expect("delete_file must still work");
+    vol.commit_active_batch().expect("commit after refusal");
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ---------------------------------------------------------------------
+// The other half of coverage: a real transport failure *inside* one of the
+// four newly-wrapped mutators must be able to *trigger* the fence, not just
+// be refused by one already set. The tests above prove `fs_for_writing`
+// refuses a pre-fenced session — true for every mutator, wrapped or not,
+// since `fs_for_writing` itself never changed. What actually distinguishes
+// "wrapped in `guarding_writes`" from "not" is whether the mutator's own
+// failure sets the latch, and that needs a failure to originate inside the
+// call, not be injected from outside it.
+// ---------------------------------------------------------------------
+
+/// A device wrapper that lets exactly `budget` `write_at`/`flush` calls
+/// through, then answers every later one with a transport error — the same
+/// shape as `FailAfterNWrites` in `core/tests/btrfs_crash_safety.rs`, kept
+/// local here because these tests need to flip the budget with a live
+/// `Arc` *after* `unlock`, which that copy has no reason to expose.
+struct FailAfterNWrites {
+    inner: luks_core::device::FileDevice,
+    budget: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl luks_core::device::ReadAt for FailAfterNWrites {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> luks_core::error::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
+
+impl luks_core::device::WriteAt for FailAfterNWrites {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> luks_core::error::Result<()> {
+        use std::sync::atomic::Ordering;
+        let prev = self
+            .budget
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| {
+                if b == 0 {
+                    None
+                } else {
+                    Some(b - 1)
+                }
+            });
+        if prev.is_err() {
+            return Err(luks_core::error::LuksError::UsbTransfer(
+                "simulated transport vanished (FailAfterNWrites budget exhausted)".into(),
+            ));
+        }
+        self.inner.write_at(offset, buf)
+    }
+
+    fn flush(&self) -> luks_core::error::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.budget.load(Ordering::SeqCst) == 0 {
+            return Err(luks_core::error::LuksError::UsbTransfer(
+                "simulated transport vanished (FailAfterNWrites budget exhausted)".into(),
+            ));
+        }
+        self.inner.flush()
+    }
+}
+
+/// Open a scratch image through `FailAfterNWrites` instead of a plain
+/// `FileDevice`, returning the volume and a live handle to the write budget
+/// so the caller can exhaust it after setup (baseline writes, `unlock`
+/// itself) has already happened.
+fn unlock_with_budget(path: &str) -> (VolumeHandle, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1_000));
+    let len = std::fs::metadata(path).expect("stat").len();
+    let inner = luks_core::device::FileDevice::open_writable(path, len).expect("open writable");
+    let dev = FailAfterNWrites {
+        inner,
+        budget: budget.clone(),
+    };
+    let handle =
+        DeviceHandle::new(dev, 512, len / 512, "TEST".into(), "IMAGE".into()).expect("scan");
+    let offset = handle
+        .table
+        .luks_partitions()
+        .next()
+        .expect("a LUKS partition")
+        .offset_bytes();
+    (handle.unlock(offset, PASSWORD).expect("unlock"), budget)
+}
+
+/// A transport failure inside `write_file` fences the session, not just
+/// fails the one call.
+#[test]
+fn a_transport_failure_inside_write_file_triggers_the_fence() {
+    let path = scratch_btrfs("fence-trigger-write-file");
+    let (vol, budget) = unlock_with_budget(&path);
+
+    // Unlock succeeded on plenty of budget; now cut the device off before
+    // the write under test, exactly the way a cable pulled mid-transfer
+    // would.
+    budget.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let err = vol
+        .write_file("/", "vanishes-mid-write.txt", b"never lands\n")
+        .expect_err("write_file must fail when the transport is gone");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err),
+        luks_jni::bridge::code::TRANSPORT,
+        "the first failure must be reported as the transport error it is, got {err:?}"
+    );
+    assert!(
+        vol.is_write_fenced(),
+        "write_file's own transport failure must have latched the fence, not just failed the call"
+    );
+
+    let err2 = vol
+        .write_file("/", "also-refused.txt", b"still refused\n")
+        .expect_err("a later write must be refused by the fence write_file set");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err2),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A transport failure inside `delete_file` fences the session.
+#[test]
+fn a_transport_failure_inside_delete_file_triggers_the_fence() {
+    let path = scratch_btrfs("fence-trigger-delete-file");
+    let (vol, budget) = unlock_with_budget(&path);
+
+    vol.write_file("/", "to-delete.txt", b"present\n")
+        .expect("baseline write on a healthy budget");
+    vol.commit_active_batch().expect("baseline commit");
+
+    budget.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let err = vol
+        .delete_file("/to-delete.txt")
+        .expect_err("delete_file must fail when the transport is gone");
+    assert_eq!(luks_jni::bridge::error_code(&err), luks_jni::bridge::code::TRANSPORT);
+    assert!(
+        vol.is_write_fenced(),
+        "delete_file's own transport failure must have latched the fence"
+    );
+
+    let err2 = vol
+        .delete_file("/to-delete.txt")
+        .expect_err("a later delete must be refused by the fence delete_file set");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err2),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A transport failure inside `create_directory` fences the session.
+#[test]
+fn a_transport_failure_inside_create_directory_triggers_the_fence() {
+    let path = scratch_btrfs("fence-trigger-create-directory");
+    let (vol, budget) = unlock_with_budget(&path);
+
+    budget.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let err = vol
+        .create_directory("/", "vanishes-mid-mkdir")
+        .expect_err("create_directory must fail when the transport is gone");
+    assert_eq!(luks_jni::bridge::error_code(&err), luks_jni::bridge::code::TRANSPORT);
+    assert!(
+        vol.is_write_fenced(),
+        "create_directory's own transport failure must have latched the fence"
+    );
+
+    let err2 = vol
+        .create_directory("/", "also-refused")
+        .expect_err("a later mkdir must be refused by the fence create_directory set");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err2),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A transport failure inside `rename` fences the session.
+#[test]
+fn a_transport_failure_inside_rename_triggers_the_fence() {
+    let path = scratch_btrfs("fence-trigger-rename");
+    let (vol, budget) = unlock_with_budget(&path);
+
+    vol.write_file("/", "old-name.txt", b"present\n")
+        .expect("baseline write on a healthy budget");
+    vol.commit_active_batch().expect("baseline commit");
+
+    budget.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    let err = vol
+        .rename("/", "old-name.txt", "/", "new-name.txt")
+        .expect_err("rename must fail when the transport is gone");
+    assert_eq!(luks_jni::bridge::error_code(&err), luks_jni::bridge::code::TRANSPORT);
+    assert!(
+        vol.is_write_fenced(),
+        "rename's own transport failure must have latched the fence"
+    );
+
+    let err2 = vol
+        .rename("/", "old-name.txt", "/", "another-name.txt")
+        .expect_err("a later rename must be refused by the fence rename set");
+    assert_eq!(
+        luks_jni::bridge::error_code(&err2),
+        luks_jni::bridge::code::WRITE_SESSION_FENCED
+    );
+
+    drop(vol);
+    let _ = std::fs::remove_file(&path);
+}

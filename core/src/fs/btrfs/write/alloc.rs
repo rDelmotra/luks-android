@@ -545,15 +545,55 @@ impl FreeSpaceMap {
     ///
     /// The extent is recorded in `pinned_freed` rather than returned to `free_ranges`
     /// to avoid reusing it within the same transaction.
+    ///
+    /// This function used to accept any range that merely *fit inside* a
+    /// block group, with no check that it had ever been allocated. A logic
+    /// error elsewhere stopped registering a writer's data runs while
+    /// `abandon_file` still freed them, decrementing `used` for bytes the
+    /// extent tree never counted; `saturating_sub` and a discarded return
+    /// value at the call site made it silent until `btrfs check` reported
+    /// "block group [13631488 8388608] used 2105344 but extent items used
+    /// 2109440". The four checks below turn that class of bug into an
+    /// immediate `CorruptFs` instead of quiet on-disk drift.
+    ///
+    /// Deliberately NOT checked here: whether `bytenr` was handed out by the
+    /// *current* batch. `delete.rs` and `rename.rs` free extents read back
+    /// from the on-disk extent tree, allocated in prior transactions and
+    /// never present in this batch's ledger — an ownership check here would
+    /// reject every legitimate delete. That validation belongs at the caller
+    /// (see PLAN Stage B2), not in this structural gate.
     pub fn free_data(&mut self, bytenr: u64, size: u64) -> Result<()> {
         if size == 0 {
             return Ok(());
         }
         let freed_len = size;
+
+        // Check 1: the range itself must not overflow address space.
+        let end = bytenr
+            .checked_add(freed_len)
+            .ok_or(LuksError::CorruptFs("free_data range overflows u64"))?;
+
         for bg in &mut self.block_groups {
-            if bytenr >= bg.block_group.start
-                && bytenr + freed_len <= bg.block_group.start + bg.block_group.length
-            {
+            if bytenr >= bg.block_group.start && end <= bg.block_group.start + bg.block_group.length {
+                // Check 3: cannot free more than the block group has allocated.
+                if bg.block_group.used < freed_len {
+                    return Err(LuksError::CorruptFs(
+                        "free_data would free more bytes than the block group has allocated",
+                    ));
+                }
+
+                // Check 4: reject a double free within this transaction —
+                // a range already pending release cannot be freed again
+                // before it is unpinned by a commit.
+                for pinned in &bg.pinned_freed {
+                    let pinned_end = pinned.start + pinned.length;
+                    if bytenr < pinned_end && pinned.start < end {
+                        return Err(LuksError::CorruptFs(
+                            "free_data range overlaps a range already pending release in this transaction",
+                        ));
+                    }
+                }
+
                 let pos = bg.pinned_freed.partition_point(|r| r.start < bytenr);
                 bg.pinned_freed.insert(
                     pos,
@@ -575,11 +615,23 @@ impl FreeSpaceMap {
                 }
                 bg.pinned_freed = merged;
 
-                bg.block_group.used = bg.block_group.used.saturating_sub(freed_len);
+                // Safe: check 3 above already proved `freed_len <= used`, so
+                // this cannot underflow. Using plain subtraction rather than
+                // `saturating_sub` means an inconsistency the check missed
+                // will panic loudly instead of silently drifting `used` out
+                // of sync with the extent tree, which is what actually
+                // corrupted a drive (see the doc comment above).
+                bg.block_group.used -= freed_len;
                 return Ok(());
             }
         }
-        Ok(())
+
+        // Check 2: the range must belong to some block group. Silently
+        // returning `Ok(())` here is exactly what let a phantom free pass
+        // unnoticed before.
+        Err(LuksError::CorruptFs(
+            "free_data range is not contained in any block group",
+        ))
     }
 
     /// Mark a metadata block of `size` bytes starting at `bytenr` as freed in this transaction.
@@ -1107,6 +1159,95 @@ mod tests {
                 reserved_start + reserved_len
             );
         }
+    }
+
+    /// Stage B1 vacuity control: a legitimate free (range inside a block
+    /// group, within `used`, not already pinned) must still succeed and
+    /// must still decrement `used` by exactly the freed length. This proves
+    /// the four new rejections below are not accidentally rejecting
+    /// everything.
+    #[test]
+    fn free_data_legitimate_free_succeeds_and_decrements_used() {
+        let bg = create_test_data_bg(0, 1_000_000, Vec::new()); // used = 1_000_000
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        assert_eq!(map.block_groups[0].block_group.used, 1_000_000);
+        map.free_data(10_000, 4096).expect("legitimate free must succeed");
+        assert_eq!(map.block_groups[0].block_group.used, 1_000_000 - 4096);
+        assert_eq!(
+            map.block_groups[0].pinned_freed,
+            vec![FreeRange {
+                start: 10_000,
+                length: 4096
+            }]
+        );
+    }
+
+    /// Stage B1 check 1: `bytenr + size` overflowing `u64` must be rejected
+    /// rather than wrapping into a bogus range.
+    #[test]
+    fn free_data_rejects_range_overflow() {
+        let bg = create_test_data_bg(0, 1_000_000, Vec::new());
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        let err = map.free_data(u64::MAX - 10, 100).unwrap_err();
+        assert!(matches!(err, LuksError::CorruptFs(_)));
+    }
+
+    /// Stage B1 check 2: a range that falls inside no block group must be a
+    /// hard error, not the silent `Ok(())` that let a phantom free through
+    /// undetected. This is the exact defect that produced "block group
+    /// [13631488 8388608] used 2105344 but extent items used 2109440".
+    #[test]
+    fn free_data_rejects_range_outside_any_block_group() {
+        let bg = create_test_data_bg(0, 1_000_000, Vec::new());
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        let err = map.free_data(5_000_000, 4096).unwrap_err();
+        assert!(matches!(err, LuksError::CorruptFs(_)));
+    }
+
+    /// Stage B1 check 3: freeing more bytes than the block group's `used`
+    /// counter records must be rejected rather than silently saturating
+    /// `used` to zero and hiding the inconsistency.
+    #[test]
+    fn free_data_rejects_freeing_more_than_used() {
+        let mut bg = create_test_data_bg(0, 1_000_000, Vec::new());
+        bg.block_group.used = 2048; // less than the range we'll try to free
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        let err = map.free_data(10_000, 4096).unwrap_err();
+        assert!(matches!(err, LuksError::CorruptFs(_)));
+        // used must be left untouched on rejection, not partially decremented.
+        assert_eq!(map.block_groups[0].block_group.used, 2048);
+    }
+
+    /// Stage B1 check 4: freeing a range that overlaps one already in
+    /// `pinned_freed` is a double free within the same transaction and must
+    /// be rejected.
+    #[test]
+    fn free_data_rejects_double_free_overlap() {
+        let bg = create_test_data_bg(0, 1_000_000, Vec::new());
+        let mut map = FreeSpaceMap {
+            block_groups: vec![bg],
+        };
+
+        map.free_data(10_000, 4096).expect("first free must succeed");
+        // Overlaps [10_000, 14_096) at the tail end.
+        let err = map.free_data(12_000, 4096).unwrap_err();
+        assert!(matches!(err, LuksError::CorruptFs(_)));
+
+        // Exact duplicate free is also an overlap.
+        let err = map.free_data(10_000, 4096).unwrap_err();
+        assert!(matches!(err, LuksError::CorruptFs(_)));
     }
 
     #[test]

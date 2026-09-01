@@ -104,6 +104,31 @@ impl VolumeHandle {
         })
     }
 
+    /// Roll back an in-flight write, freeing whatever it had reserved.
+    ///
+    /// # Why this is not wrapped in `guarding_writes`
+    ///
+    /// `ext4.abandon_file` / `btrfs.abandon_file` return `()`, not `Result` —
+    /// they are cleanup, not a fallible write, so there is nothing for
+    /// `guarding_writes` to inspect. That does not leave this path
+    /// unguarded: the safety property that matters here is the same one
+    /// every other mutator gets from `fs_for_writing` — a fenced or
+    /// poisoned session must not touch the filesystem again. On btrfs,
+    /// `abandon_file` can itself commit a transaction to disk (to rearm the
+    /// active batch after freeing the writer's runs), which is exactly the
+    /// kind of post-fence write this mechanism exists to prevent. Refusing
+    /// to enter the `match` at all — the early `return` below — is what
+    /// stops that.
+    ///
+    /// The writer's in-memory state (extents, runs, batch offsets) is not
+    /// leaked by taking that early return: `writer` is owned by this
+    /// function, and Rust drops it when the function returns regardless of
+    /// which branch ran. Nothing here holds a raw resource that needs an
+    /// explicit release — only heap-backed bookkeeping (`Vec`s of runs) that
+    /// ordinary `Drop` reclaims. What is lost is the *filesystem's* record of
+    /// the reservation, which is fine: a fenced or poisoned session is never
+    /// going to commit anything again on this handle, so that on-disk state
+    /// was already unreachable.
     pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) {
         let Ok(mut fs) = self.fs_for_writing() else {
             return;
@@ -124,69 +149,77 @@ impl VolumeHandle {
     /// file is one yanked cable away from never having existed — and pulling
     /// the cable is how a phone transfer normally ends.
     pub fn write_file(&self, parent_path: &str, name: &str, data: &[u8]) -> Result<u64> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
 
-        match &mut *fs {
-            Fs::Ext4(ext4) => {
-                let dir_ino = ext4.resolve(parent_path)?.number;
-                let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
-                ext4.flush()?;
-                Ok(ino)
+            match &mut *fs {
+                Fs::Ext4(ext4) => {
+                    let dir_ino = ext4.resolve(parent_path)?.number;
+                    let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
+                    ext4.flush()?;
+                    Ok(ino)
+                }
+                Fs::Btrfs(btrfs) => {
+                    // Now uses the single-transaction Phase 2 implementation,
+                    // which guarantees atomicity: we either create the file AND write its data,
+                    // or fail cleanly with no orphan file left behind.
+                    let ino = btrfs.create_file_with_data(parent_path, name, data)?;
+                    Ok(ino)
+                }
             }
-            Fs::Btrfs(btrfs) => {
-                // Now uses the single-transaction Phase 2 implementation,
-                // which guarantees atomicity: we either create the file AND write its data,
-                // or fail cleanly with no orphan file left behind.
-                let ino = btrfs.create_file_with_data(parent_path, name, data)?;
-                Ok(ino)
-            }
-        }
+        })
     }
 
     /// Delete a file by path from the encrypted volume.
     pub fn delete_file(&self, path: &str) -> Result<()> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
-        match &mut *fs {
-            Fs::Ext4(ext4) => ext4.delete_file(path),
-            Fs::Btrfs(btrfs) => btrfs.delete_file(path),
-        }
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
+            match &mut *fs {
+                Fs::Ext4(ext4) => ext4.delete_file(path),
+                Fs::Btrfs(btrfs) => btrfs.delete_file(path),
+            }
+        })
     }
 
     /// Create a directory at `parent_path` with name `name`.
     pub fn create_directory(&self, parent_path: &str, name: &str) -> Result<u64> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
-        match &mut *fs {
-            Fs::Ext4(ext4) => {
-                let dir_ino = ext4.resolve(parent_path)?.number as u32;
-                let ino = ext4.create_directory(dir_ino, name)?;
-                ext4.flush()?;
-                Ok(ino as u64)
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
+            match &mut *fs {
+                Fs::Ext4(ext4) => {
+                    let dir_ino = ext4.resolve(parent_path)?.number as u32;
+                    let ino = ext4.create_directory(dir_ino, name)?;
+                    ext4.flush()?;
+                    Ok(ino as u64)
+                }
+                Fs::Btrfs(btrfs) => {
+                    let ino = btrfs.create_directory(parent_path, name)?;
+                    Ok(ino)
+                }
             }
-            Fs::Btrfs(btrfs) => {
-                let ino = btrfs.create_directory(parent_path, name)?;
-                Ok(ino)
-            }
-        }
+        })
     }
 
     /// Rename an item from `(old_parent, old_name)` to `(new_parent, new_name)`.
     pub fn rename(&self, old_parent: &str, old_name: &str, new_parent: &str, new_name: &str) -> Result<()> {
-        let mut fs = self.fs_for_writing()?;
-        self.claim_writer()?;
-        match &mut *fs {
-            Fs::Ext4(ext4) => {
-                ext4.rename(old_parent, old_name, new_parent, new_name)?;
-                ext4.flush()?;
-                Ok(())
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            self.claim_writer()?;
+            match &mut *fs {
+                Fs::Ext4(ext4) => {
+                    ext4.rename(old_parent, old_name, new_parent, new_name)?;
+                    ext4.flush()?;
+                    Ok(())
+                }
+                Fs::Btrfs(btrfs) => {
+                    btrfs.rename(old_parent, old_name, new_parent, new_name)?;
+                    Ok(())
+                }
             }
-            Fs::Btrfs(btrfs) => {
-                btrfs.rename(old_parent, old_name, new_parent, new_name)?;
-                Ok(())
-            }
-        }
+        })
     }
 
     fn claim_writer(&self) -> Result<()> {

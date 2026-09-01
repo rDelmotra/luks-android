@@ -432,13 +432,36 @@ impl VolumeHandle {
     /// A poisoned lock on a write operation fails immediately with `SessionPoisoned`
     /// (code 18 `MUTEX_POISONED`) to prevent mutating or flushing partially-broken state.
     ///
-    /// The fence is checked *before* the lock, so a fenced session refuses
-    /// without waiting on whatever else holds it.
+    /// # Two fence checks, not one
+    ///
+    /// The first check, before the lock, is purely an optimisation: refuse
+    /// without waiting on whatever else holds `fs` when the session is
+    /// already, obviously fenced. It is *not* what makes fencing safe on its
+    /// own — a caller that passes it can still be made stale by a
+    /// `fence_writes` that lands in the gap between this check and actually
+    /// acquiring the lock below.
+    ///
+    /// The second check, after the lock, is the one that matters. `fence_writes`
+    /// also takes the `fs` lock before it latches the fence and discards the
+    /// active batch (see there), so the two operations cannot interleave:
+    /// whichever of "acquire `fs` here" and "acquire `fs` in `fence_writes`"
+    /// happens first runs to completion — check-and-return-a-usable-guard, or
+    /// latch-and-discard — before the other proceeds. Without this re-check, a
+    /// write that passed the fast check above could still be parked here
+    /// behind an in-flight `fence_writes`, and would then resume *after* the
+    /// batch was discarded — recreating a batch on a session that was just
+    /// fenced specifically to stop that. Deleting this second check
+    /// reintroduces that race even though the first one still "works" in
+    /// isolation.
     pub fn fs_for_writing(&self) -> Result<std::sync::MutexGuard<'_, MountedFs>> {
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
-        self.fs.lock().map_err(|_| LuksError::SessionPoisoned)
+        let guard = self.fs.lock().map_err(|_| LuksError::SessionPoisoned)?;
+        if let Some(reason) = self.fence_reason() {
+            return Err(LuksError::WriteSessionFenced(reason));
+        }
+        Ok(guard)
     }
 
     /// Why writes are fenced, or `None` if they are allowed.
@@ -463,6 +486,21 @@ impl VolumeHandle {
     /// reset.
     #[cfg(feature = "dangerous-write-support")]
     pub fn fence_writes(&self, reason: impl std::fmt::Display) {
+        // The `fs` lock is acquired FIRST, before the fence latch — the same
+        // order `fs_for_writing`'s post-lock re-check reads in. That shared
+        // order is what makes "latch the fence" and "discard the batch" a
+        // single atomic step with respect to any write in flight: a write
+        // already running holds this same lock and blocks us here until it
+        // releases it (so we never discard out from under one), and a write
+        // that has not yet acquired the lock cannot get past its own
+        // re-check once we have set the latch under this lock. See
+        // `fs_for_writing` for the other half of this ordering.
+        //
+        // A poisoned lock is recovered here on purpose: discarding state is
+        // the one write-side action that is still safe after a panic, and
+        // leaving the batch live is precisely what this exists to prevent.
+        let mut fs = self.fs.lock().unwrap_or_else(|p| p.into_inner());
+
         let mut fence = self.write_fence.lock().unwrap_or_else(|p| p.into_inner());
         if fence.is_some() {
             return;
@@ -470,12 +508,6 @@ impl VolumeHandle {
         *fence = Some(reason.to_string());
         drop(fence);
 
-        // Drop the batch directly through the mutex rather than through
-        // `fs_for_writing`, which is now fenced and would refuse. A poisoned
-        // lock is recovered here on purpose: discarding state is the one
-        // write-side action that is still safe after a panic, and leaving the
-        // batch live is precisely what this exists to prevent.
-        let mut fs = self.fs.lock().unwrap_or_else(|p| p.into_inner());
         if let MountedFs::Btrfs(btrfs) = &mut *fs {
             btrfs.discard_active_batch();
         }
@@ -490,7 +522,20 @@ impl VolumeHandle {
     pub fn guarding_writes<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
         let out = op();
         if let Err(ref e) = out {
-            if e.fences_write_session() && !matches!(e, LuksError::WriteSessionFenced(_)) {
+            // `SessionPoisoned` also satisfies `fences_write_session()` — a
+            // panic under the lock leaves state exactly as unknown as a
+            // transport failure does — but it must not latch the fence here.
+            // `fs_for_writing` already refuses forever once the mutex is
+            // poisoned (poison never clears itself), so on top of that,
+            // latching the fence would only relabel every later refusal from
+            // MUTEX_POISONED to WRITE_SESSION_FENCED, once this closure's
+            // caller was not the last wrapped mutator invoked. That is the
+            // opposite of what `WriteSessionFenced`'s own doc comment
+            // promises: the two stay distinguishable so the diagnosis
+            // matches the incident — a panic here, a flaky cable there.
+            if e.fences_write_session()
+                && !matches!(e, LuksError::WriteSessionFenced(_) | LuksError::SessionPoisoned)
+            {
                 self.fence_writes(e);
             }
         }
