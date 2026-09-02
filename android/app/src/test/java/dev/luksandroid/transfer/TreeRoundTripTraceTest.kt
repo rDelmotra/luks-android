@@ -147,6 +147,7 @@ class TreeRoundTripTraceTest {
         private val filesByParent = mutableMapOf<String, MutableSet<String>>()
 
         override val info = VolumeInfo("fake", "uuid", 4096, 0L, "btrfs", emptyList())
+        override fun commitActiveBatch() = Unit
 
         private fun record(vararg fields: String) {
             lines += fields.joinToString("\t")

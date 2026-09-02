@@ -301,7 +301,7 @@ fn run_import(img: &Path, direction: Direction, from: usize, until: usize) -> Im
         }
 
         if torn {
-            btrfs.abandon_file(writer);
+            let _ = btrfs.abandon_file(writer);
             continue;
         }
 

@@ -220,7 +220,7 @@ fn test_abandon_file_rolls_back_uncommitted_stream_and_commits_preceding() {
         // 2. Start a streaming file, write some chunks, then abandon
         let mut abandoned_writer = fs.begin_file_streaming().expect("begin streaming");
         fs.write_chunk(&mut abandoned_writer, &[0xDE, 0xAD, 0xBE, 0xEF]).expect("write partial");
-        fs.abandon_file(abandoned_writer);
+        fs.abandon_file(abandoned_writer).expect("abandon");
     }
 
     // Remount read-only and verify surviving files

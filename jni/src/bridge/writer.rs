@@ -129,15 +129,20 @@ impl VolumeHandle {
     /// the reservation, which is fine: a fenced or poisoned session is never
     /// going to commit anything again on this handle, so that on-disk state
     /// was already unreachable.
-    pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) {
-        let Ok(mut fs) = self.fs_for_writing() else {
-            return;
-        };
-        match (&mut *fs, writer) {
-            (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => ext4.abandon_file(w),
-            (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => btrfs.abandon_file(w),
-            _ => (), // If there's a mismatch we just let the writer drop
-        }
+    pub fn abandon_file(&self, writer: crate::bridge::FileWriterEnum) -> Result<()> {
+        self.guarding_writes(|| {
+            let mut fs = self.fs_for_writing()?;
+            match (&mut *fs, writer) {
+                (Fs::Ext4(ext4), crate::bridge::FileWriterEnum::Ext4(w)) => {
+                    ext4.abandon_file(w);
+                    Ok(())
+                }
+                (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => {
+                    btrfs.abandon_file(w)
+                }
+                _ => Ok(()), // If there's a mismatch we just let the writer drop
+            }
+        })
     }
 
     /// Create `name` in `parent_path` holding `data`, returning the new inode number.

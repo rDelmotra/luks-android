@@ -509,7 +509,7 @@ fn a_streaming_writer_closed_before_finish_leaves_no_orphan_behind() {
         let vol = unlock(&path);
         let mut writer = vol.begin_file(1024).expect("begin");
         vol.write_file_chunk(&mut writer, b"halfway there").expect("chunk");
-        vol.abandon_file(writer); // explicitly abandon before finish
+        vol.abandon_file(writer).expect("abandon"); // explicitly abandon before finish
     }
 
     let out = Command::new("bash")
@@ -654,7 +654,7 @@ fn a_second_writer_is_refused_while_a_streaming_writer_is_live() {
     second.list_dir_json("/").expect("the second volume must still read");
 
     first.write_file_chunk(&mut writer, b"still holding the claim").expect("chunk");
-    first.abandon_file(writer);
+    first.abandon_file(writer).expect("abandon");
 }
 
 #[test]
@@ -669,7 +669,7 @@ fn an_abandoned_streaming_writer_leaves_no_orphan_behind() {
         let vol = unlock(&path);
         let mut writer = vol.begin_file_streaming().expect("begin_file_streaming");
         vol.write_file_chunk(&mut writer, b"never finished").expect("chunk");
-        vol.abandon_file(writer); // explicitly abandon before finish
+        vol.abandon_file(writer).expect("abandon"); // explicitly abandon before finish
     }
 
     let out = Command::new("bash")
@@ -1203,7 +1203,7 @@ fn cancellation_token_halts_streaming_sha256_and_chunk_writes() {
         .write_file_chunk_with_cancel(&mut writer, &[0x42u8; 128], token)
         .unwrap_err();
     assert_eq!(error_code(&err_write), code::CANCELLED);
-    vol.abandon_file(writer);
+    vol.abandon_file(writer).expect("abandon");
 
     // 3. Test read_file_stream cancellation
     let mut sink = Vec::new();

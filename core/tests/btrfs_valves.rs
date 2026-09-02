@@ -133,7 +133,7 @@ fn valve_a_streaming_write_exceeding_free_space_refuses_with_filesystem_full() {
     );
 
     // Clean up via abandon_file
-    fs.abandon_file(writer);
+    fs.abandon_file(writer).expect("abandon");
     drop(fs);
 
     assert!(run_verify_script(&img), "oracle check must pass clean");
@@ -180,12 +180,12 @@ fn valve_b_commit_active_batch_while_writer_open_returns_corrupt_fs() {
     }
 
     // After abandon_file, commit_active_batch succeeds
-    fs.abandon_file(writer);
+    fs.abandon_file(writer).expect("abandon");
     fs.commit_active_batch().expect("commit after abandon must succeed");
 
     // And opening a new writer succeeds
     let new_writer = fs.begin_file(512).expect("begin file after abandon");
-    fs.abandon_file(new_writer);
+    fs.abandon_file(new_writer).expect("abandon");
 
     drop(fs);
     assert!(run_verify_script(&img), "oracle check must pass clean");

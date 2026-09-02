@@ -287,7 +287,7 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
     );
 
     // Abandon file cleans up cleanly
-    fs.abandon_file(writer);
+    fs.abandon_file(writer).expect("abandon");
     drop(fs);
 
     // Ground-truth oracle: btrfs check + kernel mount + scrub.

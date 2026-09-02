@@ -121,6 +121,8 @@ class ThroughputStatsTest {
 
         private val names = mutableSetOf<String>()
 
+        override fun commitActiveBatch() = Unit
+
         override fun listDir(path: String): List<Entry> = emptyList()
 
         override fun beginFileStreaming(): FileWriter = SlowWriter()

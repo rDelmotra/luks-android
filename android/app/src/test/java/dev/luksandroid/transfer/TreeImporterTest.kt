@@ -58,7 +58,12 @@ class TreeImporterTest {
         val deletedPaths = mutableListOf<String>()
         /** Bumped only when a writer commits (never on abandon) -- "files actually landed", for cancellation timing. */
         var finishedFileCount = 0
+        var commitActiveBatchCalls = 0
         private var totalBytesWritten = 0L
+
+        override fun commitActiveBatch() {
+            commitActiveBatchCalls++
+        }
 
         override val info = VolumeInfo("fake", "uuid", 4096, 0L, "ext4", emptyList())
 
@@ -541,6 +546,44 @@ class TreeImporterTest {
 
         assertTrue(outcome.succeeded)
         assertEquals("last.txt", updates.last().currentPath)
+    }
+
+    @Test
+    fun `successful import commits active batch exactly once`() {
+        val p = plan(file("a.txt", 1), file("b.txt", 1))
+        val source = FakeSource(mapOf("id:a.txt" to byteArrayOf(1), "id:b.txt" to byteArrayOf(2)))
+
+        val outcome = TreeImporter.importTree(volume, p, "/dst", source, CollisionMode.SKIP)
+
+        assertTrue(outcome.succeeded)
+        assertEquals(1, volume.commitActiveBatchCalls)
+    }
+
+    @Test
+    fun `stop on error never commits active batch`() {
+        val p = plan(file("a.txt", 10), file("b.txt", 10))
+        val source = FakeSource(mapOf("id:a.txt" to ByteArray(10), "id:b.txt" to ByteArray(10)))
+        volume.failWriteAfterTotalBytes = 15 // fail in the middle of b.txt
+
+        val outcome = TreeImporter.importTree(volume, p, "/dst", source, CollisionMode.SKIP)
+
+        assertFalse(outcome.succeeded)
+        assertEquals(0, volume.commitActiveBatchCalls)
+    }
+
+    @Test
+    fun `stop on cancellation never commits active batch`() {
+        val p = plan(file("a.txt", 10), file("b.txt", 10))
+        val source = FakeSource(mapOf("id:a.txt" to ByteArray(10), "id:b.txt" to ByteArray(10)))
+
+        val outcome = TreeImporter.importTree(
+            volume, p, "/dst", source, CollisionMode.SKIP,
+            isCancelled = { true },
+        )
+
+        assertFalse(outcome.succeeded)
+        assertTrue(outcome.failure is TransferCancelledException)
+        assertEquals(0, volume.commitActiveBatchCalls)
     }
 
     private fun assertArrayEquals(expected: ByteArray, actual: ByteArray?) {

@@ -76,6 +76,7 @@ class TreeImportTraceTest {
         }
 
         override val info = VolumeInfo("fake", "uuid", 4096, 0L, "btrfs", emptyList())
+        override fun commitActiveBatch() = Unit
 
         /**
          * `REPLACE` builds its temp name from `System.nanoTime()`, so the raw

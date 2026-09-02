@@ -192,7 +192,7 @@ impl<D: WriteAt> Btrfs<D> {
         let mut writer = self.begin_file(data.len() as u64)?;
         if !data.is_empty() {
             if let Err(e) = self.write_chunk(&mut writer, data) {
-                self.abandon_file(writer);
+                let _ = self.abandon_file(writer);
                 return Err(e);
             }
         }

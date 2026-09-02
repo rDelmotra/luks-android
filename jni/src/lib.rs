@@ -856,10 +856,13 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
         if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
-        if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            vol.abandon_file(state);
-        }
+        let abandon_res = if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            vol.abandon_file(state)
+        } else {
+            Ok(())
+        };
         bridge::drop_writer(writer);
+        abandon_res?;
         Ok(())
     })
 }

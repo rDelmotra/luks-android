@@ -186,7 +186,7 @@ fn replay(fs: &mut Btrfs<FileDevice>, ops: &[Op]) {
             }
             Op::Abandon => {
                 if let Some(w) = writer.take() {
-                    fs.abandon_file(w);
+                    fs.abandon_file(w).expect("abandon");
                 }
             }
         }

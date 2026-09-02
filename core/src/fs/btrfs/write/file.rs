@@ -368,9 +368,8 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     batch.handed_out.remove(bytenr, run_len);
                 }
                 if batch.has_uncommitted_files() {
-                    if let Ok(txn) = batch.commit_and_rearm(self) {
-                        let _ = commit_transaction(self, txn);
-                    }
+                    let txn = batch.commit_and_rearm(self)?;
+                    commit_transaction(self, txn)?;
                 }
                 self.active_batch = Some(batch);
                 Err(e)
@@ -378,7 +377,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         }
     }
 
-    pub fn abandon_file(&mut self, writer: BtrfsFileWriter) {
+    pub fn abandon_file(&mut self, writer: BtrfsFileWriter) -> Result<()> {
         self.has_open_writer = false;
         if let Some(mut batch) = self.active_batch.take() {
             for &(bytenr, run_len) in &writer.data_runs {
@@ -386,12 +385,12 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 batch.handed_out.remove(bytenr, run_len);
             }
             if batch.has_uncommitted_files() {
-                if let Ok(txn) = batch.commit_and_rearm(self) {
-                    let _ = commit_transaction(self, txn);
-                }
+                let txn = batch.commit_and_rearm(self)?;
+                commit_transaction(self, txn)?;
             }
             self.active_batch = Some(batch);
         }
+        Ok(())
     }
 }
 
