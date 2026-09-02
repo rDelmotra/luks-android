@@ -87,5 +87,11 @@ pub fn commit_transaction<D: WriteAt>(
     // 5. Update in-memory mount state and clear node cache.
     fs.update_mount_state(new_sb, txn.new_fs_tree);
 
+    crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Commit {
+        generation: txn.new_generation,
+        transid: txn.new_generation,
+        nodes_written: txn.pending_blocks.len(),
+    });
+
     Ok(())
 }

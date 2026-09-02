@@ -75,6 +75,12 @@ impl Transaction {
             RenameResolution::Proceed(plan) => plan,
         };
 
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Rename {
+            from_parent: plan.old_parent_ino,
+            to_parent: plan.new_parent_ino,
+            ino: plan.child_ino,
+        });
+
         let sb = fs.superblock();
         let new_generation = sb.generation + 1;
 

@@ -32,6 +32,12 @@ internal object LuksNative {
     /** Version of the Rust core. The cheapest possible proof the .so loaded. */
     external fun nativeVersion(): String
 
+    /** Dumps the in-memory bounded forensic ring buffer as formatted text. */
+    external fun nativeDumpForensicLog(): String
+
+    /** Clears the in-memory bounded forensic ring buffer. */
+    external fun nativeClearForensicLog()
+
     /**
      * @param fd from `UsbDeviceConnection.getFileDescriptor()`. Stays owned by
      *   Java; Rust never closes it, and it must outlive the returned handle.

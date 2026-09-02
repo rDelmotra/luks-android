@@ -156,6 +156,10 @@ impl<D: ReadAt> Btrfs<D> {
         fs.chunks.check_single_device(fs.sb.dev_id)?;
         fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
         fs.csum_tree = csum::load(&fs);
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Mount {
+            generation: fs.sb.generation,
+            root_bytenr: fs.fs_tree.bytenr,
+        });
         Ok(fs)
     }
 

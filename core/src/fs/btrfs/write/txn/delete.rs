@@ -418,6 +418,11 @@ impl Transaction {
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
 
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::DeleteFile {
+            parent_ino,
+            ino: target_ino,
+        });
+
         converge_and_finalize(
             fs,
             new_generation,

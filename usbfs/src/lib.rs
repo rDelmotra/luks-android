@@ -579,6 +579,13 @@ impl UsbFsTransport {
                 submitted_count += 1;
             }
 
+            luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
+                ep,
+                count: submitted_count,
+                bytes: buf.len(),
+                gen: generation,
+            });
+
             let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
             let mut completion_err = None;
@@ -587,6 +594,12 @@ impl UsbFsTransport {
             if submit_err.is_none() {
                 while completed < submitted_count {
                     if let Err(e) = self.poll_for_urb(self.timeout_ms as i32) {
+                        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Timeout {
+                            ep,
+                            elapsed_ms: self.timeout_ms as u64,
+                            active_urbs: submitted_count.saturating_sub(completed),
+                            gen: generation,
+                        });
                         reap_err = Some(e);
                         break;
                     }
@@ -614,6 +627,12 @@ impl UsbFsTransport {
                             completed += 1;
 
                             let status = slot.urb.status;
+                            luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Reap {
+                                ep,
+                                status,
+                                bytes: slot.urb.actual_length as usize,
+                                gen: slot.generation,
+                            });
                             if status < 0 {
                                 let err = -status;
                                 let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
@@ -751,6 +770,13 @@ impl UsbFsTransport {
                 submitted_count += 1;
             }
 
+            luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
+                ep,
+                count: submitted_count,
+                bytes: buf.len(),
+                gen: generation,
+            });
+
             let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
             let mut completion_err = None;
@@ -760,6 +786,12 @@ impl UsbFsTransport {
             if submit_err.is_none() {
                 while completed < submitted_count {
                     if let Err(e) = self.poll_for_urb(self.timeout_ms as i32) {
+                        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Timeout {
+                            ep,
+                            elapsed_ms: self.timeout_ms as u64,
+                            active_urbs: submitted_count.saturating_sub(completed),
+                            gen: generation,
+                        });
                         reap_err = Some(e);
                         break;
                     }
@@ -787,6 +819,12 @@ impl UsbFsTransport {
                             completed += 1;
 
                             let status = slot.urb.status;
+                            luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Reap {
+                                ep,
+                                status,
+                                bytes: slot.urb.actual_length as usize,
+                                gen: slot.generation,
+                            });
                             if status < 0 {
                                 let err = -status;
                                 let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
@@ -898,6 +936,10 @@ fn drain_unreaped(
         return;
     }
 
+    luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::StateTransition {
+        from: "Healthy",
+        to: "Draining",
+    });
     state.store(TransportState::Draining as u8, Ordering::Release);
 
     // 1. Issue DISCARDURB for all submitted but un-reaped URBs
@@ -952,11 +994,24 @@ fn drain_unreaped(
     }
 
     // 3. State resolution:
+    luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Drain {
+        discarded_count: *completed,
+        remaining: submitted_count.saturating_sub(*completed),
+    });
+
     if *completed == submitted_count {
         // All submitted URBs for this transfer were successfully drained!
+        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::StateTransition {
+            from: "Draining",
+            to: "Healthy",
+        });
         state.store(TransportState::Healthy as u8, Ordering::Release);
     } else {
         // Some URBs un-drained! Permanently latch Dead.
+        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::StateTransition {
+            from: "Draining",
+            to: "Dead",
+        });
         state.store(TransportState::Dead as u8, Ordering::Release);
     }
 }
@@ -984,6 +1039,10 @@ impl BulkTransport for UsbFsTransport {
             clear_halt_code() as IoctlReq,
             &ep as *const c_uint as *mut c_void,
         );
+        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Reset {
+            kind: if endpoint_in { "clear_halt_in" } else { "clear_halt_out" },
+            status: rc,
+        });
         if rc < 0 {
             return Err(transfer_err("USBDEVFS_CLEAR_HALT", errno()));
         }
@@ -1018,6 +1077,10 @@ impl BulkTransport for UsbFsTransport {
             control_code() as IoctlReq,
             &mut req as *mut UsbFsCtrlTransfer as *mut c_void,
         );
+        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Reset {
+            kind: "bot_mass_storage_reset",
+            status: rc,
+        });
         if rc < 0 {
             return Err(transfer_err("Bulk-Only Mass Storage Reset", errno()));
         }

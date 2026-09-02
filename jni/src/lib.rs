@@ -114,6 +114,7 @@ fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>
             let msg = panic_message(&payload);
             let err_msg = format!("internal error (this is a bug): {msg}");
             log::e(&format!("guard panicked: {}", err_msg));
+            luks_core::forensic::record_panic(file!(), line!(), 0, &msg);
             throw(
                 env,
                 bridge::code::PANIC,
@@ -167,13 +168,15 @@ fn jstr(env: &mut JNIEnv, s: &JString) -> R<String> {
         .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("bad string argument: {e}")))
 }
 
-fn out_string(env: &mut JNIEnv, s: &str) -> R<jstring> {
-    env.new_string(s).map(|v| v.into_raw()).map_err(|e| {
-        Fail::Msg(
-            bridge::code::GENERIC,
-            format!("cannot allocate string: {e}"),
-        )
-    })
+fn out_string(env: &mut JNIEnv, s: impl AsRef<str>) -> R<jstring> {
+    env.new_string(s.as_ref())
+        .map(|v| v.into_raw())
+        .map_err(|e| {
+            Fail::Msg(
+                bridge::code::GENERIC,
+                format!("cannot allocate string: {e}"),
+            )
+        })
 }
 
 fn out_bytes(env: &mut JNIEnv, b: &[u8]) -> R<jbyteArray> {
@@ -192,6 +195,28 @@ fn bad_handle(msg: &'static str) -> Fail {
 }
 
 // ------------------------------------------------------------------ lifecycle
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDumpForensicLog<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let dump = luks_core::forensic::dump_text();
+        out_string(env, dump)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeClearForensicLog<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) {
+    guard(&mut env, (), |_env| {
+        luks_core::forensic::clear();
+        Ok(())
+    })
+}
 
 #[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeVersion<'l>(

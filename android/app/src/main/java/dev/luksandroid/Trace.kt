@@ -82,5 +82,19 @@ object Trace {
         val code = (t as? LuksException)?.code
         return if (code != null) "${t.javaClass.simpleName}[code=$code]" else t.javaClass.simpleName
     }
+
+    /**
+     * Retrieve the in-memory bounded forensic log from the native layer.
+     */
+    fun dumpForensicLog(): String {
+        return runCatching { LuksNative.nativeDumpForensicLog() }.getOrDefault("")
+    }
+
+    /**
+     * Clear the in-memory bounded forensic log.
+     */
+    fun clearForensicLog() {
+        runCatching { LuksNative.nativeClearForensicLog() }
+    }
 }
 

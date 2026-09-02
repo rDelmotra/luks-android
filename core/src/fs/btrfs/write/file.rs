@@ -156,6 +156,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         }
 
         self.has_open_writer = true;
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BeginFile { file_len: size });
 
         Ok(BtrfsFileWriter {
             size,
@@ -197,6 +198,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         allocator.exclude_ranges(&handed_out_excl);
 
         self.has_open_writer = true;
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BeginFile { file_len: 0 });
 
         Ok(BtrfsFileWriter {
             size: 0,
@@ -380,6 +382,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         if writer.is_streaming {
             writer.size = writer.written_bytes;
         }
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::WriteChunk {
+            len: data.len(),
+            bytenr: writer.data_runs.first().map(|(b, _)| *b).unwrap_or(0),
+        });
         Ok(())
     }
 
@@ -401,6 +407,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
 
         match ino_res {
             Ok(ino) => {
+                crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::FinishFile {
+                    ino,
+                    total_bytes: writer.written_bytes,
+                });
                 if batch.should_commit() {
                     let txn = batch.commit_and_rearm(self)?;
                     commit_transaction(self, txn)?;
@@ -425,6 +435,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
 
     pub fn abandon_file(&mut self, writer: BtrfsFileWriter) -> Result<()> {
         self.has_open_writer = false;
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::AbandonFile {
+            runs_count: writer.data_runs.len(),
+            total_bytes: writer.written_bytes,
+        });
         if let Some(mut batch) = self.active_batch.take() {
             for &(bytenr, run_len) in &writer.data_runs {
                 batch.release_allocation(bytenr, run_len)?;

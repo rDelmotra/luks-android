@@ -246,6 +246,11 @@ impl Transaction {
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
 
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::CreateFile {
+            parent_ino,
+            new_ino,
+        });
+
         converge_and_finalize(
             fs,
             new_generation,
@@ -567,6 +572,11 @@ impl Transaction {
             Vec::new(),
             Vec::new(),
         )?;
+
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Mkdir {
+            parent_ino,
+            new_ino,
+        });
 
         Ok((txn, new_ino))
     }

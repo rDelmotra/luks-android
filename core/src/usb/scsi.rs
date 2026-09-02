@@ -325,6 +325,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// error that does not name what actually went wrong.
     fn recover<R>(&self, result: Result<R>) -> Result<R> {
         if result.is_err() {
+            crate::forensic::record_scsi(crate::forensic::ScsiEvent::Reset);
             let _ = self.transport.reset();
         }
         result
@@ -344,6 +345,12 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     fn command_out_inner(&self, cdb: Vec<u8>, data: &[u8], ask_why: bool) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
+        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
+            opcode,
+            tag,
+            data_len: data.len() as u32,
+            dir: "OUT",
+        });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, Direction::Out, cdb);
         let encoded = cbw.encode()?;
 
@@ -399,10 +406,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         match csw.status {
             CswStatus::Passed => {
                 if csw.data_residue != 0 {
+                    crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                        opcode,
+                        status: "RESIDUE_ERROR",
+                        transferred,
+                        sense_key: None,
+                    });
                     return Err(LuksError::ScsiProtocol(
                         "drive committed less than the full data phase",
                     ));
                 }
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PASSED",
+                    transferred,
+                    sense_key: None,
+                });
                 Ok(transferred)
             }
             CswStatus::Failed => {
@@ -411,9 +430,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 } else {
                     None
                 };
+                let sense_key = sense.as_ref().map(|s| s.key);
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "FAILED",
+                    transferred,
+                    sense_key,
+                });
                 Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PHASE_ERROR",
+                    transferred,
+                    sense_key: None,
+                });
                 let _ = self.transport.reset();
                 Err(LuksError::ScsiProtocol("CSW phase error"))
             }
@@ -432,6 +464,17 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     ) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
+        let dir_str = match direction {
+            Direction::In => "IN",
+            Direction::Out => "OUT",
+            Direction::None => "NONE",
+        };
+        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
+            opcode,
+            tag,
+            data_len: data.len() as u32,
+            dir: dir_str,
+        });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
 
@@ -511,10 +554,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 // with no log line pointing anywhere. BOT requires the host
                 // to honour this field; here that means failing loudly.
                 if matches!(direction, Direction::Out) && csw.data_residue != 0 {
+                    crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                        opcode,
+                        status: "RESIDUE_ERROR",
+                        transferred,
+                        sense_key: None,
+                    });
                     return Err(LuksError::ScsiProtocol(
                         "drive committed less than the full data phase",
                     ));
                 }
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PASSED",
+                    transferred,
+                    sense_key: None,
+                });
                 Ok(transferred)
             }
             CswStatus::Failed => {
@@ -529,11 +584,24 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 } else {
                     None
                 };
+                let sense_key = sense.as_ref().map(|s| s.key);
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "FAILED",
+                    transferred,
+                    sense_key,
+                });
                 Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
                 // Best-effort, like `recover`: a reset failure must not mask
                 // the phase error that caused it.
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PHASE_ERROR",
+                    transferred,
+                    sense_key: None,
+                });
                 let _ = self.transport.reset();
                 Err(LuksError::ScsiProtocol("phase error"))
             }

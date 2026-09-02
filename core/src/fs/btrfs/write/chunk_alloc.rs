@@ -248,6 +248,12 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
         dev_uuid,
     );
 
+    crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::ChunkAlloc {
+        logical,
+        length: alloc_len,
+        dev_offset: physical,
+    });
+
     let new_generation = sb.generation + 1;
     let extent_tree = ExtentTree::read(fs)?;
     let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
