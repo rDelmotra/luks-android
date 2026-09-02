@@ -109,6 +109,8 @@ pub struct Btrfs<D: ReadAt> {
     nodes: cache::NodeCache,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) active_batch: Option<write::Batch>,
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) has_open_writer: bool,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -147,6 +149,8 @@ impl<D: ReadAt> Btrfs<D> {
             csum_tree: None,
             #[cfg(feature = "dangerous-write-support")]
             active_batch: None,
+            #[cfg(feature = "dangerous-write-support")]
+            has_open_writer: false,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;

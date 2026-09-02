@@ -32,7 +32,6 @@ use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::chunk::BLOCK_GROUP_DATA;
 use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
-use luks_core::fs::btrfs::write::chunk_alloc::next_logical;
 use luks_core::fs::btrfs::write::extent_tree::ExtentTree;
 use luks_core::fs::btrfs::Btrfs;
 use sha2::{Digest, Sha256};
@@ -221,12 +220,10 @@ fn verify_kernel_readback_sha256(image_path: &PathBuf, files: &[(&str, &str)]) -
     }
 }
 
-/// The exit bar test: an unknown-size streaming write that is deliberately
-/// sized to exceed all pre-existing free DATA space on `plain.img`, forcing
-/// `write_chunk`'s mid-stream `allocate_data_chunk()` branch to fire — proven
-/// positively via chunk-map count and by asserting the write's data runs
-/// span a chunk that did not exist before the write started — followed by a
-/// byte-exact SHA256 readback through a real Linux kernel mount.
+/// Under Valve A (Stage V), an unknown-size streaming write that exceeds
+/// pre-existing free DATA space on `plain.img` is refused with `FilesystemFull`
+/// during `write_chunk` rather than triggering a mid-stream chunk allocation transaction.
+/// (Full safe dynamic chunk growth will be re-enabled in Stage C via the Reservation Ledger).
 #[test]
 fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
     let img = copy_to_temp("plain.img");
@@ -237,7 +234,6 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
 
     let initial_chunk_count = fs.chunk_map().len();
     let initial_data_free = free_data_bytes(&fs);
-    let prev_next_logical = next_logical(fs.chunk_map());
 
     // plain.img measured (via `cargo run --example space_probe -- plain.img`)
     // at ~6 MiB (6,291,456 bytes) free DATA space. Sanity-check that measurement
@@ -248,13 +244,11 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
     );
 
     // Deliberately larger than ALL pre-existing free DATA space, streamed in
-    // uneven chunks so no single write_chunk call reveals the total up front
-    // (that's the whole point of "unknown size").
+    // uneven chunks so no single write_chunk call reveals the total up front.
     let total_size = (initial_data_free + 2 * 1024 * 1024) as usize;
     assert!(total_size as u64 > initial_data_free);
 
     let payload = generate_payload(total_size, 0xABCD_1234);
-    let expected_sha256 = sha256_hex(&payload);
 
     let mut writer = fs.begin_file_streaming().expect("begin streaming writer");
     assert!(writer.is_streaming(), "writer should be in streaming mode");
@@ -262,66 +256,42 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
     let chunk_sizes = [65536, 131072, 32768, 98304, 16384, 262144, 512 * 1024];
     let mut offset = 0;
     let mut i = 0;
+    let mut hit_filesystem_full = false;
     while offset < payload.len() {
         let chunk_size = chunk_sizes[i % chunk_sizes.len()];
         let end = (offset + chunk_size).min(payload.len());
-        fs.write_chunk(&mut writer, &payload[offset..end])
-            .expect("write chunk");
-        offset = end;
-        i += 1;
+        match fs.write_chunk(&mut writer, &payload[offset..end]) {
+            Ok(()) => {
+                offset = end;
+                i += 1;
+            }
+            Err(LuksError::FilesystemFull) => {
+                hit_filesystem_full = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error from write_chunk: {e:?}"),
+        }
     }
 
-    // --- Positive proof that mid-stream chunk allocation actually fired ---
+    // Under Valve A:
+    // 1. FilesystemFull was returned
     assert!(
-        fs.chunk_map().len() > initial_chunk_count,
-        "chunk map must have grown: before={initial_chunk_count}, after={}",
-        fs.chunk_map().len()
+        hit_filesystem_full,
+        "write_chunk must refuse with FilesystemFull under Valve A"
     );
-    let new_chunk = fs
-        .chunk_map()
-        .chunks()
-        .iter()
-        .find(|c| c.logical == prev_next_logical)
-        .expect("a new chunk allocated at the pre-write next_logical must be present");
-    assert_eq!(new_chunk.chunk_type, BLOCK_GROUP_DATA);
-    assert!(
-        writer
-            .data_runs()
-            .iter()
-            .any(|&(bytenr, _)| bytenr >= prev_next_logical),
-        "streamed file's data runs must include an extent inside the chunk \
-         allocated mid-stream (logical >= {prev_next_logical}), runs: {:?}",
-        writer.data_runs()
+    // 2. Chunk count did NOT increase mid-stream
+    assert_eq!(
+        fs.chunk_map().len(),
+        initial_chunk_count,
+        "chunk map must not have grown mid-stream"
     );
 
-    let ino = fs
-        .finish_file(writer, "/", "streamed_forced_alloc.bin")
-        .expect("finish streamed file");
-    assert!(ino >= 256);
-
-    fs.commit_active_batch().expect("commit");
+    // Abandon file cleans up cleanly
+    fs.abandon_file(writer);
     drop(fs);
-
-    // Remount read-only: chunk allocation must have persisted.
-    let dev_ro = FileDevice::open(&img).expect("open ro");
-    let fs_ro = Btrfs::mount(dev_ro).expect("mount ro");
-    assert!(fs_ro.chunk_map().len() > initial_chunk_count);
-    let readback = fs_ro
-        .read_file("/streamed_forced_alloc.bin")
-        .expect("read streamed file ro");
-    assert_eq!(readback.len(), total_size);
-    assert_eq!(sha256_hex(&readback), expected_sha256);
-    drop(fs_ro);
 
     // Ground-truth oracle: btrfs check + kernel mount + scrub.
     assert!(run_verify_script(&img), "oracle check must pass clean");
-
-    // Byte-exact SHA256 readback through a REAL kernel mount — not our own
-    // reader. This is the exit bar's non-negotiable half.
-    assert!(
-        verify_kernel_readback_sha256(&img, &[("streamed_forced_alloc.bin", &expected_sha256)]),
-        "Linux kernel mount must read back an identical SHA256 checksum"
-    );
 
     let _ = fs::remove_file(&img);
 }

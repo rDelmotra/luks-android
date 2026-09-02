@@ -44,6 +44,11 @@ const MAX_DELETE_DEPTH: usize = 1024;
 impl<D: WriteAt> Btrfs<D> {
     /// Commit any active batch session before performing non-batch operations.
     pub fn commit_active_batch(&mut self) -> Result<()> {
+        if self.has_open_writer {
+            return Err(LuksError::CorruptFs(
+                "attempted to commit active batch while a file writer is open",
+            ));
+        }
         if let Some(batch) = self.active_batch.take() {
             if batch.has_uncommitted_files() {
                 let txn = batch.commit(self)?;
@@ -69,6 +74,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// treats as free space, whereas a mismatched `used` counter is a
     /// filesystem `btrfs check` rejects.
     pub fn discard_active_batch(&mut self) -> bool {
+        self.has_open_writer = false;
         self.active_batch.take().is_some()
     }
 
@@ -185,7 +191,10 @@ impl<D: WriteAt> Btrfs<D> {
     ) -> Result<u64> {
         let mut writer = self.begin_file(data.len() as u64)?;
         if !data.is_empty() {
-            self.write_chunk(&mut writer, data)?;
+            if let Err(e) = self.write_chunk(&mut writer, data) {
+                self.abandon_file(writer);
+                return Err(e);
+            }
         }
         let ino = self.finish_file(writer, parent_dir_path, filename)?;
         self.commit_active_batch()?;

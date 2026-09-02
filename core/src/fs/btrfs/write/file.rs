@@ -8,6 +8,7 @@ use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::Btrfs;
 
 /// State for one btrfs file whose contents arrive incrementally.
+#[derive(Debug)]
 pub struct BtrfsFileWriter {
     pub(crate) size: u64,
     pub(crate) written_bytes: u64,
@@ -44,6 +45,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     pub fn begin_file(&mut self, size: u64) -> Result<BtrfsFileWriter> {
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
+
+        if self.has_open_writer {
+            return Err(LuksError::WriterBusy);
+        }
 
         let sector_size = self.superblock().sector_size as u64;
         let disk_num_bytes = if size == 0 {
@@ -113,6 +118,8 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             batch.allocator = allocator.clone();
         }
 
+        self.has_open_writer = true;
+
         Ok(BtrfsFileWriter {
             size,
             written_bytes: 0,
@@ -127,15 +134,22 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     /// Begin an unknown-size streaming file write.
     ///
     /// Extents are allocated dynamically in `write_chunk` as data arrives,
-    /// triggering chunk allocation if existing block groups fill up.
+    /// from existing free space. If free space is exhausted, `write_chunk`
+    /// returns `FilesystemFull` (Valve A).
     pub fn begin_file_streaming(&mut self) -> Result<BtrfsFileWriter> {
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
+
+        if self.has_open_writer {
+            return Err(LuksError::WriterBusy);
+        }
 
         if self.active_batch.is_none() {
             self.active_batch = Some(Batch::open(self)?);
         }
         let allocator = self.active_batch.as_ref().unwrap().allocator.clone();
+
+        self.has_open_writer = true;
 
         Ok(BtrfsFileWriter {
             size: 0,
@@ -170,19 +184,9 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                             allocated_new += chunk_len;
                         }
                         Err(LuksError::FilesystemFull) => {
-                            self.allocate_data_chunk_excluding(&writer.data_runs)?;
-                            let extent_tree = ExtentTree::read(self)?;
-                            let mut new_alloc = FreeSpaceMap::from_extent_tree_and_chunk_map(
-                                &extent_tree,
-                                self.chunk_map(),
-                            )?;
-                            for &(run_bytenr, run_len) in &writer.data_runs {
-                                new_alloc.mark_allocated(run_bytenr, run_len)?;
-                            }
-                            writer.allocator = new_alloc;
-                            if let Some(ref mut batch) = self.active_batch {
-                                batch.allocator = writer.allocator.clone();
-                            }
+                            // Valve A: Refuse mid-stream chunk allocation.
+                            // Return FilesystemFull instead of triggering allocate_data_chunk_excluding.
+                            return Err(LuksError::FilesystemFull);
                         }
                         Err(e) => return Err(e),
                     }
@@ -338,6 +342,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         parent_path: &str,
         name: &str,
     ) -> Result<u64> {
+        self.has_open_writer = false;
         let mut batch = if let Some(b) = self.active_batch.take() {
             b
         } else {
@@ -374,6 +379,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     }
 
     pub fn abandon_file(&mut self, writer: BtrfsFileWriter) {
+        self.has_open_writer = false;
         if let Some(mut batch) = self.active_batch.take() {
             for &(bytenr, run_len) in &writer.data_runs {
                 let _ = batch.allocator.free_data(bytenr, run_len);

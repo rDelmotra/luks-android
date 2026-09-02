@@ -201,11 +201,9 @@ fn test_cross_file_batch_allocator_stays_in_sync_with_disk() {
         }
 
         // Compare in-memory cached allocator from active_batch with fresh on-disk ExtentTree
-        let in_memory_allocator = fs
-            .begin_file(0)
-            .expect("begin zero")
-            .allocator()
-            .clone();
+        let temp_writer = fs.begin_file(0).expect("begin zero");
+        let in_memory_allocator = temp_writer.allocator().clone();
+        fs.abandon_file(temp_writer);
 
         fs.commit_active_batch().expect("commit");
         let disk_extent_tree = ExtentTree::read(&mut fs).expect("read extent tree from disk");
