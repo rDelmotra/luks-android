@@ -24,8 +24,9 @@ use luks_core::error::{LuksError, Result};
 use luks_core::usb::BulkTransport;
 use std::os::raw::{c_int, c_uint, c_void};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- ioctl codes
 
@@ -62,35 +63,35 @@ type IoctlReq = libc::c_ulong;
 const USB_IOC: u8 = b'U';
 
 #[repr(C)]
-struct UsbdevfsUrb {
-    urb_type: u8,
-    endpoint: u8,
-    status: c_int,
-    flags: c_uint,
-    buffer: *mut c_void,
-    buffer_length: c_int,
-    actual_length: c_int,
-    start_frame: c_int,
-    number_of_packets_or_stream_id: c_int,
-    error_count: c_int,
-    signr: c_uint,
-    usercontext: *mut c_void,
+pub struct UsbdevfsUrb {
+    pub urb_type: u8,
+    pub endpoint: u8,
+    pub status: c_int,
+    pub flags: c_uint,
+    pub buffer: *mut c_void,
+    pub buffer_length: c_int,
+    pub actual_length: c_int,
+    pub start_frame: c_int,
+    pub number_of_packets_or_stream_id: c_int,
+    pub error_count: c_int,
+    pub signr: c_uint,
+    pub usercontext: *mut c_void,
 }
 
 const USBDEVFS_URB_TYPE_BULK: u8 = 3;
 
 #[repr(C)]
-struct UsbFsCtrlTransfer {
-    request_type: u8,
-    request: u8,
-    value: u16,
-    index: u16,
-    length: u16,
-    timeout: c_uint,
-    data: *mut c_void,
+pub struct UsbFsCtrlTransfer {
+    pub request_type: u8,
+    pub request: u8,
+    pub value: u16,
+    pub index: u16,
+    pub length: u16,
+    pub timeout: c_uint,
+    pub data: *mut c_void,
 }
 
-fn submit_urb_code() -> u32 {
+pub fn submit_urb_code() -> u32 {
     ioc(
         DIR_READ,
         USB_IOC,
@@ -99,11 +100,11 @@ fn submit_urb_code() -> u32 {
     )
 }
 
-fn discard_urb_code() -> u32 {
+pub fn discard_urb_code() -> u32 {
     ioc(DIR_NONE, USB_IOC, 11, 0)
 }
 
-fn reap_urb_code() -> u32 {
+pub fn reap_urb_code() -> u32 {
     ioc(
         DIR_WRITE,
         USB_IOC,
@@ -112,7 +113,7 @@ fn reap_urb_code() -> u32 {
     )
 }
 
-fn control_code() -> u32 {
+pub fn control_code() -> u32 {
     ioc(
         DIR_WRITE | DIR_READ,
         USB_IOC,
@@ -121,27 +122,156 @@ fn control_code() -> u32 {
     )
 }
 
-fn claim_code() -> u32 {
+pub fn claim_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 15, std::mem::size_of::<c_uint>())
 }
 
-fn release_code() -> u32 {
+pub fn release_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 16, std::mem::size_of::<c_uint>())
 }
 
-fn clear_halt_code() -> u32 {
+pub fn clear_halt_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 21, std::mem::size_of::<c_uint>())
 }
 
-struct InFlightUrb {
-    urb: UsbdevfsUrb,
-    submitted: bool,
-    reaped: bool,
+// ----------------------------------------------------------- RawUsbFs trait seam
+
+/// Abstraction over raw usbfs kernel ioctl and poll operations for deterministic testing.
+pub trait RawUsbFs: Send + Sync {
+    fn ioctl(&self, fd: RawFd, req: IoctlReq, arg: *mut c_void) -> c_int;
+    fn poll(&self, fd: RawFd, events: libc::c_short, timeout_ms: i32) -> std::result::Result<libc::c_short, i32>;
+}
+
+/// Production implementation issuing real libc syscalls.
+pub struct RealUsbFs;
+
+impl RawUsbFs for RealUsbFs {
+    fn ioctl(&self, fd: RawFd, req: IoctlReq, arg: *mut c_void) -> c_int {
+        unsafe { libc::ioctl(fd, req, arg) }
+    }
+
+    fn poll(&self, fd: RawFd, events: libc::c_short, timeout_ms: i32) -> std::result::Result<libc::c_short, i32> {
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if rc < 0 {
+                let e = errno();
+                if e == libc::EINTR {
+                    continue;
+                }
+                return Err(e);
+            }
+            if rc == 0 {
+                return Err(libc::ETIMEDOUT);
+            }
+            return Ok(pfd.revents);
+        }
+    }
+}
+
+// ------------------------------------------------------------- Transport State
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TransportState {
+    Healthy = 0,
+    Draining = 1,
+    Dead = 2,
+}
+
+// ------------------------------------------------------------ Persistent Arena
+
+pub const MAX_URB_SLOTS: usize = 32;
+
+#[repr(C)]
+pub struct UrbSlot {
+    pub urb: UsbdevfsUrb,
+    pub generation: u64,
     /// Position in the chunk sequence. Completions are scored by this, not
     /// by the order they are reaped in — REAPURB does not promise to return
     /// them in submission order, and a gap earlier in the sequence must stop
     /// the count even if a later chunk happened to complete first.
-    index: usize,
+    pub index: usize,
+    pub in_use: bool,
+    pub submitted: bool,
+    pub reaped: bool,
+}
+
+// SAFETY: UrbSlot's raw pointers are internally managed and only accessed with Arena lock.
+unsafe impl Send for UrbSlot {}
+
+pub struct UrbArena {
+    pub slots: Box<[UrbSlot]>,
+    pub next_generation: u64,
+}
+
+// SAFETY: UrbArena is protected inside Mutex.
+unsafe impl Send for UrbArena {}
+
+impl UrbArena {
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(MAX_URB_SLOTS);
+        for _ in 0..MAX_URB_SLOTS {
+            slots.push(UrbSlot {
+                urb: UsbdevfsUrb {
+                    urb_type: USBDEVFS_URB_TYPE_BULK,
+                    endpoint: 0,
+                    status: 0,
+                    flags: 0,
+                    buffer: std::ptr::null_mut(),
+                    buffer_length: 0,
+                    actual_length: 0,
+                    start_frame: 0,
+                    number_of_packets_or_stream_id: 0,
+                    error_count: 0,
+                    signr: 0,
+                    usercontext: std::ptr::null_mut(),
+                },
+                generation: 0,
+                index: 0,
+                in_use: false,
+                submitted: false,
+                reaped: false,
+            });
+        }
+        Self {
+            slots: slots.into_boxed_slice(),
+            next_generation: 1,
+        }
+    }
+
+    /// Allocate `count` slots for a transfer, tagging each with a new generation ID.
+    pub fn allocate(&mut self, count: usize) -> std::result::Result<(u64, Vec<usize>), LuksError> {
+        let gen = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+
+        let mut indices = Vec::with_capacity(count);
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.in_use {
+                slot.in_use = true;
+                slot.generation = gen;
+                slot.index = indices.len();
+                slot.submitted = false;
+                slot.reaped = false;
+                slot.urb.status = 0;
+                slot.urb.actual_length = 0;
+                // Encode slot index + 1 as usercontext token (non-null, bounded)
+                slot.urb.usercontext = (i + 1) as *mut c_void;
+                indices.push(i);
+                if indices.len() == count {
+                    return Ok((gen, indices));
+                }
+            }
+        }
+        for &idx in &indices {
+            self.slots[idx].in_use = false;
+        }
+        Err(LuksError::UsbTransfer("all URB slots in use".into()))
+    }
 }
 
 /// Bytes actually usable from this round: the sum of `actual_length` over
@@ -227,7 +357,13 @@ pub struct UsbFsTransport {
     max_transfer: Arc<AtomicUsize>,
     timeout_ms: u32,
     claimed: bool,
+    state: Arc<AtomicU8>,
+    raw: Arc<dyn RawUsbFs>,
+    arena: Arc<Mutex<UrbArena>>,
 }
+
+unsafe impl Send for UsbFsTransport {}
+unsafe impl Sync for UsbFsTransport {}
 
 impl UsbFsTransport {
     /// Start optimistic and let the kernel say no.
@@ -279,6 +415,24 @@ impl UsbFsTransport {
             max_transfer: Arc::new(AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER)),
             timeout_ms: 5_000,
             claimed: false,
+            state: Arc::new(AtomicU8::new(TransportState::Healthy as u8)),
+            raw: Arc::new(RealUsbFs),
+            arena: Arc::new(Mutex::new(UrbArena::new())),
+        }
+    }
+
+    /// Inject a custom `RawUsbFs` implementation for testing.
+    pub fn with_raw_usbfs(mut self, raw: Arc<dyn RawUsbFs>) -> Self {
+        self.raw = raw;
+        self
+    }
+
+    /// Current transport state (`Healthy`, `Draining`, or `Dead`).
+    pub fn state(&self) -> TransportState {
+        match self.state.load(Ordering::Acquire) {
+            0 => TransportState::Healthy,
+            1 => TransportState::Draining,
+            _ => TransportState::Dead,
         }
     }
 
@@ -304,16 +458,15 @@ impl UsbFsTransport {
     /// device, so this usually succeeds immediately. On a desktop Linux host it
     /// will fail with `EBUSY` unless the kernel driver is detached first.
     pub fn claim_interface(&mut self) -> Result<()> {
+        if self.state() == TransportState::Dead {
+            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+        }
         let n = self.interface as c_uint;
-        // SAFETY: `claim_code()` expects a pointer to a single c_uint, which is
-        // what is passed. `self.fd` is valid per the `from_raw_fd` contract.
-        let rc = unsafe {
-            libc::ioctl(
-                self.fd,
-                claim_code() as IoctlReq,
-                &n as *const c_uint as *mut c_void,
-            )
-        };
+        let rc = self.raw.ioctl(
+            self.fd,
+            claim_code() as IoctlReq,
+            &n as *const c_uint as *mut c_void,
+        );
         if rc < 0 {
             return Err(transfer_err("USBDEVFS_CLAIMINTERFACE", errno()));
         }
@@ -326,14 +479,11 @@ impl UsbFsTransport {
             return Ok(());
         }
         let n = self.interface as c_uint;
-        // SAFETY: as in claim_interface.
-        let rc = unsafe {
-            libc::ioctl(
-                self.fd,
-                release_code() as IoctlReq,
-                &n as *const c_uint as *mut c_void,
-            )
-        };
+        let rc = self.raw.ioctl(
+            self.fd,
+            release_code() as IoctlReq,
+            &n as *const c_uint as *mut c_void,
+        );
         self.claimed = false;
         if rc < 0 {
             return Err(transfer_err("USBDEVFS_RELEASEINTERFACE", errno()));
@@ -360,27 +510,10 @@ impl UsbFsTransport {
     /// already knows how to score a partial transfer and — one layer up, via
     /// `ScsiBlockDevice::recover` — trigger a Bulk-Only reset on any
     /// transport failure rather than leaving the bus wedged.
-    fn poll_for_urb(&self) -> std::result::Result<(), i32> {
-        loop {
-            let mut pfd = libc::pollfd {
-                fd: self.fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            };
-            // SAFETY: `pfd` is a single, stack-local, correctly-sized
-            // `pollfd` and `poll` writes only `revents` back into it.
-            let rc = unsafe { libc::poll(&mut pfd, 1, self.timeout_ms as libc::c_int) };
-            if rc < 0 {
-                let e = errno();
-                if e == libc::EINTR {
-                    continue;
-                }
-                return Err(e);
-            }
-            if rc == 0 {
-                return Err(libc::ETIMEDOUT);
-            }
-            return Ok(());
+    fn poll_for_urb(&self, timeout_ms: i32) -> std::result::Result<(), i32> {
+        match self.raw.poll(self.fd, libc::POLLOUT, timeout_ms) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -390,6 +523,12 @@ impl UsbFsTransport {
     fn bulk_out(&self, ep: u8, buf: &[u8]) -> Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+
+        if self.state() == TransportState::Dead {
+            return Err(LuksError::UsbTransfer(
+                "USB transport dead: un-drained URBs pending from earlier failure".into(),
+            ));
         }
 
         const CHUNK_SIZE: usize = 128 * 1024;
@@ -408,146 +547,121 @@ impl UsbFsTransport {
             }
 
             let num_urbs = chunks.len();
-            let mut urbs = Vec::with_capacity(num_urbs);
-            for i in 0..num_urbs {
-                urbs.push(InFlightUrb {
-                    urb: UsbdevfsUrb {
-                        urb_type: USBDEVFS_URB_TYPE_BULK,
-                        endpoint: ep,
-                        status: 0,
-                        flags: 0,
-                        buffer: chunks[i].as_ptr() as *mut c_void,
-                        buffer_length: chunks[i].len() as i32,
-                        actual_length: 0,
-                        start_frame: 0,
-                        number_of_packets_or_stream_id: 0,
-                        error_count: 0,
-                        signr: 0,
-                        usercontext: std::ptr::null_mut(),
-                    },
-                    submitted: false,
-                    reaped: false,
-                    index: i,
-                });
-            }
+            let mut arena = self.arena.lock().unwrap();
+            let (generation, slot_indices) = arena.allocate(num_urbs)?;
 
-            for i in 0..num_urbs {
-                let inflight_ptr = &mut urbs[i] as *mut InFlightUrb as *mut c_void;
-                urbs[i].urb.usercontext = inflight_ptr;
+            for (i, &slot_idx) in slot_indices.iter().enumerate() {
+                let slot = &mut arena.slots[slot_idx];
+                slot.urb.urb_type = USBDEVFS_URB_TYPE_BULK;
+                slot.urb.endpoint = ep;
+                slot.urb.flags = 0;
+                slot.urb.buffer = chunks[i].as_ptr() as *mut c_void;
+                slot.urb.buffer_length = chunks[i].len() as i32;
+                slot.urb.actual_length = 0;
+                slot.urb.status = 0;
             }
 
             let mut submit_err = None;
             let mut submitted_count = 0;
 
-            for i in 0..num_urbs {
-                let rc = unsafe {
-                    libc::ioctl(
-                        self.fd,
-                        submit_urb_code() as IoctlReq,
-                        &mut urbs[i].urb as *mut UsbdevfsUrb as *mut c_void,
-                    )
-                };
+            for &slot_idx in &slot_indices {
+                let slot = &mut arena.slots[slot_idx];
+                let rc = self.raw.ioctl(
+                    self.fd,
+                    submit_urb_code() as IoctlReq,
+                    &mut slot.urb as *mut UsbdevfsUrb as *mut c_void,
+                );
                 if rc < 0 {
                     submit_err = Some(errno());
                     break;
                 }
-                urbs[i].submitted = true;
+                slot.submitted = true;
                 submitted_count += 1;
             }
 
-            // Tear down immediately if submission itself failed, so the
-            // kernel starts unwinding while the drain below runs rather than
-            // after.
-            if submit_err.is_some() {
-                for j in 0..submitted_count {
-                    if urbs[j].submitted && !urbs[j].reaped {
-                        unsafe {
-                            libc::ioctl(
-                                self.fd,
-                                discard_urb_code() as IoctlReq,
-                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Reap every URB that was actually submitted and score each by
-            // *index* — REAPURB makes no promise about completion order.
             let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
             let mut completion_err = None;
             let mut reap_err = None;
 
-            while completed < submitted_count {
-                if let Err(e) = self.poll_for_urb() {
-                    reap_err = Some(e);
-                    break;
-                }
-                let mut reaped: *mut c_void = std::ptr::null_mut();
-                let rc = unsafe {
-                    libc::ioctl(
+            if submit_err.is_none() {
+                while completed < submitted_count {
+                    if let Err(e) = self.poll_for_urb(self.timeout_ms as i32) {
+                        reap_err = Some(e);
+                        break;
+                    }
+                    let mut reaped: *mut c_void = std::ptr::null_mut();
+                    let rc = self.raw.ioctl(
                         self.fd,
                         reap_urb_code() as IoctlReq,
                         &mut reaped as *mut *mut c_void as *mut c_void,
-                    )
-                };
-                if rc < 0 {
-                    let e = errno();
-                    if e == libc::EINTR {
-                        continue;
+                    );
+                    if rc < 0 {
+                        let e = errno();
+                        if e == libc::EINTR {
+                            continue;
+                        }
+                        reap_err = Some(e);
+                        break;
                     }
-                    reap_err = Some(e);
-                    break;
-                }
-                let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
-                inflight.reaped = true;
-                completed += 1;
+                    let raw_val = reaped as usize;
+                    if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
+                        let slot_idx = raw_val - 1;
+                        let slot = &mut arena.slots[slot_idx];
+                        if slot.generation == generation && slot.submitted && !slot.reaped {
+                            slot.reaped = true;
+                            slot.in_use = false;
+                            completed += 1;
 
-                let status = inflight.urb.status;
-                if status < 0 {
-                    let err = -status;
-                    let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
-                    if !was_discarded && completion_err.is_none() {
-                        completion_err = Some(err);
-
-                        for j in 0..submitted_count {
-                            if urbs[j].submitted && !urbs[j].reaped {
-                                unsafe {
-                                    libc::ioctl(
-                                        self.fd,
-                                        discard_urb_code() as IoctlReq,
-                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                                    );
+                            let status = slot.urb.status;
+                            if status < 0 {
+                                let err = -status;
+                                let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
+                                if !was_discarded && completion_err.is_none() {
+                                    completion_err = Some(err);
+                                    for &other_idx in &slot_indices {
+                                        let other = &mut arena.slots[other_idx];
+                                        if other.submitted && !other.reaped {
+                                            let _ = self.raw.ioctl(
+                                                self.fd,
+                                                discard_urb_code() as IoctlReq,
+                                                &mut other.urb as *mut UsbdevfsUrb as *mut c_void,
+                                            );
+                                        }
+                                    }
                                 }
+                            } else if slot.index < outcomes.len() {
+                                outcomes[slot.index] = Some(slot.urb.actual_length);
                             }
+                        } else if slot.in_use && slot.generation < generation {
+                            // Stale completion from older generation reclaimed
+                            slot.in_use = false;
                         }
                     }
-                    // outcomes[inflight.index] stays None: failed or discarded.
-                } else {
-                    outcomes[inflight.index] = Some(inflight.urb.actual_length);
                 }
             }
 
-            // A REAPURB failure leaves whatever was still in flight neither
-            // confirmed nor discarded. Best-effort clean-up so the next round
-            // does not inherit URBs this one never resolved.
-            if reap_err.is_some() {
-                for j in 0..submitted_count {
-                    if urbs[j].submitted && !urbs[j].reaped {
-                        unsafe {
-                            libc::ioctl(
-                                self.fd,
-                                discard_urb_code() as IoctlReq,
-                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                            );
-                        }
-                    }
+            let err = submit_err.or(completion_err).or(reap_err);
+
+            if err.is_some() || completed < submitted_count {
+                drain_unreaped(
+                    self.fd,
+                    &*self.raw,
+                    &self.state,
+                    &mut *arena,
+                    generation,
+                    &slot_indices,
+                    self.timeout_ms,
+                    &mut completed,
+                    submitted_count,
+                );
+            } else {
+                for &slot_idx in &slot_indices {
+                    arena.slots[slot_idx].in_use = false;
                 }
             }
 
             let prefix = contiguous_prefix(&outcomes);
-            let err = submit_err.or(completion_err).or(reap_err);
 
             match err {
                 None => return Ok(prefix),
@@ -584,6 +698,12 @@ impl UsbFsTransport {
             return Ok(0);
         }
 
+        if self.state() == TransportState::Dead {
+            return Err(LuksError::UsbTransfer(
+                "USB transport dead: un-drained URBs pending from earlier failure".into(),
+            ));
+        }
+
         const CHUNK_SIZE: usize = 128 * 1024;
 
         loop {
@@ -599,167 +719,138 @@ impl UsbFsTransport {
             }
 
             let num_urbs = chunks.len();
-            let mut urbs = Vec::with_capacity(num_urbs);
-            for i in 0..num_urbs {
-                urbs.push(InFlightUrb {
-                    urb: UsbdevfsUrb {
-                        urb_type: USBDEVFS_URB_TYPE_BULK,
-                        endpoint: ep,
-                        status: 0,
-                        flags: 0,
-                        buffer: chunks[i].as_mut_ptr() as *mut c_void,
-                        buffer_length: chunks[i].len() as i32,
-                        actual_length: 0,
-                        start_frame: 0,
-                        number_of_packets_or_stream_id: 0,
-                        error_count: 0,
-                        signr: 0,
-                        usercontext: std::ptr::null_mut(),
-                    },
-                    submitted: false,
-                    reaped: false,
-                    index: i,
-                });
-            }
+            let mut arena = self.arena.lock().unwrap();
+            let (generation, slot_indices) = arena.allocate(num_urbs)?;
 
-            for i in 0..num_urbs {
-                let inflight_ptr = &mut urbs[i] as *mut InFlightUrb as *mut c_void;
-                urbs[i].urb.usercontext = inflight_ptr;
+            for (i, &slot_idx) in slot_indices.iter().enumerate() {
+                let slot = &mut arena.slots[slot_idx];
+                slot.urb.urb_type = USBDEVFS_URB_TYPE_BULK;
+                slot.urb.endpoint = ep;
+                slot.urb.flags = 0;
+                slot.urb.buffer = chunks[i].as_mut_ptr() as *mut c_void;
+                slot.urb.buffer_length = chunks[i].len() as i32;
+                slot.urb.actual_length = 0;
+                slot.urb.status = 0;
             }
 
             let mut submit_err = None;
             let mut submitted_count = 0;
 
-            for i in 0..num_urbs {
-                let rc = unsafe {
-                    libc::ioctl(
-                        self.fd,
-                        submit_urb_code() as IoctlReq,
-                        &mut urbs[i].urb as *mut UsbdevfsUrb as *mut c_void,
-                    )
-                };
+            for &slot_idx in &slot_indices {
+                let slot = &mut arena.slots[slot_idx];
+                let rc = self.raw.ioctl(
+                    self.fd,
+                    submit_urb_code() as IoctlReq,
+                    &mut slot.urb as *mut UsbdevfsUrb as *mut c_void,
+                );
                 if rc < 0 {
                     submit_err = Some(errno());
                     break;
                 }
-                urbs[i].submitted = true;
+                slot.submitted = true;
                 submitted_count += 1;
             }
 
-            // Tear down immediately if submission itself failed, so the
-            // kernel starts unwinding while the drain below runs rather than
-            // after.
-            if submit_err.is_some() {
-                for j in 0..submitted_count {
-                    if urbs[j].submitted && !urbs[j].reaped {
-                        unsafe {
-                            libc::ioctl(
-                                self.fd,
-                                discard_urb_code() as IoctlReq,
-                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Reap every URB that was actually submitted and score each by
-            // *index* — REAPURB makes no promise about completion order.
             let mut outcomes: Vec<Option<i32>> = vec![None; num_urbs];
             let mut completed = 0;
             let mut completion_err = None;
             let mut reap_err = None;
             let mut discarded_for_short_read = false;
 
-            while completed < submitted_count {
-                if let Err(e) = self.poll_for_urb() {
-                    reap_err = Some(e);
-                    break;
-                }
-                let mut reaped: *mut c_void = std::ptr::null_mut();
-                let rc = unsafe {
-                    libc::ioctl(
+            if submit_err.is_none() {
+                while completed < submitted_count {
+                    if let Err(e) = self.poll_for_urb(self.timeout_ms as i32) {
+                        reap_err = Some(e);
+                        break;
+                    }
+                    let mut reaped: *mut c_void = std::ptr::null_mut();
+                    let rc = self.raw.ioctl(
                         self.fd,
                         reap_urb_code() as IoctlReq,
                         &mut reaped as *mut *mut c_void as *mut c_void,
-                    )
-                };
-                if rc < 0 {
-                    let e = errno();
-                    if e == libc::EINTR {
-                        continue;
-                    }
-                    reap_err = Some(e);
-                    break;
-                }
-                let inflight = unsafe { &mut *(reaped as *mut InFlightUrb) };
-                inflight.reaped = true;
-                completed += 1;
-
-                let status = inflight.urb.status;
-                if status < 0 {
-                    let err = -status;
-                    let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
-                    if !was_discarded && completion_err.is_none() {
-                        completion_err = Some(err);
-
-                        for j in 0..submitted_count {
-                            if urbs[j].submitted && !urbs[j].reaped {
-                                unsafe {
-                                    libc::ioctl(
-                                        self.fd,
-                                        discard_urb_code() as IoctlReq,
-                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                                    );
-                                }
-                            }
+                    );
+                    if rc < 0 {
+                        let e = errno();
+                        if e == libc::EINTR {
+                            continue;
                         }
+                        reap_err = Some(e);
+                        break;
                     }
-                    // outcomes[inflight.index] stays None: failed or discarded.
-                } else {
-                    outcomes[inflight.index] = Some(inflight.urb.actual_length);
+                    let raw_val = reaped as usize;
+                    if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
+                        let slot_idx = raw_val - 1;
+                        let slot = &mut arena.slots[slot_idx];
+                        if slot.generation == generation && slot.submitted && !slot.reaped {
+                            slot.reaped = true;
+                            slot.in_use = false;
+                            completed += 1;
 
-                    // Short reads are normal — the device has no more data.
-                    // Stop asking for the rest rather than waiting on it, but
-                    // this is not an error: the prefix through here is still
-                    // exactly what a caller should see.
-                    let short_read = inflight.urb.actual_length < inflight.urb.buffer_length;
-                    if short_read && !discarded_for_short_read {
-                        discarded_for_short_read = true;
-                        for j in 0..submitted_count {
-                            if urbs[j].submitted && !urbs[j].reaped {
-                                unsafe {
-                                    libc::ioctl(
-                                        self.fd,
-                                        discard_urb_code() as IoctlReq,
-                                        &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                                    );
+                            let status = slot.urb.status;
+                            if status < 0 {
+                                let err = -status;
+                                let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
+                                if !was_discarded && completion_err.is_none() {
+                                    completion_err = Some(err);
+                                    for &other_idx in &slot_indices {
+                                        let other = &mut arena.slots[other_idx];
+                                        if other.submitted && !other.reaped {
+                                            let _ = self.raw.ioctl(
+                                                self.fd,
+                                                discard_urb_code() as IoctlReq,
+                                                &mut other.urb as *mut UsbdevfsUrb as *mut c_void,
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                if slot.index < outcomes.len() {
+                                    outcomes[slot.index] = Some(slot.urb.actual_length);
+                                }
+                                let short_read = slot.urb.actual_length < slot.urb.buffer_length;
+                                if short_read && !discarded_for_short_read {
+                                    discarded_for_short_read = true;
+                                    for &other_idx in &slot_indices {
+                                        let other = &mut arena.slots[other_idx];
+                                        if other.submitted && !other.reaped {
+                                            let _ = self.raw.ioctl(
+                                                self.fd,
+                                                discard_urb_code() as IoctlReq,
+                                                &mut other.urb as *mut UsbdevfsUrb as *mut c_void,
+                                            );
+                                        }
+                                    }
                                 }
                             }
+                        } else if slot.in_use && slot.generation < generation {
+                            // Stale completion from older generation reclaimed
+                            slot.in_use = false;
                         }
                     }
                 }
             }
 
-            // A REAPURB failure leaves whatever was still in flight neither
-            // confirmed nor discarded. Best-effort clean-up so the next round
-            // does not inherit URBs this one never resolved.
-            if reap_err.is_some() {
-                for j in 0..submitted_count {
-                    if urbs[j].submitted && !urbs[j].reaped {
-                        unsafe {
-                            libc::ioctl(
-                                self.fd,
-                                discard_urb_code() as IoctlReq,
-                                &mut urbs[j].urb as *mut UsbdevfsUrb as *mut c_void,
-                            );
-                        }
-                    }
+            let err = submit_err.or(completion_err).or(reap_err);
+
+            if err.is_some() || completed < submitted_count {
+                drain_unreaped(
+                    self.fd,
+                    &*self.raw,
+                    &self.state,
+                    &mut *arena,
+                    generation,
+                    &slot_indices,
+                    self.timeout_ms,
+                    &mut completed,
+                    submitted_count,
+                );
+            } else {
+                for &slot_idx in &slot_indices {
+                    arena.slots[slot_idx].in_use = false;
                 }
             }
 
             let prefix = contiguous_prefix(&outcomes);
-            let err = submit_err.or(completion_err).or(reap_err);
 
             match err {
                 None => return Ok(prefix),
@@ -792,6 +883,84 @@ impl UsbFsTransport {
     }
 }
 
+fn drain_unreaped(
+    fd: RawFd,
+    raw: &dyn RawUsbFs,
+    state: &AtomicU8,
+    arena: &mut UrbArena,
+    generation: u64,
+    slot_indices: &[usize],
+    timeout_ms: u32,
+    completed: &mut usize,
+    submitted_count: usize,
+) {
+    if *completed >= submitted_count {
+        return;
+    }
+
+    state.store(TransportState::Draining as u8, Ordering::Release);
+
+    // 1. Issue DISCARDURB for all submitted but un-reaped URBs
+    for &idx in slot_indices {
+        let slot = &mut arena.slots[idx];
+        if slot.generation == generation && slot.submitted && !slot.reaped {
+            let _ = raw.ioctl(
+                fd,
+                discard_urb_code() as IoctlReq,
+                &mut slot.urb as *mut UsbdevfsUrb as *mut c_void,
+            );
+        }
+    }
+
+    // 2. Bounded draining loop
+    let drain_budget = Duration::from_millis(2 * timeout_ms as u64);
+    let deadline = Instant::now() + drain_budget;
+
+    while *completed < submitted_count {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let rem_ms = (deadline - now).as_millis().clamp(10, 500) as i32;
+
+        if raw.poll(fd, libc::POLLOUT, rem_ms).is_err() {
+            continue;
+        }
+
+        let mut reaped: *mut c_void = std::ptr::null_mut();
+        let rc = raw.ioctl(
+            fd,
+            reap_urb_code() as IoctlReq,
+            &mut reaped as *mut *mut c_void as *mut c_void,
+        );
+        if rc < 0 {
+            continue;
+        }
+
+        let raw_val = reaped as usize;
+        if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
+            let slot_idx = raw_val - 1;
+            let slot = &mut arena.slots[slot_idx];
+            if slot.generation == generation && slot.submitted && !slot.reaped {
+                slot.reaped = true;
+                slot.in_use = false;
+                *completed += 1;
+            } else if slot.in_use && slot.generation < generation {
+                slot.in_use = false;
+            }
+        }
+    }
+
+    // 3. State resolution:
+    if *completed == submitted_count {
+        // All submitted URBs for this transfer were successfully drained!
+        state.store(TransportState::Healthy as u8, Ordering::Release);
+    } else {
+        // Some URBs un-drained! Permanently latch Dead.
+        state.store(TransportState::Dead as u8, Ordering::Release);
+    }
+}
+
 impl BulkTransport for UsbFsTransport {
     fn write(&self, data: &[u8]) -> Result<usize> {
         self.bulk_out(self.ep_out, data)
@@ -806,15 +975,15 @@ impl BulkTransport for UsbFsTransport {
     }
 
     fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
+        if self.state() == TransportState::Dead {
+            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+        }
         let ep = if endpoint_in { self.ep_in } else { self.ep_out } as c_uint;
-        // SAFETY: the ioctl reads a single c_uint through this pointer.
-        let rc = unsafe {
-            libc::ioctl(
-                self.fd,
-                clear_halt_code() as IoctlReq,
-                &ep as *const c_uint as *mut c_void,
-            )
-        };
+        let rc = self.raw.ioctl(
+            self.fd,
+            clear_halt_code() as IoctlReq,
+            &ep as *const c_uint as *mut c_void,
+        );
         if rc < 0 {
             return Err(transfer_err("USBDEVFS_CLEAR_HALT", errno()));
         }
@@ -822,6 +991,9 @@ impl BulkTransport for UsbFsTransport {
     }
 
     fn reset(&self) -> Result<()> {
+        if self.state() == TransportState::Dead {
+            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+        }
         // Bulk-Only Mass Storage Reset: a *class* request on the interface.
         //
         // Deliberately NOT USBDEVFS_RESET. That performs a USB port reset,
@@ -841,13 +1013,11 @@ impl BulkTransport for UsbFsTransport {
         };
         // SAFETY: length is 0 and data is null, so the kernel transfers no
         // payload and dereferences nothing.
-        let rc = unsafe {
-            libc::ioctl(
-                self.fd,
-                control_code() as IoctlReq,
-                &mut req as *mut UsbFsCtrlTransfer as *mut c_void,
-            )
-        };
+        let rc = self.raw.ioctl(
+            self.fd,
+            control_code() as IoctlReq,
+            &mut req as *mut UsbFsCtrlTransfer as *mut c_void,
+        );
         if rc < 0 {
             return Err(transfer_err("Bulk-Only Mass Storage Reset", errno()));
         }
@@ -965,6 +1135,7 @@ mod tests {
         assert_eq!(t.ep_in, 0x81, "IN endpoints carry the 0x80 direction bit");
         assert_eq!(t.ep_out, 0x02);
         assert_eq!(t.max_transfer(), UsbFsTransport::DEFAULT_MAX_TRANSFER);
+        assert_eq!(t.state(), TransportState::Healthy);
     }
 
     #[test]
@@ -975,7 +1146,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let err = t.read(&mut buf).unwrap_err();
         assert!(
-            matches!(err, LuksError::UsbTransfer(ref m) if m.contains("errno")),
+            matches!(err, LuksError::UsbTransfer(ref m) if m.contains("errno") || m.contains("dead")),
             "unexpected error: {err}"
         );
     }
