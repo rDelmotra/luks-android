@@ -38,6 +38,32 @@ impl BtrfsFileWriter {
     pub fn allocator(&self) -> &FreeSpaceMap {
         &self.allocator
     }
+
+    #[doc(hidden)]
+    pub fn new_raw(
+        size: u64,
+        written_bytes: u64,
+        data_runs: Vec<(u64, u64)>,
+        checksums: Vec<(u64, u32)>,
+        allocator: FreeSpaceMap,
+        is_streaming: bool,
+        tail_buf: Vec<u8>,
+    ) -> Self {
+        Self {
+            size,
+            written_bytes,
+            data_runs,
+            checksums,
+            allocator,
+            is_streaming,
+            tail_buf,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn data_runs_mut(&mut self) -> &mut Vec<(u64, u64)> {
+        &mut self.data_runs
+    }
 }
 
 impl<D: ReadAt + WriteAt> Btrfs<D> {
@@ -99,7 +125,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     if let Some(ref mut batch) = self.active_batch {
                         if let Err(e) = batch.record_allocation(bytenr, chunk_len) {
                             for &(r_bytenr, r_len) in &data_runs {
-                                batch.handed_out.remove(r_bytenr, r_len);
+                                let _ = batch.release_allocation(r_bytenr, r_len);
                             }
                             return Err(e);
                         }
@@ -121,7 +147,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 Err(e) => {
                     if let Some(ref mut batch) = self.active_batch {
                         for &(r_bytenr, r_len) in &data_runs {
-                            batch.handed_out.remove(r_bytenr, r_len);
+                            let _ = batch.release_allocation(r_bytenr, r_len);
                         }
                     }
                     return Err(e);
@@ -385,7 +411,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             Err(e) => {
                 batch.rollback(mark);
                 for &(bytenr, run_len) in &writer.data_runs {
-                    batch.handed_out.remove(bytenr, run_len);
+                    let _ = batch.release_allocation(bytenr, run_len);
                 }
                 if batch.has_uncommitted_files() {
                     let txn = batch.commit_and_rearm(self)?;
@@ -401,7 +427,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         self.has_open_writer = false;
         if let Some(mut batch) = self.active_batch.take() {
             for &(bytenr, run_len) in &writer.data_runs {
-                batch.handed_out.remove(bytenr, run_len);
+                batch.release_allocation(bytenr, run_len)?;
             }
             if batch.has_uncommitted_files() {
                 let txn = batch.commit_and_rearm(self)?;

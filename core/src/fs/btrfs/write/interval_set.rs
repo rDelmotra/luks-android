@@ -106,6 +106,41 @@ impl IntervalSet {
         self.intervals = new_intervals;
     }
 
+    /// Check if `[start, start + length)` is wholly enclosed within a single interval in the set.
+    pub fn contains_range(&self, start: u64, length: u64) -> bool {
+        if length == 0 {
+            return true;
+        }
+        let end = match start.checked_add(length) {
+            Some(e) => e,
+            None => return false,
+        };
+
+        // Binary search for the rightmost interval whose start <= start
+        let idx = self.intervals.partition_point(|&(s, _)| s <= start);
+        if idx > 0 {
+            let (prev_start, prev_end) = self.intervals[idx - 1];
+            if prev_start <= start && prev_end >= end {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove an interval `[start, start + length)` from the set.
+    /// Returns `true` if the interval was completely present in the set and removed,
+    /// or `false` if it was not present or only partially present (detecting double release / foreign range).
+    pub fn remove_exact(&mut self, start: u64, length: u64) -> bool {
+        if length == 0 {
+            return true;
+        }
+        if !self.contains_range(start, length) {
+            return false;
+        }
+        self.remove(start, length);
+        true
+    }
+
     /// Number of disjoint intervals in the set.
     pub fn len(&self) -> usize {
         self.intervals.len()
@@ -177,5 +212,50 @@ mod tests {
         set.insert(100, 200); // [100, 300)
         set.remove(150, 50); // remove [150, 200)
         assert_eq!(set.intervals(), &[(100, 150), (200, 300)]);
+    }
+
+    #[test]
+    fn test_interval_set_contains_range() {
+        let mut set = IntervalSet::new();
+        assert!(set.contains_range(100, 0)); // length 0 is trivially contained
+        assert!(!set.contains_range(100, 50)); // empty set
+
+        set.insert(1000, 500); // [1000, 1500)
+        assert!(set.contains_range(1000, 500)); // exact match
+        assert!(set.contains_range(1000, 100)); // subrange at start
+        assert!(set.contains_range(1200, 100)); // subrange in middle
+        assert!(set.contains_range(1400, 100)); // subrange at end
+        assert!(set.contains_range(1000, 0)); // zero length
+
+        // Outside / partial
+        assert!(!set.contains_range(900, 200)); // starts before
+        assert!(!set.contains_range(1400, 200)); // extends past end
+        assert!(!set.contains_range(800, 1000)); // spans past both sides
+        assert!(!set.contains_range(2000, 100)); // disjoint
+        assert!(!set.contains_range(u64::MAX - 10, 20)); // overflow
+    }
+
+    #[test]
+    fn test_interval_set_remove_exact() {
+        let mut set = IntervalSet::new();
+        set.insert(100, 100); // [100, 200)
+        set.insert(300, 100); // [300, 400)
+
+        // Attempting to remove non-existent or overlapping range returns false
+        assert!(!set.remove_exact(50, 100));
+        assert!(!set.remove_exact(150, 100));
+        assert!(!set.remove_exact(200, 100));
+        assert_eq!(set.intervals(), &[(100, 200), (300, 400)]); // Unmutated
+
+        // Exact subrange removal succeeds
+        assert!(set.remove_exact(120, 30)); // remove [120, 150)
+        assert_eq!(set.intervals(), &[(100, 120), (150, 200), (300, 400)]);
+
+        // Second removal of same range returns false (double-release prevention)
+        assert!(!set.remove_exact(120, 30));
+
+        // Exact full interval removal succeeds
+        assert!(set.remove_exact(300, 100));
+        assert_eq!(set.intervals(), &[(100, 120), (150, 200)]);
     }
 }

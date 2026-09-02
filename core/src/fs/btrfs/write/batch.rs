@@ -176,6 +176,17 @@ impl Batch {
         Ok(())
     }
 
+    /// Release an allocated range from the reservation ledger.
+    /// Fails immediately with `CorruptFs` if the range was not present in the ledger.
+    pub fn release_allocation(&mut self, start: u64, length: u64) -> Result<()> {
+        if !self.handed_out.remove_exact(start, length) {
+            return Err(LuksError::CorruptFs(
+                "attempted to release allocation not present in reservation ledger",
+            ));
+        }
+        Ok(())
+    }
+
     /// Add a written file into this batch session via its writer.
     pub fn add_writer<D: WriteAt>(
         &mut self,
