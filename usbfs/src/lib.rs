@@ -272,6 +272,30 @@ impl UrbArena {
         }
         Err(LuksError::UsbTransfer("all URB slots in use".into()))
     }
+
+    /// Resolve a kernel-reaped pointer to a slot index in the arena.
+    ///
+    /// The Linux kernel's `USBDEVFS_REAPURB` returns the exact user-space pointer
+    /// to `UsbdevfsUrb` that was passed to `USBDEVFS_SUBMITURB` (i.e. `&arena.slots[i].urb`).
+    /// We first match by pointer equality across the arena's slots.
+    /// As a fallback (for test mocks or synthetic ioctls), we also accept an encoded
+    /// 1-based index token `(1..=MAX_URB_SLOTS)` in `reaped`.
+    /// Any unaligned, invalid, or out-of-range pointer returns `None` safely without dereferencing.
+    pub fn find_slot_idx(&self, reaped: *mut c_void) -> Option<usize> {
+        if reaped.is_null() {
+            return None;
+        }
+        // 1. Production kernel path: match the exact UsbdevfsUrb pointer submitted
+        if let Some(idx) = self.slots.iter().position(|s| std::ptr::eq(&s.urb, reaped as *const _)) {
+            return Some(idx);
+        }
+        // 2. Fallback for test mocks or integer tokens (1-based index)
+        let raw_val = reaped as usize;
+        if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
+            return Some(raw_val - 1);
+        }
+        None
+    }
 }
 
 /// Bytes actually usable from this round: the sum of `actual_length` over
@@ -617,9 +641,7 @@ impl UsbFsTransport {
                         reap_err = Some(e);
                         break;
                     }
-                    let raw_val = reaped as usize;
-                    if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
-                        let slot_idx = raw_val - 1;
+                    if let Some(slot_idx) = arena.find_slot_idx(reaped) {
                         let slot = &mut arena.slots[slot_idx];
                         if slot.generation == generation && slot.submitted && !slot.reaped {
                             slot.reaped = true;
@@ -809,9 +831,7 @@ impl UsbFsTransport {
                         reap_err = Some(e);
                         break;
                     }
-                    let raw_val = reaped as usize;
-                    if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
-                        let slot_idx = raw_val - 1;
+                    if let Some(slot_idx) = arena.find_slot_idx(reaped) {
                         let slot = &mut arena.slots[slot_idx];
                         if slot.generation == generation && slot.submitted && !slot.reaped {
                             slot.reaped = true;
@@ -979,9 +999,7 @@ fn drain_unreaped(
             continue;
         }
 
-        let raw_val = reaped as usize;
-        if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
-            let slot_idx = raw_val - 1;
+        if let Some(slot_idx) = arena.find_slot_idx(reaped) {
             let slot = &mut arena.slots[slot_idx];
             if slot.generation == generation && slot.submitted && !slot.reaped {
                 slot.reaped = true;

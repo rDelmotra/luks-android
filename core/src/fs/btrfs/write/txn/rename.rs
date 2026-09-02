@@ -372,7 +372,7 @@ fn resolve_rename<D: ReadAt>(
                 if key.item_type == EXTENT_DATA_KEY {
                     let data = cursor.data()?;
                     let file_ext = crate::fs::btrfs::extent::FileExtent::parse(key.offset, data)?;
-                    if !file_ext.is_zeros() && file_ext.disk_bytenr > 0 && file_ext.disk_num_bytes > 0 {
+                    if file_ext.has_disk_bytes() {
                         data_extents_to_free.push((file_ext.disk_bytenr, file_ext.disk_num_bytes));
                     }
                 }
@@ -380,6 +380,20 @@ fn resolve_rename<D: ReadAt>(
             }
             data_extents_to_free.sort_unstable();
             data_extents_to_free.dedup();
+
+            // G1: Refuse to free shared extents on rename-overwrite.
+            {
+                let extent_tree_for_refs = ExtentTree::read(fs)?;
+                for &(bytenr, _num_bytes) in &data_extents_to_free {
+                    if let Some(ext) = extent_tree_for_refs.extents.iter().find(|e| e.bytenr == bytenr) {
+                        if ext.refs > 1 {
+                            return Err(LuksError::UnsupportedFsFeature(
+                                "overwriting a file with shared data extents (refs > 1) is not supported".into(),
+                            ));
+                        }
+                    }
+                }
+            }
 
             let inode_ref_key = Key::new(dest_ino, INODE_REF_KEY, new_parent_ino);
             let dest_dir_index = if let Some(ref_data) = fs.find_item(fs.fs_tree().bytenr, &inode_ref_key)? {

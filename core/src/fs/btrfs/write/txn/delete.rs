@@ -160,13 +160,30 @@ impl Transaction {
         for (key, data) in &target_items {
             if key.item_type == EXTENT_DATA_KEY {
                 let file_ext = crate::fs::btrfs::extent::FileExtent::parse(key.offset, data)?;
-                if !file_ext.is_zeros() && file_ext.disk_bytenr > 0 && file_ext.disk_num_bytes > 0 {
+                if file_ext.has_disk_bytes() {
                     data_extents_to_free.push((file_ext.disk_bytenr, file_ext.disk_num_bytes));
                 }
             }
         }
         data_extents_to_free.sort_unstable();
         data_extents_to_free.dedup();
+
+        // G1: Refuse to free shared extents (refs > 1). This prevents
+        // data corruption when deleting files that share extents via
+        // reflink, deduplication, or snapshots.
+        // We read the extent tree early to check refs before proceeding.
+        {
+            let extent_tree_for_refs = ExtentTree::read(fs)?;
+            for &(bytenr, _num_bytes) in &data_extents_to_free {
+                if let Some(ext) = extent_tree_for_refs.extents.iter().find(|e| e.bytenr == bytenr) {
+                    if ext.refs > 1 {
+                        return Err(LuksError::UnsupportedFsFeature(
+                            "deleting a file with shared data extents (refs > 1) is not supported".into(),
+                        ));
+                    }
+                }
+            }
+        }
 
         let sb = fs.superblock();
         let new_generation = sb.generation + 1;

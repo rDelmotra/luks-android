@@ -682,12 +682,12 @@ impl Batch {
             None,
             None,
             None,
-            self.pending_blocks.clone(),
+            std::mem::take(&mut self.pending_blocks),
             Vec::new(),
             self.allocator.clone(),
-            self.blocks_to_add.clone(),
-            self.blocks_to_remove.clone(),
-            self.data_extents_to_add.clone(),
+            std::mem::take(&mut self.blocks_to_add),
+            std::mem::take(&mut self.blocks_to_remove),
+            std::mem::take(&mut self.data_extents_to_add),
             Vec::new(),
         )?;
 
@@ -695,10 +695,9 @@ impl Batch {
             self.allocator = final_alloc.clone();
             self.allocator.unpin_freed();
         }
-        self.pending_blocks.clear();
-        self.blocks_to_add.clear();
-        self.blocks_to_remove.clear();
-        self.data_extents_to_add.clear();
+        // `pending_blocks`, `blocks_to_add`, `blocks_to_remove`, and
+        // `data_extents_to_add` are already empty — `std::mem::take` moved
+        // their contents into `converge_and_finalize` above.
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
         self.csum_root = None;
         self.generation = txn.new_generation;

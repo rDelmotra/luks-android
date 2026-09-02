@@ -666,12 +666,48 @@ where
 
         // If this is the root node and it has collapsed to exactly 1 child pointer,
         // we can shrink the tree height by adopting the single child as the new root.
+        // The promoted child MUST be CoW'd to carry the current generation, or
+        // ROOT_ITEM.generation will not match the root block's header generation,
+        // causing `verify_parent_transid` to fail with -EIO on mount.
         if is_root && interior.entries.len() == 1 {
             let child_entry = &interior.entries[0];
             let child_bytenr = child_entry.blockptr;
             let child_key = child_entry.key;
+            let child_level = level - 1;
             freed.push((bytenr, level));
-            return Ok((Some((child_bytenr, child_key, level - 1)), emitted_blocks));
+
+            // If the child already carries the current generation (it was
+            // touched in this same transaction), no re-copy is needed.
+            if child_entry.generation == generation {
+                return Ok((Some((child_bytenr, child_key, child_level)), emitted_blocks));
+            }
+
+            // The child has a stale generation — read it, stamp it with the
+            // current generation at a fresh address, and emit.
+            let child_node = read_node(fs, pending, child_bytenr)?;
+            let new_bytenr = allocator.allocate_metadata_for_owner(node_size, owner)?;
+            allocated.push((new_bytenr, child_level));
+            freed.push((child_bytenr, child_level));
+
+            if child_level == 0 {
+                let mut leaf = Leaf::from_node(&child_node, csum_type)?;
+                leaf.bytenr = new_bytenr;
+                leaf.generation = generation;
+                leaf.owner = owner;
+                let emitted = leaf.emit(node_size)?;
+                let first_key = leaf.items.first().map(|it| it.key).unwrap_or(child_key);
+                emitted_blocks.push((new_bytenr, emitted));
+                return Ok((Some((new_bytenr, first_key, 0)), emitted_blocks));
+            } else {
+                let mut child_interior = InteriorNode::from_node(&child_node, csum_type)?;
+                child_interior.bytenr = new_bytenr;
+                child_interior.generation = generation;
+                child_interior.owner = owner;
+                let emitted = child_interior.emit(node_size)?;
+                let first_key = child_interior.entries.first().map(|e| e.key).unwrap_or(child_key);
+                emitted_blocks.push((new_bytenr, emitted));
+                return Ok((Some((new_bytenr, first_key, child_level)), emitted_blocks));
+            }
         }
 
         let target_bytenr = if is_already_new {
