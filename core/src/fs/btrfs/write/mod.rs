@@ -78,6 +78,11 @@ impl<D: WriteAt> Btrfs<D> {
         self.active_batch.take().is_some()
     }
 
+    /// Access the active batch session if one is currently open.
+    pub fn active_batch(&self) -> Option<&Batch> {
+        self.active_batch.as_ref()
+    }
+
     /// Update the modification timestamp (`mtime`) of the file at `path`.
     pub fn set_mtime(&mut self, path: &str, mtime_sec: u64, mtime_nsec: u32) -> Result<()> {
         self.commit_active_batch()?;

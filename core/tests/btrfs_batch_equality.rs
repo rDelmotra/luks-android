@@ -99,7 +99,7 @@ fn test_batch_direct_invocation_matches_finish_file() {
     let mut writer = fs.begin_file(payload.len() as u64).expect("begin_file");
     fs.write_chunk(&mut writer, &payload).expect("write_chunk");
 
-    let mut batch = Batch::open_with_allocator(&mut fs, writer.allocator().clone()).expect("open_with_allocator");
+    let mut batch = Batch::open(&mut fs).expect("open");
     let ino = batch.add_writer(&mut fs, &writer, "/", "direct_batch.bin").expect("add_writer");
     assert!(ino >= 256);
 
@@ -135,10 +135,10 @@ fn test_batch_transaction_byte_identical_on_fixture() {
     let mut writer2 = fs2.begin_file(payload.len() as u64).expect("begin_file 2");
     fs2.write_chunk(&mut writer2, &payload).expect("write_chunk 2");
 
-    let mut batch1 = Batch::open_with_allocator(&mut fs1, writer1.allocator().clone()).expect("open batch 1");
+    let mut batch1 = Batch::open(&mut fs1).expect("open batch 1");
     let ino1 = batch1.add_writer_with_time(&mut fs1, &writer1, "/", "identical.txt", 1700000000, 0).expect("add_writer 1");
 
-    let mut batch2 = Batch::open_with_allocator(&mut fs2, writer2.allocator().clone()).expect("open batch 2");
+    let mut batch2 = Batch::open(&mut fs2).expect("open batch 2");
     let ino2 = batch2.add_writer_with_time(&mut fs2, &writer2, "/", "identical.txt", 1700000000, 0).expect("add_writer 2");
 
     assert_eq!(ino1, ino2);

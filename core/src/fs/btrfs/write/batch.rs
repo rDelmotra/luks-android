@@ -207,7 +207,7 @@ impl Batch {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<u64> {
-        self.add_file_with_time(
+        self.add_file_internal(
             fs,
             writer.is_streaming,
             writer.written_bytes,
@@ -218,6 +218,7 @@ impl Batch {
             name,
             now_sec,
             now_nsec,
+            true,
         )
     }
 
@@ -264,6 +265,35 @@ impl Batch {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<u64> {
+        self.add_file_internal(
+            fs,
+            is_streaming,
+            written_bytes,
+            declared_size,
+            data_runs,
+            checksums,
+            parent_path,
+            name,
+            now_sec,
+            now_nsec,
+            false,
+        )
+    }
+
+    fn add_file_internal<D: WriteAt>(
+        &mut self,
+        fs: &mut Btrfs<D>,
+        is_streaming: bool,
+        written_bytes: u64,
+        declared_size: u64,
+        data_runs: &[(u64, u64)],
+        checksums: &[(u64, u32)],
+        parent_path: &str,
+        name: &str,
+        now_sec: u64,
+        now_nsec: u32,
+        already_reserved: bool,
+    ) -> Result<u64> {
         if !is_streaming && written_bytes != declared_size {
             return Err(LuksError::OutOfBounds);
         }
@@ -273,10 +303,14 @@ impl Batch {
             declared_size
         };
 
-        // Record data runs into double-allocation ledger
+        // Record data runs into double-allocation ledger (if not already reserved)
+        // and promote reservations to batch allocator.
         for &(bytenr, run_len) in data_runs {
             if run_len > 0 {
-                self.record_allocation(bytenr, run_len)?;
+                if !already_reserved {
+                    self.record_allocation(bytenr, run_len)?;
+                }
+                self.allocator.mark_allocated(bytenr, run_len)?;
             }
         }
 

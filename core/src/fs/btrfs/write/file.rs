@@ -3,7 +3,6 @@ use crate::error::{LuksError, Result};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::batch::Batch;
 use crate::fs::btrfs::write::commit::commit_transaction;
-use crate::fs::btrfs::write::extent_tree::ExtentTree;
 use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::Btrfs;
 
@@ -61,6 +60,16 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             self.active_batch = Some(Batch::open(self)?);
         }
         let mut allocator = self.active_batch.as_ref().unwrap().allocator.clone();
+        let handed_out_excl: Vec<std::ops::Range<u64>> = self
+            .active_batch
+            .as_ref()
+            .unwrap()
+            .handed_out
+            .intervals()
+            .iter()
+            .map(|&(s, e)| s..e)
+            .collect();
+        allocator.exclude_ranges(&handed_out_excl);
 
         let mut total_free_data: u64 = allocator
             .block_groups
@@ -71,20 +80,14 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
 
         while total_free_data < disk_num_bytes {
             self.allocate_data_chunk_excluding(&[])?;
-            let extent_tree = ExtentTree::read(self)?;
-            allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
-                &extent_tree,
-                self.chunk_map(),
-            )?;
+            self.active_batch = Some(Batch::open(self)?);
+            allocator = self.active_batch.as_ref().unwrap().allocator.clone();
             total_free_data = allocator
                 .block_groups
                 .iter()
                 .filter(|bg| crate::fs::btrfs::write::alloc::bg_holds_data(bg.block_group.flags))
                 .map(|bg| bg.total_free_bytes)
                 .sum();
-            if let Some(ref mut batch) = self.active_batch {
-                batch.allocator = allocator.clone();
-            }
         }
 
         let mut data_runs = Vec::new();
@@ -93,29 +96,37 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             let remaining = disk_num_bytes - allocated;
             match allocator.allocate_data_chunk(remaining, sector_size as u32) {
                 Ok((bytenr, chunk_len)) => {
+                    if let Some(ref mut batch) = self.active_batch {
+                        if let Err(e) = batch.record_allocation(bytenr, chunk_len) {
+                            for &(r_bytenr, r_len) in &data_runs {
+                                batch.handed_out.remove(r_bytenr, r_len);
+                            }
+                            return Err(e);
+                        }
+                    }
                     data_runs.push((bytenr, chunk_len));
                     allocated += chunk_len;
                 }
                 Err(LuksError::FilesystemFull) => {
                     self.allocate_data_chunk_excluding(&data_runs)?;
-                    let extent_tree = ExtentTree::read(self)?;
-                    allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
-                        &extent_tree,
-                        self.chunk_map(),
-                    )?;
+                    self.active_batch = Some(Batch::open(self)?);
+                    allocator = self.active_batch.as_ref().unwrap().allocator.clone();
                     for &(run_bytenr, run_len) in &data_runs {
                         allocator.mark_allocated(run_bytenr, run_len)?;
-                    }
-                    if let Some(ref mut batch) = self.active_batch {
-                        batch.allocator = allocator.clone();
+                        if let Some(ref mut batch) = self.active_batch {
+                            batch.record_allocation(run_bytenr, run_len)?;
+                        }
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(ref mut batch) = self.active_batch {
+                        for &(r_bytenr, r_len) in &data_runs {
+                            batch.handed_out.remove(r_bytenr, r_len);
+                        }
+                    }
+                    return Err(e);
+                }
             }
-        }
-
-        if let Some(ref mut batch) = self.active_batch {
-            batch.allocator = allocator.clone();
         }
 
         self.has_open_writer = true;
@@ -147,7 +158,17 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         if self.active_batch.is_none() {
             self.active_batch = Some(Batch::open(self)?);
         }
-        let allocator = self.active_batch.as_ref().unwrap().allocator.clone();
+        let mut allocator = self.active_batch.as_ref().unwrap().allocator.clone();
+        let handed_out_excl: Vec<std::ops::Range<u64>> = self
+            .active_batch
+            .as_ref()
+            .unwrap()
+            .handed_out
+            .intervals()
+            .iter()
+            .map(|&(s, e)| s..e)
+            .collect();
+        allocator.exclude_ranges(&handed_out_excl);
 
         self.has_open_writer = true;
 
@@ -180,6 +201,9 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     let remaining = disk_num_bytes - allocated_new;
                     match writer.allocator.allocate_data_chunk(remaining, sector_size as u32) {
                         Ok((bytenr, chunk_len)) => {
+                            if let Some(ref mut batch) = self.active_batch {
+                                batch.record_allocation(bytenr, chunk_len)?;
+                            }
                             writer.data_runs.push((bytenr, chunk_len));
                             allocated_new += chunk_len;
                         }
@@ -190,9 +214,6 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                         }
                         Err(e) => return Err(e),
                     }
-                }
-                if let Some(ref mut batch) = self.active_batch {
-                    batch.allocator = writer.allocator.clone();
                 }
             }
         } else if end > writer.size {
@@ -346,7 +367,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let mut batch = if let Some(b) = self.active_batch.take() {
             b
         } else {
-            Batch::open_with_allocator(self, writer.allocator.clone())?
+            Batch::open(self)?
         };
 
         let mark = batch.mark();
@@ -364,7 +385,6 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             Err(e) => {
                 batch.rollback(mark);
                 for &(bytenr, run_len) in &writer.data_runs {
-                    let _ = batch.allocator.free_data(bytenr, run_len);
                     batch.handed_out.remove(bytenr, run_len);
                 }
                 if batch.has_uncommitted_files() {
@@ -381,7 +401,6 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         self.has_open_writer = false;
         if let Some(mut batch) = self.active_batch.take() {
             for &(bytenr, run_len) in &writer.data_runs {
-                let _ = batch.allocator.free_data(bytenr, run_len);
                 batch.handed_out.remove(bytenr, run_len);
             }
             if batch.has_uncommitted_files() {
@@ -400,6 +419,7 @@ mod tests {
     use crate::device::FileDevice;
     use crate::fs::btrfs::extent::ExtentKind;
     use crate::fs::btrfs::write::alloc::FreeRange;
+    use crate::fs::btrfs::write::extent_tree::ExtentTree;
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -457,6 +477,7 @@ mod tests {
             },
         ];
         allocator.block_groups[0].total_free_bytes = 16_384 + 32_768 + 16_384;
+        fs.active_batch = Some(Batch::open_with_allocator(&mut fs, allocator.clone()).expect("open batch"));
 
         let total_file_size = 49_152u64; // 48 KB: requires 32 KB from Range 2 + 16 KB from Range 1
         let sector_size = fs.superblock().sector_size;
