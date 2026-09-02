@@ -171,16 +171,13 @@ impl Transaction {
         // G1: Refuse to free shared extents (refs > 1). This prevents
         // data corruption when deleting files that share extents via
         // reflink, deduplication, or snapshots.
-        // We read the extent tree early to check refs before proceeding.
-        {
-            let extent_tree_for_refs = ExtentTree::read(fs)?;
-            for &(bytenr, _num_bytes) in &data_extents_to_free {
-                if let Some(ext) = extent_tree_for_refs.extents.iter().find(|e| e.bytenr == bytenr) {
-                    if ext.refs > 1 {
-                        return Err(LuksError::UnsupportedFsFeature(
-                            "deleting a file with shared data extents (refs > 1) is not supported".into(),
-                        ));
-                    }
+        let extent_tree = ExtentTree::read(fs)?;
+        for &(bytenr, _num_bytes) in &data_extents_to_free {
+            if let Some(ext) = extent_tree.extents.iter().find(|e| e.bytenr == bytenr) {
+                if ext.refs > 1 {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "deleting a file with shared data extents (refs > 1) is not supported".into(),
+                    ));
                 }
             }
         }
@@ -188,7 +185,6 @@ impl Transaction {
         let sb = fs.superblock();
         let new_generation = sb.generation + 1;
 
-        let extent_tree = ExtentTree::read(fs)?;
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();

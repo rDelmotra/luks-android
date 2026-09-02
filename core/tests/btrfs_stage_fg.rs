@@ -6,6 +6,8 @@
 
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::extent::{ExtentKind, FileExtent};
 use luks_core::fs::btrfs::Btrfs;
@@ -43,6 +45,10 @@ fn copy_to_temp(name: &str) -> PathBuf {
 }
 
 fn run_verify_btrfs(img_path: &Path) -> (bool, String) {
+    if !common::oracle::gate() {
+        return (true, "oracle skipped via ALLOW_NO_ORACLE".into());
+    }
+
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("tools")
@@ -175,5 +181,91 @@ fn test_stage_g_delete_and_rename_file_passes_oracle() {
 
     let (ok, out) = run_verify_btrfs(&img_path);
     assert!(ok, "btrfs check failed after delete and rename:\n{out}");
+    let _ = fs::remove_file(img_path);
+}
+
+#[test]
+fn test_g1_shared_extent_refusal() {
+    use luks_core::error::LuksError;
+    use luks_core::fs::btrfs::Key;
+
+    let img_path = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&img_path).unwrap().len();
+    let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount");
+
+    // 1. Create a file
+    let data = vec![0x42; 8192];
+    fs.create_file_with_data("/", "shared_test.bin", &data).expect("create file");
+
+    // 2. Find the file's data extent
+    let target = fs.resolve_no_follow(fs.fs_tree(), "/shared_test.bin").expect("resolve");
+    let target_ino = target.inode.objectid;
+    let mut disk_bytenr = 0u64;
+    let mut cursor = fs.search(fs.fs_tree().bytenr, &Key::new(target_ino, 0, 0)).expect("search");
+    while cursor.valid() {
+        let key = cursor.key().expect("key");
+        if key.objectid != target_ino {
+            break;
+        }
+        if key.item_type == luks_core::fs::btrfs::tree::EXTENT_DATA_KEY {
+            let file_ext = FileExtent::parse(key.offset, cursor.data().expect("data")).expect("parse");
+            if file_ext.has_disk_bytes() {
+                disk_bytenr = file_ext.disk_bytenr;
+                break;
+            }
+        }
+        cursor.advance().expect("advance");
+    }
+    assert!(disk_bytenr > 0, "must have found physical disk_bytenr");
+
+    // 3. Locate the extent tree leaf holding the extent
+    let extent_root = fs.tree_root(luks_core::fs::btrfs::tree::EXTENT_TREE_OBJECTID).expect("extent root").bytenr;
+    let (phys, _) = fs.chunk_map().map(extent_root).expect("map extent root");
+    let node_size = fs.superblock().node_size as usize;
+    let metadata_uuid = fs.superblock().metadata_uuid;
+    let csum_type = fs.superblock().csum_type;
+    drop(fs);
+
+    // 4. Read extent leaf, bump refs from 1 to 2, and re-emit
+    let mut img_bytes = fs::read(&img_path).expect("read img");
+    let leaf_raw = img_bytes[phys as usize..phys as usize + node_size].to_vec();
+    let node = luks_core::fs::btrfs::tree::Node::parse(
+        leaf_raw,
+        extent_root,
+        csum_type,
+        &metadata_uuid,
+    )
+    .expect("parse node");
+    let leaf = luks_core::fs::btrfs::write::node::Leaf::from_node(&node, csum_type).expect("from_node");
+
+    let item_idx = leaf
+        .items
+        .iter()
+        .position(|it| it.key.objectid == disk_bytenr && it.key.item_type == luks_core::fs::btrfs::tree::EXTENT_ITEM_KEY)
+        .expect("find extent item");
+
+    let mut mutated_leaf = leaf.clone();
+    mutated_leaf.items[item_idx].data[0..8].copy_from_slice(&2u64.to_le_bytes());
+    let emitted = mutated_leaf.emit(node_size as u32).expect("emit");
+
+    img_bytes[phys as usize..phys as usize + node_size].copy_from_slice(&emitted);
+    fs::write(&img_path, &img_bytes).expect("write img");
+
+    // 5. Mount and verify delete_file is refused with UnsupportedFsFeature
+    let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable");
+    let mut fs = Btrfs::mount(dev).expect("mount");
+
+    let delete_res = fs.delete_file("/shared_test.bin");
+    match delete_res {
+        Err(LuksError::UnsupportedFsFeature(msg)) => {
+            assert!(
+                msg.contains("shared data extents (refs > 1)"),
+                "expected shared data extents refusal, got: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFsFeature on shared extent delete, got: {other:?}"),
+    }
+
     let _ = fs::remove_file(img_path);
 }
