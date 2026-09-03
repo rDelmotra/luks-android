@@ -79,7 +79,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         let disk_num_bytes = if size == 0 {
             0
         } else {
-            ((size + sector_size - 1) / sector_size) * sector_size
+            size.div_ceil(sector_size) * sector_size
         };
 
         if self.active_batch.is_none() {
@@ -224,7 +224,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             if end > total_allocated {
                 let sector_size = self.superblock().sector_size as u64;
                 let needed_more = end - total_allocated;
-                let disk_num_bytes = ((needed_more + sector_size - 1) / sector_size) * sector_size;
+                let disk_num_bytes = needed_more.div_ceil(sector_size) * sector_size;
                 let mut allocated_new = 0u64;
 
                 while allocated_new < disk_num_bytes {

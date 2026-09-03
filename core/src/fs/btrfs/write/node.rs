@@ -105,11 +105,7 @@ impl Leaf {
     /// Free space in bytes available for new item descriptors and data payloads.
     pub fn free_space(&self, node_size: u32) -> usize {
         let used = HEADER_SIZE + (self.items.len() * ITEM_SIZE) + self.total_data_bytes();
-        if used > node_size as usize {
-            0
-        } else {
-            node_size as usize - used
-        }
+        (node_size as usize).saturating_sub(used)
     }
 
     /// Binary search for an item matching `key`.
@@ -350,11 +346,7 @@ impl InteriorNode {
     /// Free space in bytes available for new key pointer entries.
     pub fn free_space(&self, node_size: u32) -> usize {
         let used = HEADER_SIZE + (self.entries.len() * KEY_PTR_SIZE);
-        if used > node_size as usize {
-            0
-        } else {
-            node_size as usize - used
-        }
+        (node_size as usize).saturating_sub(used)
     }
 
     /// Insert a child key pointer into this interior node in sorted key order.

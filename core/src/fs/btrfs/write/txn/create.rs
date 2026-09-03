@@ -24,7 +24,7 @@ impl Transaction {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<Self> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
@@ -277,7 +277,7 @@ impl Transaction {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
@@ -312,7 +312,7 @@ impl Transaction {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         // Check if entry already exists in parent directory

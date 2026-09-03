@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod device;
 pub mod error;

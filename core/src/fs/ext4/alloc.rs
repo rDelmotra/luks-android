@@ -163,7 +163,7 @@ impl<D: WriteAt> Ext4<D> {
                 if sb.group_has_super(group) {
                     let mut meta_blocks = 1 + sb.reserved_gdt_blocks as u32;
                     let desc_bytes = self.groups.len() as u64 * sb.desc_size as u64;
-                    let desc_blocks = (desc_bytes + sb.block_size as u64 - 1) / sb.block_size as u64;
+                    let desc_blocks = desc_bytes.div_ceil(sb.block_size as u64);
                     meta_blocks += desc_blocks as u32;
 
                     for i in 0..meta_blocks {

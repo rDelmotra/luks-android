@@ -21,6 +21,7 @@ use crate::fs::ext4::{self, Ext4};
 use crate::fs::{DirEntry, FileInfo, FileType};
 
 /// A mounted filesystem, whichever one the volume turned out to hold.
+#[allow(clippy::large_enum_variant)]
 pub enum MountedFs<D: ReadAt> {
     Ext4(Ext4<D>),
     Btrfs(Btrfs<D>),

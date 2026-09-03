@@ -53,7 +53,7 @@ impl FreeSpaceMap {
 
         for bg in &extent_tree.block_groups {
             let bg_start = bg.start;
-            let bg_end = bg.start.checked_add(bg.length).ok_or_else(|| {
+            let bg_end = bg.start.checked_add(bg.length).ok_or({
                 LuksError::CorruptFs("block group range overflow")
             })?;
 

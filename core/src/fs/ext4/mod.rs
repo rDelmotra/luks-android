@@ -283,7 +283,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 3 == 0 {
+        while test.is_multiple_of(3) {
             test /= 3;
         }
         if test == 1 {
@@ -291,7 +291,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 5 == 0 {
+        while test.is_multiple_of(5) {
             test /= 5;
         }
         if test == 1 {
@@ -299,7 +299,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 7 == 0 {
+        while test.is_multiple_of(7) {
             test /= 7;
         }
         test == 1

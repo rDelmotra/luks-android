@@ -115,7 +115,7 @@ pub fn find_free_dev_extent(
             if hole_len >= requested_chunk_size {
                 return Ok((cur_offset, requested_chunk_size));
             }
-            if max_hole.map_or(true, |(_, max_len)| hole_len > max_len) {
+            if max_hole.is_none_or(|(_, max_len)| hole_len > max_len) {
                 max_hole = Some((cur_offset, hole_len));
             }
         }
@@ -128,7 +128,7 @@ pub fn find_free_dev_extent(
         if hole_len >= requested_chunk_size {
             return Ok((cur_offset, requested_chunk_size));
         }
-        if max_hole.map_or(true, |(_, max_len)| hole_len > max_len) {
+        if max_hole.is_none_or(|(_, max_len)| hole_len > max_len) {
             max_hole = Some((cur_offset, hole_len));
         }
     }
@@ -237,7 +237,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
         .chunks()
         .iter()
         .find_map(|c| c.stripes.iter().find(|s| s.devid == devid).map(|s| s.dev_uuid))
-        .ok_or_else(|| LuksError::CorruptFs("no existing chunk found for device id"))?;
+        .ok_or(LuksError::CorruptFs("no existing chunk found for device id"))?;
 
     let new_chunk = Chunk::new_single(
         logical,

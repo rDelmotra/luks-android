@@ -24,7 +24,7 @@ impl Transaction {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<Self> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let trimmed = path.trim_matches('/');

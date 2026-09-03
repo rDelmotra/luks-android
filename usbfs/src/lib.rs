@@ -146,6 +146,7 @@ pub trait RawUsbFs: Send + Sync {
 pub struct RealUsbFs;
 
 impl RawUsbFs for RealUsbFs {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn ioctl(&self, fd: RawFd, req: IoctlReq, arg: *mut c_void) -> c_int {
         unsafe { libc::ioctl(fd, req, arg) }
     }
@@ -211,6 +212,12 @@ pub struct UrbArena {
 
 // SAFETY: UrbArena is protected inside Mutex.
 unsafe impl Send for UrbArena {}
+
+impl Default for UrbArena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UrbArena {
     pub fn new() -> Self {
@@ -291,7 +298,7 @@ impl UrbArena {
         }
         // 2. Fallback for test mocks or integer tokens (1-based index)
         let raw_val = reaped as usize;
-        if raw_val >= 1 && raw_val <= MAX_URB_SLOTS {
+        if (1..=MAX_URB_SLOTS).contains(&raw_val) {
             return Some(raw_val - 1);
         }
         None
@@ -689,7 +696,7 @@ impl UsbFsTransport {
                     self.fd,
                     &*self.raw,
                     &self.state,
-                    &mut *arena,
+                    &mut arena,
                     generation,
                     &slot_indices,
                     self.timeout_ms,
@@ -895,7 +902,7 @@ impl UsbFsTransport {
                     self.fd,
                     &*self.raw,
                     &self.state,
-                    &mut *arena,
+                    &mut arena,
                     generation,
                     &slot_indices,
                     self.timeout_ms,
@@ -941,6 +948,7 @@ impl UsbFsTransport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_unreaped(
     fd: RawFd,
     raw: &dyn RawUsbFs,

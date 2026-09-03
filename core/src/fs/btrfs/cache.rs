@@ -141,6 +141,7 @@ impl NodeCache {
     }
 
     /// Clear all cached nodes.
+    #[allow(dead_code)]
     pub(super) fn clear(&self) {
         let mut inner = self.lock();
         inner.nodes.clear();

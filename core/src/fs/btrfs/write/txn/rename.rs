@@ -59,7 +59,7 @@ impl Transaction {
         now_sec: u64,
         now_nsec: u32,
     ) -> Result<Self> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let plan = match resolve_rename(
@@ -280,13 +280,11 @@ fn resolve_rename<D: ReadAt>(
             let mut parent_of_curr = None;
             let ref_search_key = Key::new(curr, INODE_REF_KEY, 0);
             let cursor = fs.search(fs.fs_tree().bytenr, &ref_search_key)?;
-            while cursor.valid() {
+            if cursor.valid() {
                 let k = cursor.key()?;
-                if k.objectid != curr || k.item_type != INODE_REF_KEY {
-                    break;
+                if k.objectid == curr && k.item_type == INODE_REF_KEY {
+                    parent_of_curr = Some(k.offset);
                 }
-                parent_of_curr = Some(k.offset);
-                break;
             }
 
             match parent_of_curr {

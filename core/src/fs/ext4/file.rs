@@ -122,11 +122,13 @@ fn coalesce_extents(extents: &[Extent]) -> Vec<Extent> {
 /// - Depth 1 (single leaf block): at most `(block_size - 12 - 4) / 12` entries:
 ///   - 340 entries on a 4 KiB filesystem (up to 42.5 GiB contiguous, or 1.36 MiB fully fragmented).
 ///   - 84 entries on a 1 KiB filesystem.
+///
 /// These two figures are an arithmetic derivation, not directly measured, but audited
 /// 2026-08-17 (`notes/feature-remediation.md`) and found to be a distinct ceiling from the
 /// measured *directory*-entry ceiling of 203 (4 KiB) / 49 (1 KiB) entries recorded in
 /// `core/tests/statfs.rs::measure_ext4_directory_capacity_ceiling` — do not conflate the two
 /// when updating either.
+///
 /// If fragmentation or size requires more runs than fit in a single leaf block, depth 2
 /// would be required. The writer refuses cleanly and early before block allocation.
 fn runs_from(extents: &[Extent], max_runs: usize) -> Result<Vec<Run>> {
@@ -255,9 +257,7 @@ impl<D: WriteAt> Ext4<D> {
                 }
                 let goal = writer
                     .extents
-                    .iter()
-                    .filter(|e| Some(e.physical) != writer.leaf_block)
-                    .last()
+                    .iter().rfind(|e| Some(e.physical) != writer.leaf_block)
                     .map(|e| e.physical + e.len)
                     .unwrap_or(0);
                 let new_extents = self.alloc_blocks(goal, delta)?;

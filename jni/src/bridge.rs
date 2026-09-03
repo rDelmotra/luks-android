@@ -286,6 +286,7 @@ pub struct Handle {
     payload: Payload,
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum Payload {
     Device(DeviceHandle),
     Volume(VolumeHandle),

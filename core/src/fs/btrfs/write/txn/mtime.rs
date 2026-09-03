@@ -21,7 +21,7 @@ impl Transaction {
         mtime_sec: u64,
         mtime_nsec: u32,
     ) -> Result<Self> {
-        gate::check_writeable_fs(&fs.superblock())?;
+        gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let sb = fs.superblock();
