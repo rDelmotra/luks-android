@@ -105,6 +105,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             .sum();
 
         while total_free_data < disk_num_bytes {
+            self.commit_active_batch()?;
             self.allocate_data_chunk_excluding(&[])?;
             self.active_batch = Some(Batch::open(self)?);
             allocator = self.active_batch.as_ref().unwrap().allocator.clone();
@@ -134,6 +135,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     allocated += chunk_len;
                 }
                 Err(LuksError::FilesystemFull) => {
+                    self.commit_active_batch()?;
                     self.allocate_data_chunk_excluding(&data_runs)?;
                     self.active_batch = Some(Batch::open(self)?);
                     allocator = self.active_batch.as_ref().unwrap().allocator.clone();

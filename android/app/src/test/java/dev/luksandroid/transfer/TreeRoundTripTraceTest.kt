@@ -171,6 +171,8 @@ class TreeRoundTripTraceTest {
             return RecordingWriter()
         }
 
+        override fun beginFile(sizeBytes: Long): FileWriter = beginFileStreaming()
+
         inner class RecordingWriter : FileWriter(0L) {
             private var offset = 0
 

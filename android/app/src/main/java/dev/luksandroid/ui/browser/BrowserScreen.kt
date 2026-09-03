@@ -644,7 +644,9 @@ fun BrowserScreen(
                 if (terminal.type == TransferType.IMPORT &&
                     (code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED)
                 ) {
-                    isSlackLimitReached = true
+                    if (volumeInfo.fsType == "ext4") {
+                        isSlackLimitReached = true
+                    }
                 }
                 val label = when (terminal.type) {
                     TransferType.IMPORT -> "Import"
@@ -795,7 +797,7 @@ fun BrowserScreen(
                 throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "create_directory")
-                if (e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) {
+                if ((e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) && volumeInfo.fsType == "ext4") {
                     isSlackLimitReached = true
                 }
                 newFolderError = "[${e.code}] ${e.message}"

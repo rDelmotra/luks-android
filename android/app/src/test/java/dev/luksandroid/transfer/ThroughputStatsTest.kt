@@ -126,6 +126,7 @@ class ThroughputStatsTest {
         override fun listDir(path: String): List<Entry> = emptyList()
 
         override fun beginFileStreaming(): FileWriter = SlowWriter()
+        override fun beginFile(sizeBytes: Long): FileWriter = SlowWriter()
 
         inner class SlowWriter : FileWriter(0L) {
             override fun write(bytes: ByteArray, offset: Int, length: Int) {

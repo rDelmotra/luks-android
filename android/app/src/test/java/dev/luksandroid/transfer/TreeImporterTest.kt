@@ -143,6 +143,7 @@ class TreeImporterTest {
         val writersCreated = mutableListOf<FakeWriter>()
 
         override fun beginFileStreaming(): FileWriter = FakeWriter().also { writersCreated += it }
+        override fun beginFile(sizeBytes: Long): FileWriter = beginFileStreaming()
 
         inner class FakeWriter : FileWriter(0L) {
             private val buffer = ByteArrayOutputStream()

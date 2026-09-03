@@ -260,7 +260,11 @@ object TreeImporter {
         targetName: String,
         onChunk: (Long) -> Unit,
     ): Long {
-        val writer = volume.beginFileStreaming()
+        val writer = if (entry.sizeBytes >= 0L) {
+            volume.beginFile(entry.sizeBytes)
+        } else {
+            volume.beginFileStreaming()
+        }
         var total = 0L
         try {
             source.open(entry.sourceId).use { input ->
