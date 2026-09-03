@@ -46,6 +46,20 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        // Broadcast receiver for remote diagnostic dumping via `adb shell am broadcast -a dev.luksandroid.DUMP_FORENSIC`
+        val forensicFilter = android.content.IntentFilter("dev.luksandroid.DUMP_FORENSIC")
+        val forensicReceiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                val dump = Trace.dumpForensicLog()
+                android.util.Log.i("LUKS_FORENSIC_DUMP", "\n=== FORENSIC LOG DUMP ===\n$dump\n=== END FORENSIC LOG DUMP ===")
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(forensicReceiver, forensicFilter, android.content.Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(forensicReceiver, forensicFilter)
+        }
+
         setContent {
             LuksTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {

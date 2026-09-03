@@ -202,6 +202,72 @@ fun DiagnosticsScreen(
                 }
             }
         }
+
+        // Forensic Event Log Card
+        var forensicLogText by remember { mutableStateOf<String?>(null) }
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    text = "Forensic Event Trace",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "In-memory 256-slot ring buffer of native USB, SCSI, and Btrfs hardware events (zero filename / zero data exposure).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = {
+                            val dump = dev.luksandroid.Trace.dumpForensicLog()
+                            forensicLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                            android.util.Log.i("LUKS_FORENSIC_DUMP", "\n=== FORENSIC LOG DUMP ===\n$dump\n=== END FORENSIC LOG DUMP ===")
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("View / Refresh Log")
+                    }
+                    Button(
+                        onClick = {
+                            dev.luksandroid.Trace.clearForensicLog()
+                            forensicLogText = "(Log cleared)"
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("Clear")
+                    }
+                }
+                forensicLogText?.let { log ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    ) {
+                        Text(
+                            text = log,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(12.dp),
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 
