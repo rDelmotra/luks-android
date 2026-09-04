@@ -22,6 +22,13 @@ const OP_READ_10: u8 = 0x28;
 const OP_READ_16: u8 = 0x88;
 const OP_READ_CAPACITY_16: u8 = 0x9E;
 const OP_MODE_SENSE_6: u8 = 0x1A;
+/// The 10-byte form, tried when a bridge does not know the 6-byte one. Rarer
+/// on cheap hardware than MODE SENSE(6), so it is the fallback, not the
+/// first attempt.
+const OP_MODE_SENSE_10: u8 = 0x5A;
+/// Caching mode page (SPC/SBC), the one that carries the Write Cache Enable
+/// bit `write_cache_state` asks for.
+const MODE_PAGE_CACHING: u8 = 0x08;
 /// Write opcodes exist only with `dangerous-write-support`. This is the
 /// literal statement of the safety guarantee: without the feature, the byte
 /// `0x2A` is never assembled into a command block, so no build of this crate
@@ -47,6 +54,14 @@ const SA_READ_CAPACITY_16: u8 = 0x10;
 /// READ(10) carries a 16-bit block count and a 32-bit LBA.
 const READ10_MAX_BLOCKS: u64 = 0xFFFF;
 const READ10_MAX_LBA: u64 = 0xFFFF_FFFF;
+
+/// The maximum bytes moved in a single SCSI data phase.
+///
+/// Linux `usb-storage` caps single transfers to 128 KiB (`US_MAX_SECTORS = 240`
+/// or 120 KiB, commonly 128 KiB). Cheap USB flash bridges (e.g. SanDisk) have
+/// limited internal SRAM buffers (typically 128 KiB) and stall the bulk pipe
+/// (`EPIPE` / errno 32) if a single SCSI command requests more.
+pub const MAX_SCSI_TRANSFER: usize = 128 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct InquiryData {
@@ -107,6 +122,7 @@ pub fn opcode_name(op: u8) -> String {
         0x28 => "READ(10)",
         0x2A => "WRITE(10)",
         0x35 => "SYNCHRONIZE CACHE(10)",
+        0x5A => "MODE SENSE(10)",
         0x88 => "READ(16)",
         0x8A => "WRITE(16)",
         0x91 => "SYNCHRONIZE CACHE(16)",
@@ -181,6 +197,65 @@ impl std::fmt::Display for Sense {
     }
 }
 
+/// What MODE SENSE said about the drive's write cache, from the Caching mode
+/// page's Write Cache Enable (WCE) bit.
+///
+/// Three states, not a bool, on purpose. "The device did not answer" and "the
+/// device answered no" are different facts, and collapsing them into a single
+/// `false` is exactly the mistake documented on
+/// [`ScsiBlockDevice::synchronize_cache`]: a rejected command is not
+/// evidence about what it would have said. `Unknown` is returned rather than
+/// guessed whenever MODE SENSE fails, omits the Caching page, or answers with
+/// something too short to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCacheState {
+    /// The Caching mode page's WCE bit was set: the drive reports writes are
+    /// buffered before reaching the medium.
+    Enabled,
+    /// The Caching mode page's WCE bit was clear: the drive reports it has no
+    /// write cache, or writes through immediately.
+    Disabled,
+    /// MODE SENSE did not give a usable answer — rejected outright, or the
+    /// response did not contain a well-formed Caching page.
+    Unknown,
+}
+
+/// Pull the WCE bit (bit 2 of byte 2 of the Caching mode page) out of a MODE
+/// SENSE(6) or MODE SENSE(10) response.
+///
+/// `mode_sense_6` selects which mode parameter header applies: 4 bytes with a
+/// one-byte block descriptor length for the 6-byte form, 8 bytes with a
+/// two-byte block descriptor length for the 10-byte form. The block
+/// descriptor (if any) sits between the header and the first mode page, and
+/// its length is the one thing that differs between drives — skipping the
+/// wrong number of bytes here silently reads the WCE bit from the wrong
+/// place instead of failing, which is why every length here is checked
+/// against what was actually returned before it is trusted.
+fn parse_caching_page_wce(mode_sense_6: bool, data: &[u8]) -> Option<bool> {
+    let header_len = if mode_sense_6 { 4 } else { 8 };
+    if data.len() < header_len {
+        return None;
+    }
+    let block_descriptor_len = if mode_sense_6 {
+        data[3] as usize
+    } else {
+        u16::from_be_bytes([data[6], data[7]]) as usize
+    };
+    let page_start = header_len.checked_add(block_descriptor_len)?;
+    // Need at least 3 bytes of the page itself: page code, page length, and
+    // the byte the WCE bit lives in.
+    let page_end = page_start.checked_add(3)?;
+    if data.len() < page_end {
+        return None;
+    }
+    let page = &data[page_start..];
+    // Bit 7 (PS, "parameters savable") is not part of the page code.
+    if page[0] & 0x3F != MODE_PAGE_CACHING {
+        return None;
+    }
+    Some(page[2] & 0x04 != 0)
+}
+
 /// A USB mass storage device presented as random-access bytes.
 pub struct ScsiBlockDevice<T: BulkTransport> {
     transport: T,
@@ -250,6 +325,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// error that does not name what actually went wrong.
     fn recover<R>(&self, result: Result<R>) -> Result<R> {
         if result.is_err() {
+            crate::forensic::record_scsi(crate::forensic::ScsiEvent::Reset);
             let _ = self.transport.reset();
         }
         result
@@ -260,13 +336,21 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.command_inner(cdb, direction, data, true)
     }
 
+    #[cfg(feature = "dangerous-write-support")]
     fn command_out(&self, cdb: Vec<u8>, data: &[u8]) -> Result<usize> {
         self.command_out_inner(cdb, data, true)
     }
 
+    #[cfg(feature = "dangerous-write-support")]
     fn command_out_inner(&self, cdb: Vec<u8>, data: &[u8], ask_why: bool) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
+        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
+            opcode,
+            tag,
+            data_len: data.len() as u32,
+            dir: "OUT",
+        });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, Direction::Out, cdb);
         let encoded = cbw.encode()?;
 
@@ -288,18 +372,31 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
+        let mut cleared_halt = false;
         while got < CSW_LEN {
-            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-            if n == 0 {
-                self.recover(self.transport.clear_halt(true))?;
-                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-                if n == 0 {
+            match self.transport.read(&mut csw_buf[got..]) {
+                Ok(0) | Err(_) if !cleared_halt => {
+                    // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
+                    // endpoint before/during CSW is standard; clear halt and retry once.
+                    cleared_halt = true;
+                    if let Err(e) = self.transport.clear_halt(true) {
+                        let _ = self.transport.reset();
+                        return Err(e);
+                    }
+                    continue;
+                }
+                Ok(0) => {
+                    let _ = self.transport.reset();
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
-                got += n;
-                continue;
+                Ok(n) => {
+                    got += n;
+                }
+                Err(e) => {
+                    let _ = self.transport.reset();
+                    return Err(e);
+                }
             }
-            got += n;
         }
 
         let csw = CommandStatusWrapper::decode(&csw_buf)?;
@@ -309,10 +406,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         match csw.status {
             CswStatus::Passed => {
                 if csw.data_residue != 0 {
+                    crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                        opcode,
+                        status: "RESIDUE_ERROR",
+                        transferred,
+                        sense_key: None,
+                    });
                     return Err(LuksError::ScsiProtocol(
                         "drive committed less than the full data phase",
                     ));
                 }
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PASSED",
+                    transferred,
+                    sense_key: None,
+                });
                 Ok(transferred)
             }
             CswStatus::Failed => {
@@ -321,9 +430,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 } else {
                     None
                 };
+                let sense_key = sense.as_ref().map(|s| s.key);
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "FAILED",
+                    transferred,
+                    sense_key,
+                });
                 Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PHASE_ERROR",
+                    transferred,
+                    sense_key: None,
+                });
                 let _ = self.transport.reset();
                 Err(LuksError::ScsiProtocol("CSW phase error"))
             }
@@ -342,6 +464,17 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     ) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
+        let dir_str = match direction {
+            Direction::In => "IN",
+            Direction::Out => "OUT",
+            Direction::None => "NONE",
+        };
+        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
+            opcode,
+            tag,
+            data_len: data.len() as u32,
+            dir: dir_str,
+        });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
 
@@ -377,19 +510,31 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         let mut csw_buf = [0u8; CSW_LEN];
         let mut got = 0usize;
+        let mut cleared_halt = false;
         while got < CSW_LEN {
-            let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-            if n == 0 {
-                // A stalled endpoint is the usual cause; clear it and retry once.
-                self.recover(self.transport.clear_halt(true))?;
-                let n = self.recover(self.transport.read(&mut csw_buf[got..]))?;
-                if n == 0 {
+            match self.transport.read(&mut csw_buf[got..]) {
+                Ok(0) | Err(_) if !cleared_halt => {
+                    // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
+                    // endpoint before/during CSW is standard; clear halt and retry once.
+                    cleared_halt = true;
+                    if let Err(e) = self.transport.clear_halt(true) {
+                        let _ = self.transport.reset();
+                        return Err(e);
+                    }
+                    continue;
+                }
+                Ok(0) => {
+                    let _ = self.transport.reset();
                     return Err(LuksError::ScsiProtocol("no CSW"));
                 }
-                got += n;
-                continue;
+                Ok(n) => {
+                    got += n;
+                }
+                Err(e) => {
+                    let _ = self.transport.reset();
+                    return Err(e);
+                }
             }
-            got += n;
         }
 
         let csw = CommandStatusWrapper::decode(&csw_buf)?;
@@ -409,10 +554,22 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 // with no log line pointing anywhere. BOT requires the host
                 // to honour this field; here that means failing loudly.
                 if matches!(direction, Direction::Out) && csw.data_residue != 0 {
+                    crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                        opcode,
+                        status: "RESIDUE_ERROR",
+                        transferred,
+                        sense_key: None,
+                    });
                     return Err(LuksError::ScsiProtocol(
                         "drive committed less than the full data phase",
                     ));
                 }
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PASSED",
+                    transferred,
+                    sense_key: None,
+                });
                 Ok(transferred)
             }
             CswStatus::Failed => {
@@ -427,11 +584,24 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 } else {
                     None
                 };
+                let sense_key = sense.as_ref().map(|s| s.key);
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "FAILED",
+                    transferred,
+                    sense_key,
+                });
                 Err(LuksError::ScsiCommandFailed { opcode, sense })
             }
             CswStatus::PhaseError => {
                 // Best-effort, like `recover`: a reset failure must not mask
                 // the phase error that caused it.
+                crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                    opcode,
+                    status: "PHASE_ERROR",
+                    transferred,
+                    sense_key: None,
+                });
                 let _ = self.transport.reset();
                 Err(LuksError::ScsiProtocol("phase error"))
             }
@@ -592,6 +762,67 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         Ok(buf[2] & 0x80 != 0)
     }
 
+    /// MODE SENSE(6) for the Caching mode page (0x08), truncated to whatever
+    /// the drive actually sent.
+    fn mode_sense_6_caching(&self) -> Result<Vec<u8>> {
+        let mut cdb = vec![0u8; 6];
+        cdb[0] = OP_MODE_SENSE_6;
+        cdb[2] = MODE_PAGE_CACHING;
+        cdb[4] = u8::MAX; // allocation length: the 6-byte form's field is one byte
+        let mut buf = vec![0u8; u8::MAX as usize];
+        let n = self.command(cdb, Direction::In, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// The 10-byte fallback, for a bridge that answers MODE SENSE(10) but not
+    /// the 6-byte form.
+    fn mode_sense_10_caching(&self) -> Result<Vec<u8>> {
+        let mut cdb = vec![0u8; 10];
+        cdb[0] = OP_MODE_SENSE_10;
+        cdb[2] = MODE_PAGE_CACHING;
+        let alloc: u16 = 512;
+        cdb[7..9].copy_from_slice(&alloc.to_be_bytes());
+        let mut buf = vec![0u8; alloc as usize];
+        let n = self.command(cdb, Direction::In, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Ask the drive whether MODE SENSE(6)/(10) had anything to say about the
+    /// Caching mode page.
+    ///
+    /// This is a different command from `synchronize_cache` — MODE SENSE, not
+    /// SYNCHRONIZE CACHE — so a bridge that rejects the flush opcode outright
+    /// may still answer this one honestly. It exists to let a human find out
+    /// what hardware actually reports; it does not feed back into
+    /// `synchronize_cache` or `no_flush_command`, and it changes nothing about
+    /// the write path. Not behind the write feature, for the same reason as
+    /// `is_write_protected`: a read-only query about the drive's own
+    /// capabilities is exactly the kind of thing a build that cannot write is
+    /// still allowed to ask.
+    pub fn write_cache_state(&self) -> WriteCacheState {
+        if let Ok(data) = self.mode_sense_6_caching() {
+            if let Some(wce) = parse_caching_page_wce(true, &data) {
+                return if wce {
+                    WriteCacheState::Enabled
+                } else {
+                    WriteCacheState::Disabled
+                };
+            }
+        }
+        if let Ok(data) = self.mode_sense_10_caching() {
+            if let Some(wce) = parse_caching_page_wce(false, &data) {
+                return if wce {
+                    WriteCacheState::Enabled
+                } else {
+                    WriteCacheState::Disabled
+                };
+            }
+        }
+        WriteCacheState::Unknown
+    }
+
     /// Ask the drive which write opcodes it will accept, **without writing
     /// anything**.
     ///
@@ -648,12 +879,34 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// If neither exists, this returns `Ok` and stops asking. That is a real
     /// weakening of a guarantee this crate argues for elsewhere, so it is
     /// stated plainly rather than buried: **on such a drive a completed write
-    /// is not known to be on the medium.** The reasoning for proceeding
-    /// anyway is that SBC requires a device with no write cache to reject the
-    /// command exactly this way, so "refuses to flush" is the same answer as
-    /// "has nothing to flush" — and the alternative is refusing to write at
-    /// all to hardware the kernel writes to happily. [`flush_is_a_no_op`]
-    /// exposes which case a caller is in.
+    /// is not known to be on the medium.**
+    ///
+    /// The honest justification for proceeding anyway is not a spec argument.
+    /// SBC does not require a device with no write cache to reject
+    /// SYNCHRONIZE CACHE this way — a device that genuinely has no cache
+    /// should answer GOOD, since flushing nothing is a trivially satisfied
+    /// no-op. INVALID COMMAND OPERATION CODE says only "I do not implement
+    /// this opcode"; it says nothing about whether writes are being buffered.
+    /// Cheap USB bridges commonly speak a reduced SCSI command set that omits
+    /// SYNCHRONIZE CACHE entirely while still buffering writes in controller
+    /// RAM, so "refuses to flush" and "has nothing to flush" are not the same
+    /// answer, and treating them as equivalent would be a guess dressed up as
+    /// a spec citation.
+    ///
+    /// What actually justifies this is that there is no better option, and
+    /// the Linux kernel takes the identical position on the identical
+    /// hardware: `sd_sync_cache()` treats this exact sense code (ILLEGAL
+    /// REQUEST / INVALID COMMAND OPERATION CODE) from a USB or ATA bridge as
+    /// "this device cannot flush" and carries on rather than failing every
+    /// write to it (kernel commit "scsi: sd: dont fail if the device doesnt
+    /// recognize SYNCHRONIZE CACHE"). The kernel writes to hardware like this
+    /// every day; refusing to would make this crate more conservative than
+    /// the OS it runs under, for no safety actually gained. The risk this
+    /// leaves is real and drive-dependent — data written just before a power
+    /// loss or a yanked cable can be lost on a bridge with volatile
+    /// write-back RAM and no way to ask it to flush — and this function does
+    /// not paper over that. It records the fact instead: [`flush_is_a_no_op`]
+    /// lets a caller find out which case it is in.
     ///
     /// Only an *invalid opcode* is treated this way. A flush that fails for
     /// any other reason is still an error: "this drive cannot flush" and "this
@@ -722,9 +975,10 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        // Per-command block count is bounded by the transport's transfer limit
-        // and by what the CDB can express.
-        let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+        // Per-command block count is bounded by the transport's transfer limit,
+        // the safe SCSI transfer cap (128 KiB), and what the CDB can express.
+        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
+        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
         let mut chunk = vec![0u8; (max_blocks * bs) as usize];
@@ -785,7 +1039,8 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        let max_blocks = (self.transport.max_transfer() as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
+        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
         while done < buf.len() {

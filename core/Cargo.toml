@@ -66,3 +66,53 @@ dangerous-write-support = []
 
 # [profile.release] moved to the workspace root Cargo.toml — Cargo ignores
 # profile settings in non-root members and warns about them.
+
+[[example]]
+name = "write_btrfs_to_drive"
+required-features = ["dangerous-write-support"]
+
+[[example]]
+name = "space_probe"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_controls"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_mkdir"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_rename"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_unknown"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_crash_safety"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_inode_patch"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_mkdir"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_rename"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_streaming_unknown"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "statfs"
+required-features = ["dangerous-write-support"]
+
+

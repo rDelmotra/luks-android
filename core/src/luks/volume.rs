@@ -243,7 +243,7 @@ impl<D: crate::device::WriteAt> LuksVolume<D> {
         let mut at = offset;
         let mut done = 0usize;
 
-        if at % sector != 0 {
+        if !at.is_multiple_of(sector) {
             let first = ((sector - at % sector) as usize).min(buf.len());
             self.write_at_chunk(at, &buf[..first])?;
             at += first as u64;

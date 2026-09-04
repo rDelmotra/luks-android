@@ -14,6 +14,16 @@ pub use detect::{detect, FsKind};
 pub use ext4::Ext4;
 pub use mounted::{MountedFs, OpenFile};
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StatFs {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub available_bytes: u64,
+    pub total_inodes: u64,
+    pub free_inodes: u64,
+    pub block_size: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Regular,
@@ -51,6 +61,14 @@ pub struct DirEntry {
     /// a folder and something the user may know as a separate mount or a
     /// snapshot they cannot write to.
     pub is_subvolume: bool,
+    /// Bytes, as reported by the entry's own inode. Zero for a subvolume: its
+    /// location field is a tree id, not an inode in the listing directory's
+    /// tree, so reading it as one would land on an unrelated file.
+    pub size: u64,
+    /// Seconds since the Unix epoch. Zero if the inode could not be read —
+    /// this is metadata that decorates a listing, not something a corrupt
+    /// entry should be allowed to fail the whole directory over.
+    pub mtime: i64,
 }
 
 #[derive(Debug, Clone)]

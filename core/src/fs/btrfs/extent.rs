@@ -137,6 +137,15 @@ impl FileExtent {
             || self.kind == ExtentKind::Prealloc
     }
 
+    /// Whether this extent occupies real disk blocks that should be freed
+    /// when the owning file is deleted. Unlike `is_zeros()` (which is correct
+    /// for *reading* — prealloc extents should read as zeros), this predicate
+    /// is correct for *freeing*: a Prealloc extent has a real `disk_bytenr`
+    /// that must be returned to the allocator.
+    pub fn has_disk_bytes(&self) -> bool {
+        self.kind != ExtentKind::Inline && self.disk_bytenr > 0 && self.disk_num_bytes > 0
+    }
+
     pub fn is_compressed(&self) -> bool {
         self.compression != 0
     }

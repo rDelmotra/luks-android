@@ -62,6 +62,15 @@ data class VolumeInfo(
     val subvolumes: List<SubvolumeInfo>,
 )
 
+data class StatFsInfo(
+    val totalBytes: Long,
+    val freeBytes: Long,
+    val availableBytes: Long,
+    val totalInodes: Long,
+    val freeInodes: Long,
+    val blockSize: Int,
+)
+
 /**
  * A btrfs subvolume: a separate filesystem tree inside the same filesystem.
  * [path] is where it appears when browsing from the top level, so it can be
@@ -78,10 +87,34 @@ data class SubvolumeInfo(
  * [isSubvolume] marks a btrfs subvolume boundary. It is still a directory and
  * opens like one; the flag exists because it is a different tree underneath,
  * and may be a read-only snapshot.
+ *
+ * [size] and [mtime] are zero for a subvolume, and zero (rather than absent)
+ * if the native side could not read the entry's inode — a listing degrades
+ * a bad entry to unknown metadata instead of failing outright.
  */
-data class Entry(val name: String, val type: String, val isSubvolume: Boolean = false) {
+data class Entry(
+    val name: String,
+    val type: String,
+    val isSubvolume: Boolean = false,
+    val size: Long = 0,
+    val mtime: Long = 0,
+) {
     val isDir: Boolean get() = type == "dir"
 }
+
+data class FileInfo(
+    val path: String,
+    val size: Long,
+    val mode: Int,
+    val uid: Int,
+    val gid: Int,
+    val links: Int,
+    val type: String,
+    val atime: Long,
+    val mtime: Long,
+    val ctime: Long,
+)
+
 
 /** A drive that has been identified but not decrypted. */
 class LuksDevice internal constructor(
@@ -90,10 +123,27 @@ class LuksDevice internal constructor(
     private val usbInterface: UsbInterface,
 ) : AutoCloseable {
 
-    val info: DeviceInfo = parseDeviceInfo(LuksNative.nativeDeviceInfo(handle))
+    val info: DeviceInfo = if (handle == 0L) {
+        DeviceInfo("", "", 512, 0L, "", emptyList(), null)
+    } else {
+        parseDeviceInfo(LuksNative.nativeDeviceInfo(handle))
+    }
 
     /** Partitions carrying a LUKS header, found by probing, not by type GUID. */
     val luksPartitions: List<PartitionInfo> get() = info.partitions.filter { it.isLuks }
+
+    /**
+     * False once [close] has run (native handle zeroed) — including a close
+     * triggered from outside this object, e.g. [dev.luksandroid.session.SessionController]
+     * tearing down the device it took ownership of at unlock time.
+     *
+     * Callers that cache a [LuksDevice] across a lock/unlock cycle (the
+     * devices screen does, so it doesn't have to re-enumerate USB every time)
+     * must check this before reusing the instance: a locked session has
+     * already released the USB interface underneath it, so every native call
+     * on a closed handle fails immediately rather than reopening anything.
+     */
+    val isOpen: Boolean get() = handle != 0L
 
     /**
      * Derives the master key and mounts the filesystem inside [partitionOffset].
@@ -159,7 +209,9 @@ class LuksDevice internal constructor(
         // releasing the interface or closing the connection first would leave
         // Rust holding a descriptor the kernel may have reissued.
         if (handle != 0L) {
-            LuksNative.nativeCloseDevice(handle)
+            try {
+                LuksNative.nativeCloseDevice(handle)
+            } catch (_: UnsatisfiedLinkError) {}
             handle = 0
         }
         runCatching { connection.releaseInterface(usbInterface) }
@@ -168,32 +220,43 @@ class LuksDevice internal constructor(
 }
 
 /** An unlocked volume with a mounted filesystem. */
-class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
+open class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
     private val activeWriters = mutableSetOf<FileWriter>()
 
-    val info: VolumeInfo = JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
-        val subvols = it.optJSONArray("subvolumes")
+    open val info: VolumeInfo = if (handle == 0L) {
         VolumeInfo(
-            // A volume with no label reports JSON null, and optString would
-            // turn that into the literal text "null" on screen.
-            label = if (it.isNull("label")) "" else it.optString("label"),
-            uuid = it.optString("uuid"),
-            blockSize = it.optInt("blockSize"),
-            sizeBytes = it.optLong("sizeBytes"),
-            fsType = it.optString("fsType"),
-            subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
-                val s = subvols!!.getJSONObject(i)
-                SubvolumeInfo(
-                    id = s.optLong("id"),
-                    name = s.optString("name"),
-                    path = s.optString("path"),
-                    readOnly = s.optBoolean("readOnly"),
-                )
-            },
+            label = "",
+            uuid = "",
+            blockSize = 4096,
+            sizeBytes = 0L,
+            fsType = "ext4",
+            subvolumes = emptyList(),
         )
+    } else {
+        JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
+            val subvols = it.optJSONArray("subvolumes")
+            VolumeInfo(
+                // A volume with no label reports JSON null, and optString would
+                // turn that into the literal text "null" on screen.
+                label = if (it.isNull("label")) "" else it.optString("label"),
+                uuid = it.optString("uuid"),
+                blockSize = it.optInt("blockSize"),
+                sizeBytes = it.optLong("sizeBytes"),
+                fsType = it.optString("fsType"),
+                subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
+                    val s = subvols!!.getJSONObject(i)
+                    SubvolumeInfo(
+                        id = s.optLong("id"),
+                        name = s.optString("name"),
+                        path = s.optString("path"),
+                        readOnly = s.optBoolean("readOnly"),
+                    )
+                },
+            )
+        }
     }
 
-    fun listDir(path: String): List<Entry> {
+    open fun listDir(path: String): List<Entry> {
         check(handle != 0L) { "volume is closed" }
         val entries = JSONObject(LuksNative.nativeListDir(handle, path)).getJSONArray("entries")
         return (0 until entries.length()).map { i ->
@@ -202,16 +265,51 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
                 e.getString("name"),
                 e.getString("type"),
                 e.optBoolean("isSubvolume"),
+                e.optLong("size"),
+                e.optLong("mtime"),
             )
         }
     }
 
-    fun fileSize(path: String): Long {
+    open fun listDirPaged(path: String, offset: Long, limit: Long): List<Entry> {
+        check(handle != 0L) { "volume is closed" }
+        val entries = JSONObject(LuksNative.nativeListDirPaged(handle, path, offset, limit)).getJSONArray("entries")
+        return (0 until entries.length()).map { i ->
+            val e = entries.getJSONObject(i)
+            Entry(
+                e.getString("name"),
+                e.getString("type"),
+                e.optBoolean("isSubvolume"),
+                e.optLong("size"),
+                e.optLong("mtime"),
+            )
+        }
+    }
+
+    open fun fileSize(path: String): Long {
         check(handle != 0L) { "volume is closed" }
         return JSONObject(LuksNative.nativeFileInfo(handle, path)).getLong("size")
     }
 
-    fun readFile(path: String, maxBytes: Long = 4L * 1024 * 1024): ByteArray {
+    open fun fileInfo(path: String): FileInfo {
+        check(handle != 0L) { "volume is closed" }
+        val obj = JSONObject(LuksNative.nativeFileInfo(handle, path))
+        return FileInfo(
+            path = obj.optString("path", path),
+            size = obj.optLong("size", 0L),
+            mode = obj.optInt("mode", 0),
+            uid = obj.optInt("uid", 0),
+            gid = obj.optInt("gid", 0),
+            links = obj.optInt("links", 0),
+            type = obj.optString("type", ""),
+            atime = obj.optLong("atime", 0L),
+            mtime = obj.optLong("mtime", 0L),
+            ctime = obj.optLong("ctime", 0L),
+        )
+    }
+
+
+    open fun readFile(path: String, maxBytes: Long = 4L * 1024 * 1024): ByteArray {
         check(handle != 0L) { "volume is closed" }
         return LuksNative.nativeReadFile(handle, path, maxBytes)
     }
@@ -224,15 +322,18 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
      * the whole thing as a Java `byte[]`, which the app heap will not survive
      * for a multi-gigabyte file.
      */
-    fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+    open fun readChunk(path: String, offset: Long, len: Int): ByteArray {
         check(handle != 0L) { "volume is closed" }
         return LuksNative.nativeReadChunk(handle, path, offset, len)
     }
 
+    open fun readChunk(path: String, offset: Long, len: Long): ByteArray =
+        readChunk(path, offset, len.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+
     /** [sha256] result: digest plus the throughput it was measured at. */
     data class Digest(val sha256: String, val bytes: Long, val elapsedMs: Long, val bytesPerSec: Long)
 
-    fun sha256(path: String, chunkBytes: Int = 0): Digest {
+    open fun sha256(path: String, chunkBytes: Int = 0): Digest {
         check(handle != 0L) { "volume is closed" }
         val j = JSONObject(LuksNative.nativeSha256(handle, path, chunkBytes))
         return Digest(
@@ -251,7 +352,7 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
      * specific reason as a [LuksException]. This only answers "does the code
      * to try even exist here".
      */
-    val canWrite: Boolean get() = LuksNative.nativeWriteSupported()
+    open val canWrite: Boolean get() = LuksNative.nativeWriteSupported()
 
     /**
      * Creates [name] in the volume's root directory holding [data], returning
@@ -264,18 +365,46 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
      * Blocking: this is the whole write, including the flush through the USB
      * bridge. Off the main thread, same as [unlock].
      */
-    fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
+    open fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
         check(handle != 0L) { "volume is closed" }
         return LuksNative.nativeWriteFile(handle, parentPath, name, data)
     }
 
-    fun deleteFile(path: String) {
-        check(handle != 0L) { "volume is closed" }
+    open fun deleteFile(path: String) {
+        if (handle == 0L) throw IllegalStateException("volume is closed")
         LuksNative.nativeDeleteFile(handle, path)
     }
 
+    open fun commitActiveBatch() {
+        if (handle == 0L) throw IllegalStateException("volume is closed")
+        LuksNative.nativeCommitActiveBatch(handle)
+    }
+
+    open fun createDirectory(parentPath: String, name: String): Long {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeCreateDirectory(handle, parentPath, name)
+    }
+
+    open fun rename(oldParent: String, oldName: String, newParent: String, newName: String) {
+        check(handle != 0L) { "volume is closed" }
+        LuksNative.nativeRename(handle, oldParent, oldName, newParent, newName)
+    }
+
+    open fun statFs(): StatFsInfo {
+        check(handle != 0L) { "volume is closed" }
+        val o = JSONObject(LuksNative.nativeStatFs(handle))
+        return StatFsInfo(
+            totalBytes = o.getLong("totalBytes"),
+            freeBytes = o.getLong("freeBytes"),
+            availableBytes = o.getLong("availableBytes"),
+            totalInodes = o.getLong("totalInodes"),
+            freeInodes = o.getLong("freeInodes"),
+            blockSize = o.getInt("blockSize"),
+        )
+    }
+
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
-    fun beginFile(sizeBytes: Long): FileWriter {
+    open fun beginFile(sizeBytes: Long): FileWriter {
         check(handle != 0L) { "volume is closed" }
         check(sizeBytes >= 0) { "negative file size" }
         val writer = FileWriter(LuksNative.nativeBeginFile(handle, sizeBytes))
@@ -283,8 +412,31 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
         return writer
     }
 
-    inner class FileWriter internal constructor(private var writerHandle: Long) : AutoCloseable {
-        fun write(data: java.nio.ByteBuffer, len: Int = data.remaining()) {
+    /**
+     * Sibling of [beginFile] with no upfront size -- for a streaming write whose total
+     * length is not known before the first chunk arrives. Same semantics otherwise:
+     * fixed-memory, and closing without [FileWriter.finish] rolls it back.
+     */
+    open fun beginFileStreaming(): FileWriter {
+        check(handle != 0L) { "volume is closed" }
+        val writer = FileWriter(LuksNative.nativeBeginFileStreaming(handle))
+        activeWriters += writer
+        return writer
+    }
+
+    open fun writeChunk(writer: FileWriter, data: ByteArray, offset: Int = 0, length: Int = data.size) {
+        writer.write(data, offset, length)
+    }
+
+    open fun finishFile(writer: FileWriter, parentPath: String, name: String): Long =
+        writer.finish(parentPath, name)
+
+    open fun abandonFile(writer: FileWriter) {
+        writer.abandon()
+    }
+
+    open inner class FileWriter internal constructor(private var writerHandle: Long = 0L) : AutoCloseable {
+        open fun write(data: java.nio.ByteBuffer, len: Int = data.remaining()) {
             check(writerHandle != 0L) { "writer is closed" }
             check(handle != 0L) { "volume is closed" }
             require(data.isDirect) { "buffer must be direct" }
@@ -292,18 +444,47 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
             LuksNative.nativeWriteChunk(handle, writerHandle, data, len)
         }
 
-        fun finish(parentPath: String, name: String): Long {
-            check(writerHandle != 0L) { "writer is closed" }
-            check(handle != 0L) { "volume is closed" }
-            val result = LuksNative.nativeFinishFile(handle, writerHandle, parentPath, name)
-            writerHandle = 0
-            activeWriters -= this
-            return result
+        // Reused across every chunk this writer streams, not reallocated per
+        // call: a directory import can stream thousands of chunks through one
+        // FileWriter's whole lifetime (one writer per file, many chunks per
+        // writer), and allocating a fresh off-heap ByteBuffer for each one is
+        // real, measurable overhead that single-file import never pays --
+        // it reads straight into one direct buffer for the file's duration.
+        // Grown, never shrunk, so a later larger chunk (should not happen at
+        // today's fixed chunk size, but this must not silently truncate if it
+        // ever does) still fits.
+        private var scratch: java.nio.ByteBuffer? = null
+
+        open fun write(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size) {
+            require(offset >= 0 && length >= 0 && offset + length <= bytes.size) { "invalid slice bounds" }
+            val buf = scratch.let { existing ->
+                if (existing != null && existing.capacity() >= length) existing
+                else java.nio.ByteBuffer.allocateDirect(length).also { scratch = it }
+            }
+            buf.clear()
+            buf.put(bytes, offset, length)
+            buf.flip()
+            write(buf, length)
         }
 
-        override fun close() {
+        open fun finish(parentPath: String, name: String): Long {
+            check(writerHandle != 0L) { "writer is closed" }
+            check(handle != 0L) { "volume is closed" }
+            val wh = writerHandle
+            writerHandle = 0
+            activeWriters -= this
+            return LuksNative.nativeFinishFile(handle, wh, parentPath, name)
+        }
+
+        open fun abandon() {
+            close()
+        }
+
+        open override fun close() {
             if (writerHandle != 0L && handle != 0L) {
-                LuksNative.nativeCloseWriter(handle, writerHandle)
+                try {
+                    LuksNative.nativeCloseWriter(handle, writerHandle)
+                } catch (_: UnsatisfiedLinkError) {}
             }
             writerHandle = 0
             activeWriters -= this
@@ -311,10 +492,12 @@ class LuksVolume internal constructor(private var handle: Long) : AutoCloseable 
     }
 
     /** Dropping this zeroes the master key held on the Rust side. */
-    override fun close() {
+    open override fun close() {
         if (handle != 0L) {
             activeWriters.toList().forEach { it.close() }
-            LuksNative.nativeCloseVolume(handle)
+            try {
+                LuksNative.nativeCloseVolume(handle)
+            } catch (_: UnsatisfiedLinkError) {}
             handle = 0
         }
     }
@@ -351,3 +534,16 @@ fun formatSize(bytes: Long): String = when {
     bytes >= 1L shl 10 -> "%.1f KiB".format(bytes.toDouble() / (1L shl 10))
     else -> "$bytes B"
 }
+
+fun formatTimestamp(epochSeconds: Long): String {
+    if (epochSeconds <= 0L) return ""
+    return try {
+        val instant = java.time.Instant.ofEpochSecond(epochSeconds)
+        val zone = java.time.ZoneId.systemDefault()
+        val formatter = java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+        formatter.format(instant.atZone(zone))
+    } catch (_: Exception) {
+        ""
+    }
+}
+

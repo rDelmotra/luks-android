@@ -140,6 +140,14 @@ impl NodeCache {
         (inner.hits, inner.misses)
     }
 
+    /// Clear all cached nodes.
+    #[allow(dead_code)]
+    pub(super) fn clear(&self) {
+        let mut inner = self.lock();
+        inner.nodes.clear();
+        inner.order.clear();
+    }
+
     /// A poisoned cache is recoverable: the worst a panic mid-update can leave
     /// behind is a stale entry or a missing one, and both merely cost a reread.
     /// Propagating the poison would turn an unrelated panic in one thread into

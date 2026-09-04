@@ -27,6 +27,8 @@
 //! by name. Our own reader is never the judge.
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use luks_core::device::FileDevice;
 use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
@@ -385,10 +387,9 @@ fn tool(which: &str) -> Option<String> {
     if !std::path::Path::new(&script).exists() {
         return None;
     }
-    Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(script)
+    if !common::oracle::gate() {
+        return None;
+    }
+
+    Some(script)
 }

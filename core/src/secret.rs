@@ -90,4 +90,15 @@ mod tests {
         let s: Secret = serde_json::from_str("\"aGVsbG8=\"").unwrap();
         assert_eq!(s.expose(), b"hello");
     }
+
+    // N.7 (`notes/feature-remediation.md` §4): the test that proves
+    // `ZeroizeOnDrop` actually scrubs `Secret`'s backing bytes — as opposed
+    // to merely asserting a mock's `.close()` was called, which is the
+    // failure this item exists to correct — lives in
+    // `core/tests/secret_zeroize.rs`, not here. It needs a small amount of
+    // `unsafe` (a `#[global_allocator]` hook that snapshots a watched
+    // allocation's contents at `dealloc` time), and this crate is
+    // `#![forbid(unsafe_code)]` (see `core/src/lib.rs`); an external
+    // integration-test crate is not bound by that attribute, so that is
+    // where the proof has to live.
 }

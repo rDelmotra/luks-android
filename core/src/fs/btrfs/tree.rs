@@ -19,10 +19,9 @@ use crate::error::{LuksError, Result};
 
 /// Bytes before the first item descriptor or key pointer.
 pub const HEADER_SIZE: usize = 101;
-/// `key (17) + offset (4) + size (4)`.
-const ITEM_SIZE: usize = 25;
+pub const ITEM_SIZE: usize = 25;
 /// `key (17) + blockptr (8) + generation (8)`.
-const KEY_PTR_SIZE: usize = 33;
+pub const KEY_PTR_SIZE: usize = 33;
 /// `objectid (8) + type (1) + offset (8)`.
 pub const KEY_SIZE: usize = 17;
 
@@ -43,17 +42,67 @@ pub const ROOT_ITEM_KEY: u8 = 132;
 pub const ROOT_BACKREF_KEY: u8 = 144;
 /// The mirror of [`ROOT_BACKREF_KEY`], filed under the parent.
 pub const ROOT_REF_KEY: u8 = 156;
+pub const EXTENT_ITEM_KEY: u8 = 168;
+pub const METADATA_ITEM_KEY: u8 = 169;
+pub const TREE_BLOCK_REF_KEY: u8 = 176;
+pub const EXTENT_DATA_REF_KEY: u8 = 178;
+pub const SHARED_BLOCK_REF_KEY: u8 = 182;
+pub const SHARED_DATA_REF_KEY: u8 = 184;
+pub const BLOCK_GROUP_ITEM_KEY: u8 = 192;
+pub const FREE_SPACE_INFO_KEY: u8 = 198;
+pub const FREE_SPACE_EXTENT_KEY: u8 = 199;
+pub const FREE_SPACE_BITMAP_KEY: u8 = 200;
+pub const DEV_EXTENT_KEY: u8 = 204;
 pub const DEV_ITEM_KEY: u8 = 216;
 pub const CHUNK_ITEM_KEY: u8 = 228;
+
+/// A human name for an item type, for errors that would otherwise describe a
+/// bare number.
+///
+/// `RULES.md`: *an error about an operation must name the operation.* A
+/// capacity failure that says only "an item did not fit" leaves the reader to
+/// supply which item from context, and context is exactly what was wrong the
+/// last two times this project chased a misattributed error.
+pub fn item_type_name(item_type: u8) -> &'static str {
+    match item_type {
+        INODE_ITEM_KEY => "inode item",
+        INODE_REF_KEY => "inode ref",
+        XATTR_ITEM_KEY => "xattr item",
+        DIR_ITEM_KEY => "directory item",
+        DIR_INDEX_KEY => "directory index",
+        EXTENT_DATA_KEY => "file extent item",
+        EXTENT_CSUM_KEY => "checksum item",
+        ROOT_ITEM_KEY => "root item",
+        ROOT_BACKREF_KEY => "root backref",
+        ROOT_REF_KEY => "root ref",
+        EXTENT_ITEM_KEY => "extent item",
+        METADATA_ITEM_KEY => "metadata item",
+        TREE_BLOCK_REF_KEY => "tree block ref",
+        EXTENT_DATA_REF_KEY => "extent data ref",
+        SHARED_BLOCK_REF_KEY => "shared block ref",
+        SHARED_DATA_REF_KEY => "shared data ref",
+        BLOCK_GROUP_ITEM_KEY => "block group item",
+        FREE_SPACE_INFO_KEY => "free space info",
+        FREE_SPACE_EXTENT_KEY => "free space extent",
+        FREE_SPACE_BITMAP_KEY => "free space bitmap",
+        DEV_EXTENT_KEY => "device extent",
+        DEV_ITEM_KEY => "device item",
+        CHUNK_ITEM_KEY => "chunk item",
+        _ => "tree item",
+    }
+}
 
 // --- objectids we name -----------------------------------------------------
 pub const DEV_ITEMS_OBJECTID: u64 = 1;
 pub const ROOT_TREE_OBJECTID: u64 = 1;
+pub const EXTENT_TREE_OBJECTID: u64 = 2;
+pub const CHUNK_TREE_OBJECTID: u64 = 3;
+pub const DEV_TREE_OBJECTID: u64 = 4;
 pub const FS_TREE_OBJECTID: u64 = 5;
-pub const CSUM_TREE_OBJECTID: u64 = 7;
-/// The root tree's own directory, which holds exactly one entry: `default`,
-/// naming the subvolume a plain `mount` shows.
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
+pub const CSUM_TREE_OBJECTID: u64 = 7;
+pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
+pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
 /// The objectid every `EXTENT_CSUM` item is filed under: `-10` as a `u64`.
 /// btrfs reserves the top of the objectid space by counting down, so this sorts
@@ -199,6 +248,30 @@ impl Node {
         self.level == 0
     }
 
+    pub fn bytenr(&self) -> u64 {
+        u64le(&self.raw, 48)
+    }
+
+    pub fn flags(&self) -> u64 {
+        u64le(&self.raw, 56)
+    }
+
+    pub fn metadata_uuid(&self) -> [u8; 16] {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(&self.raw[32..48]);
+        u
+    }
+
+    pub fn chunk_tree_uuid(&self) -> [u8; 16] {
+        let mut u = [0u8; 16];
+        u.copy_from_slice(&self.raw[64..80]);
+        u
+    }
+
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
     /// Key of entry `i`, in either kind of node.
     pub fn key(&self, i: usize) -> Result<Key> {
         if i >= self.nr_items {
@@ -276,6 +349,9 @@ impl Node {
     /// a corruption case: searching for `(inode, DIR_INDEX, 0)` in a tree whose
     /// first key is higher is an ordinary way to start a directory scan.
     pub fn child_for(&self, key: &Key) -> Result<usize> {
+        if self.nr_items == 0 {
+            return Err(LuksError::CorruptFs("btrfs interior node has no child pointers"));
+        }
         let bound = self.lower_bound(key)?;
         if bound < self.nr_items && self.key(bound)? == *key {
             return Ok(bound);

@@ -11,9 +11,11 @@
 
 #![forbid(unsafe_code)]
 #![warn(clippy::all)]
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod device;
 pub mod error;
+pub mod forensic;
 pub mod fs;
 pub mod luks;
 pub mod partition;

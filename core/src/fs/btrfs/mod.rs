@@ -35,8 +35,10 @@ pub mod inode;
 pub mod subvol;
 pub mod superblock;
 pub mod tree;
+#[cfg(feature = "dangerous-write-support")]
+pub mod write;
 
-pub use chunk::{Chunk, ChunkMap};
+pub use chunk::{Chunk, ChunkMap, DevExtent, Stripe};
 pub use csum::Verified;
 pub use cursor::Cursor;
 pub use dir::Located;
@@ -105,6 +107,10 @@ pub struct Btrfs<D: ReadAt> {
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
     nodes: cache::NodeCache,
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) active_batch: Option<write::Batch>,
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) has_open_writer: bool,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -141,11 +147,19 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            #[cfg(feature = "dangerous-write-support")]
+            active_batch: None,
+            #[cfg(feature = "dangerous-write-support")]
+            has_open_writer: false,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
         fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
         fs.csum_tree = csum::load(&fs);
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Mount {
+            generation: fs.sb.generation,
+            root_bytenr: fs.fs_tree.bytenr,
+        });
         Ok(fs)
     }
 
@@ -201,6 +215,12 @@ impl<D: ReadAt> Btrfs<D> {
     /// cache the top of each tree is re-read once per operation — which
     /// measured as 88% of all device reads on a large file. See [`cache`].
     pub fn read_node(&self, logical: u64) -> Result<Node> {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            if let Some(raw) = batch.pending_blocks.get(&logical) {
+                return Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid);
+            }
+        }
         if let Some(node) = self.nodes.get(logical) {
             return Ok(node);
         }
@@ -311,16 +331,15 @@ impl<D: ReadAt> Btrfs<D> {
         })
     }
 
-    /// The top-level tree — where browsing starts.
-    ///
-    /// This is FS_TREE (id 5), which is what the kernel shows for a mount with
-    /// `subvol=/`, and every subvolume is reachable from it by path because
-    /// resolution crosses subvolume boundaries. Starting at
-    /// [`default_subvolume`](Self::default_subvolume) instead would match a
-    /// plain `mount` but hide everything outside it — on openSUSE the default
-    /// is a snapshot several levels down, and choosing it would make the live
-    /// filesystem unbrowsable.
     pub fn fs_tree(&self) -> TreeRoot {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            let mut root = self.fs_tree;
+            root.bytenr = batch.fs_root.0;
+            root.level = batch.fs_root.1;
+            root.generation = batch.generation;
+            return root;
+        }
         self.fs_tree
     }
 
@@ -332,12 +351,23 @@ impl<D: ReadAt> Btrfs<D> {
         &self.chunks
     }
 
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn chunk_map_mut(&mut self) -> &mut ChunkMap {
+        &mut self.chunks
+    }
+
     pub fn label(&self) -> &str {
         &self.sb.label
     }
 
     pub fn fsid(&self) -> [u8; 16] {
         self.sb.fsid
+    }
+
+    /// Chunk tree UUID from the chunk tree root node.
+    pub fn chunk_tree_uuid(&self) -> Result<[u8; 16]> {
+        let node = self.read_node(self.sb.chunk_root)?;
+        Ok(node.chunk_tree_uuid())
     }
 
     pub fn sector_size(&self) -> u32 {
@@ -351,5 +381,135 @@ impl<D: ReadAt> Btrfs<D> {
     /// The underlying device, for layers that need to read past this one.
     pub fn device(&self) -> &D {
         &self.device
+    }
+
+    /// Mutable access to the underlying device for writer operations.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
+    /// Update the in-memory mount state (superblock and root trees) after a committed transaction,
+    /// invalidating the node cache.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn update_mount_state(&mut self, sb: Superblock, fs_tree: TreeRoot) {
+        self.sb = sb;
+        self.fs_tree = fs_tree;
+        self.nodes.clear();
+        self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
+    }
+
+    /// Read all `DEV_EXTENT` items for `devid` from the `DEV_TREE`.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn read_dev_extents(&self, devid: u64) -> Result<Vec<(u64, u64)>> {
+        write::chunk_alloc::read_dev_extents(self, devid)
+    }
+
+    /// Filesystem capacity and allocation statistics.
+    pub fn statfs(&self) -> Result<crate::fs::StatFs> {
+        let total_bytes = self.sb.total_bytes;
+        let sector_size = self.sb.sector_size;
+
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            let detailed_stat = (|| -> Result<crate::fs::StatFs> {
+                let free_space_map = if let Some(ref batch) = self.active_batch {
+                    batch.allocator.clone()
+                } else {
+                    write::alloc::FreeSpaceMap::from_extent_tree_and_chunk_map(
+                        &write::extent_tree::ExtentTree::read(self)?,
+                        self.chunk_map(),
+                    )?
+                };
+
+                let mut free_data = 0u64;
+                let mut free_metadata = 0u64;
+                let mut free_system = 0u64;
+
+                for bg in &free_space_map.block_groups {
+                    let flags = bg.block_group.flags;
+                    if flags & 0x1 != 0 {
+                        // DATA
+                        free_data = free_data.saturating_add(bg.total_free_bytes);
+                    }
+                    if flags & 0x4 != 0 {
+                        // METADATA
+                        free_metadata = free_metadata.saturating_add(bg.total_free_bytes);
+                    }
+                    if flags & 0x2 != 0 {
+                        // SYSTEM
+                        free_system = free_system.saturating_add(bg.total_free_bytes);
+                    }
+                }
+
+                // Unallocated device space
+                let dev_extents = write::chunk_alloc::read_dev_extents(self, self.sb.dev_id).unwrap_or_default();
+                let allocated_dev_bytes: u64 = dev_extents.iter().map(|(_, len)| *len).sum();
+                let unalloc_dev_bytes = total_bytes
+                    .saturating_sub(write::chunk_alloc::BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
+                    .saturating_sub(allocated_dev_bytes);
+
+                let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes / (64 * 1024)) * (64 * 1024);
+
+                let total_free_data = free_data.saturating_add(allocatable_unalloc_dev_bytes);
+
+                // Metadata headroom:
+                // In btrfs, each 4 KiB data sector needs 4 bytes of csum, plus extent item & extent data items.
+                // Cost ratio: ~ 1 metadata byte per 256 data bytes.
+                // When free_metadata < 512 KiB, compute available bytes proportionally without clamping to 0.
+                let max_data_from_metadata = if free_metadata >= 512 * 1024 {
+                    let excess = free_metadata - 512 * 1024;
+                    (256 * 1024 * 256) + excess.saturating_mul(256)
+                } else {
+                    (free_metadata / 2).saturating_mul(256)
+                };
+
+                let data_safety_margin = 64 * 1024;
+                let raw_available = total_free_data.min(max_data_from_metadata);
+                let available_bytes = if raw_available > data_safety_margin {
+                    raw_available - data_safety_margin
+                } else {
+                    raw_available
+                };
+
+                let total_free = total_free_data.min(total_bytes);
+
+                Ok(crate::fs::StatFs {
+                    total_bytes,
+                    free_bytes: total_free,
+                    available_bytes: available_bytes.min(total_free),
+                    total_inodes: 0,
+                    free_inodes: 0,
+                    block_size: sector_size,
+                })
+            })();
+
+            if let Ok(stat) = detailed_stat {
+                return Ok(stat);
+            }
+
+            let free_bytes = total_bytes.saturating_sub(self.sb.bytes_used);
+            Ok(crate::fs::StatFs {
+                total_bytes,
+                free_bytes,
+                available_bytes: free_bytes,
+                total_inodes: 0,
+                free_inodes: 0,
+                block_size: sector_size,
+            })
+        }
+
+        #[cfg(not(feature = "dangerous-write-support"))]
+        {
+            let free_bytes = total_bytes.saturating_sub(self.sb.bytes_used);
+            Ok(crate::fs::StatFs {
+                total_bytes,
+                free_bytes,
+                available_bytes: free_bytes,
+                total_inodes: 0,
+                free_inodes: 0,
+                block_size: sector_size,
+            })
+        }
     }
 }

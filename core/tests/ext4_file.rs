@@ -23,6 +23,8 @@
 //! the inode fields themselves.
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use luks_core::device::FileDevice;
 use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
@@ -231,12 +233,11 @@ fn verify_script() -> Option<String> {
     if !std::path::Path::new(&script).exists() {
         return None;
     }
-    let up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    up.then_some(script)
+    if !common::oracle::gate() {
+        return None;
+    }
+
+    Some(script)
 }
 
 /// The check the batched allocator was written for: a file of a size where

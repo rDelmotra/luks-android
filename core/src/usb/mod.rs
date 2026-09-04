@@ -17,7 +17,7 @@ pub mod bot;
 pub mod scsi;
 
 pub use bot::{CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction};
-pub use scsi::{Capacity, InquiryData, ScsiBlockDevice};
+pub use scsi::{Capacity, InquiryData, ScsiBlockDevice, MAX_SCSI_TRANSFER};
 
 use crate::error::Result;
 

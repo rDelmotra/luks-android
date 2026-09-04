@@ -1,7 +1,7 @@
 #!/bin/bash
 # Grade a LUKS image we wrote to, using the kernel's own tools.
 #
-#   tools/verify-image.sh <image> [password]
+#   tools/verify-image.sh <image-or-device> [password]
 #
 # This is the oracle for every filesystem write. The rule that has held for
 # every fixture in this repo applies doubly here: **never check our output with
@@ -9,20 +9,46 @@
 # on-disk format agree with each other perfectly and corrupt real drives.
 #
 # So the image goes to Linux, is opened by real `cryptsetup`, checked by real
-# `e2fsck` or `btrfs check`, and mounted by the real kernel. If all three are
-# happy, the drive is one Linux can use — which is the only claim that matters.
+# `e2fsck` or `btrfs check`, and mounted by the real kernel. When the container
+# holds btrfs, it is also scrubbed — see the "btrfs scrub" block below for why
+# that is not optional. If all steps are happy, the drive is one Linux can
+# use — which is the only claim that matters.
 #
 # Runs in the colima VM because macOS has neither cryptsetup nor device-mapper
 # (see the doc errata in STATE.md — the original planning docs were wrong about
 # this). Start it with `colima start` if it is not up.
 #
+# <image-or-device> may be a regular file (the fixtures, or an image made with
+# make-stick-image.sh) OR a raw macOS block device node (/dev/diskN — what
+# `diskutil list` names a physically attached stick). Both are just read from
+# the *host* and streamed into the VM over `colima ssh -- tee`, exactly the
+# same way a file already was — this does not require the colima VM to see
+# host block devices at all, only for this host shell to be able to open the
+# path for reading, which it can for any device this user owns (measured
+# 2026-08-18 against a disk image attached with `hdiutil attach -nomount`,
+# which produces the same /dev/diskN block-device node a real USB stick does).
+# Do NOT point this at a mounted disk while it is mounted — unmount first with
+# `diskutil unmountDisk /dev/diskN`, or the read will race the OS.
+#
 # Exit status is the verdict: 0 clean, non-zero and the reason is on stderr.
 set -euo pipefail
 
-IMG="${1:?usage: verify-image.sh <image> [password]}"
+IMG="${1:?usage: verify-image.sh <image-or-device> [password]}"
 PASSWORD="${2:-test}"
 
-[ -f "$IMG" ] || { echo "no such image: $IMG" >&2; exit 2; }
+if [ -f "$IMG" ]; then
+    :
+elif [ -b "$IMG" ]; then
+    [ -r "$IMG" ] || {
+        echo "cannot read $IMG — run 'diskutil unmountDisk $IMG' first, and" >&2
+        echo "if that still isn't readable, this user does not own the node;" >&2
+        echo "re-run under sudo." >&2
+        exit 2
+    }
+else
+    echo "no such image or device: $IMG" >&2
+    exit 2
+fi
 command -v colima >/dev/null || { echo "colima not installed" >&2; exit 2; }
 colima status >/dev/null 2>&1 || { echo "colima is not running — 'colima start'" >&2; exit 2; }
 
@@ -134,7 +160,40 @@ esac
 mkdir -p "$MNT"
 mount -o ro "$MAPPER" "$MNT"
 echo "--- mounted, root contains ---"
-ls -la "$MNT" | head -40
+# `|| true`: under `set -o pipefail`, a directory with more than the
+# `head -40` cutoff makes `ls` catch SIGPIPE and this pipeline "fail" before
+# scrub ever runs (see tools/verify-btrfs.sh, measured 2026-08-14). This is a
+# display line, not a check; it must never gate the verdict.
+ls -la "$MNT" | head -40 || true
+
+if [ "$FSTYPE" = "btrfs" ]; then
+    # `btrfs check` alone is not enough: measured 2026-08-14 (tools/verify-btrfs.sh),
+    # its csum pass is metadata-only and misses corrupt file *data*. Scrub reads
+    # every block against the checksum tree, data included. `-r` keeps it
+    # read-only (report, do not repair) — the same role `-n` plays for e2fsck
+    # above.
+    echo "--- btrfs scrub start -Bdr ---"
+    SCRUB_OUT="$(btrfs scrub start -Bdr "$MNT" 2>&1)" || true
+    echo "$SCRUB_OUT"
+    # scrub's own exit code is NOT enough. Measured 2026-08-14 (tools/verify-btrfs.sh):
+    # zeroing only the second DUP metadata mirror of a live tree block makes
+    # scrub print "Error summary: verify=4 / Corrected: 4 / Uncorrectable: 0"
+    # and **exit 0** — it self-healed from the surviving good mirror and calls
+    # that success. Only a genuinely *uncorrectable* error returns nonzero. So,
+    # exactly as verify-btrfs.sh does, grep scrub's own printed summary for the
+    # literal "no errors found" line and fail explicitly on anything else,
+    # regardless of scrub's exit code. Without this, a regression that quietly
+    # stops writing the second DUP mirror — the single invariant the write
+    # engine is built around — passes clean.
+    if ! grep -q "Error summary:    no errors found" <<<"$SCRUB_OUT"; then
+        echo "FAIL: scrub reported errors — see \"Error summary\" above. A" >&2
+        echo "'Corrected' count is not success: it means a DUP mirror was wrong" >&2
+        echo "and scrub silently repaired it from the other copy, which for this" >&2
+        echo "project means the writer failed to write that mirror in the first" >&2
+        echo "place. scrub's own exit code does not distinguish this from clean." >&2
+        exit 1
+    fi
+fi
 REMOTE_SCRIPT
 
 colima ssh -- tee "$REMOTE" < "$IMG" > /dev/null
@@ -144,4 +203,4 @@ colima ssh -- tee "$REMOTE_SH" < "$LOCAL_SH" > /dev/null
 printf '%s' "$PASSWORD" | colima ssh -- sudo bash "$REMOTE_SH" "$REMOTE" "$NAME"
 colima ssh -- rm -f "$REMOTE_SH" 2>/dev/null || true
 
-echo "VERDICT: clean — cryptsetup opened it, the checker passed, the kernel mounted it"
+echo "VERDICT: clean — cryptsetup opened it, the checker passed, the kernel mounted it (and scrub found nothing, if btrfs)"

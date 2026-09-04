@@ -77,10 +77,16 @@ fi
 # and non-generic, so it is either an exported symbol or it does not exist.
 # There is no "compiled but unreachable" middle state to argue about — which
 # makes this the one artifact-level check that proves what it claims.
+# Both the whole-file and the streaming (unknown-size) entry points count:
+# a build that dropped nativeWriteFile but still exported
+# nativeBeginFileStreaming could still write a drive one chunk at a time, and
+# the single-literal check would have called that clean.
+JNI_PATTERN='nativeWriteFile|nativeBeginFileStreaming'
+
 DYLIB_HITS() {
     # cdylib extension differs by host; the Android build produces the .so.
     for f in target/debug/libluks_jni.dylib target/debug/libluks_jni.so; do
-        [ -f "$f" ] && { nm -gU "$f" 2>/dev/null | grep -cE 'nativeWriteFile' || true; return; }
+        [ -f "$f" ] && { nm -gU "$f" 2>/dev/null | grep -cE "$JNI_PATTERN" || true; return; }
     done
     echo "MISSING"
 }
@@ -93,20 +99,20 @@ JNI_CONTROL="$(DYLIB_HITS)"
 
 cargo build -p luks_jni >/dev/null 2>&1 || true
 
-echo "jni default: ${JNI_DEFAULT} nativeWriteFile exports"
-echo "jni control: ${JNI_CONTROL} nativeWriteFile exports"
+echo "jni default: ${JNI_DEFAULT} write-entry-point exports"
+echo "jni control: ${JNI_CONTROL} write-entry-point exports"
 
 if [ "$JNI_DEFAULT" = "MISSING" ] || [ "$JNI_CONTROL" = "MISSING" ]; then
     echo "VACUOUS: no cdylib was found to inspect — the check proved nothing." >&2
     exit 1
 fi
 if [ "$JNI_CONTROL" -eq 0 ]; then
-    echo "VACUOUS: the control build exports no nativeWriteFile either, so this" >&2
+    echo "VACUOUS: the control build exports no write entry points either, so this" >&2
     echo "check is not measuring anything. Fix the check before trusting it." >&2
     exit 1
 fi
 if [ "$JNI_DEFAULT" -ne 0 ]; then
-    echo "FAIL: a default JNI build exports nativeWriteFile — the app could write" >&2
+    echo "FAIL: a default JNI build exports a write entry point — the app could write" >&2
     exit 1
 fi
 
@@ -125,7 +131,7 @@ fi
 # forgotten, because the release build depends on it.
 JNILIB="android/app/src/main/jniLibs/arm64-v8a/libluks_jni.so"
 if [ -f "$JNILIB" ]; then
-    if grep -qa 'nativeWriteFile' "$JNILIB"; then
+    if grep -qaE "$JNI_PATTERN" "$JNILIB"; then
         echo
         echo "⚠️  WARNING: $JNILIB has the write path linked in." >&2
         echo "    A debug APK built from this tree can write to a drive. That is" >&2
@@ -133,7 +139,7 @@ if [ -f "$JNILIB" ]; then
         echo "    Rebuild without it:  tools/build-android-libs.sh --debug" >&2
         echo "    A release build refuses this outright — see checkNoWriteCodeInRelease." >&2
     else
-        echo "jniLibs .so: no nativeWriteFile — a debug APK from this tree cannot write"
+        echo "jniLibs .so: no write entry points — a debug APK from this tree cannot write"
     fi
 else
     echo "jniLibs .so: not built (nothing to inspect)"

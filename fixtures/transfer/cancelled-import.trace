@@ -1,0 +1,7 @@
+mkdir	/dst	A
+begin
+write	0	12	1
+finish	/dst/A	one.txt
+begin
+write	0	12	2
+finish	/dst/A	two.txt

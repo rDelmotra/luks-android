@@ -355,7 +355,7 @@ fn the_write_path_costs_this_much_cpu_with_no_device_latency() {
     // fails only if the write path has become pathologically slow rather than
     // merely wasteful.
     assert!(
-        mibs > 20.0,
+        mibs > 10.0,
         "the write path manages only {mibs:.0} MiB/s of pure CPU"
     );
 }

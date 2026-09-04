@@ -93,13 +93,14 @@ const RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 //   0x158 s_free_blocks_count_hi
 //   0x15C s_min_extra_isize (u16) | 0x15E s_want_extra_isize (u16)
 const SB_BLOCKS_COUNT_HI: usize = 0x150;
+const SB_R_BLOCKS_COUNT_HI: usize = 0x154;
 pub(crate) const SB_FREE_BLOCKS_COUNT_HI: usize = 0x158;
 const SB_MIN_EXTRA_ISIZE: usize = 0x15C;
 
 // bg_flags bits
 /// The inode bitmap and table for this group have never been written.
 pub const BG_INODE_UNINIT: u16 = 0x0001;
-/// The block bitmap for this group has never been written.
+/// The block bitmap for this group have never been written.
 pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 
 // i_flags bits
@@ -118,6 +119,7 @@ fn u32le(b: &[u8], o: usize) -> u32 {
 pub struct Superblock {
     pub inodes_count: u32,
     pub blocks_count: u64,
+    pub s_r_blocks_count: u64,
     pub first_data_block: u32,
     pub block_size: u32,
     pub blocks_per_group: u32,
@@ -228,9 +230,17 @@ impl Superblock {
             0
         };
 
+        let r_blocks_lo = u32le(b, 8) as u64;
+        let r_blocks_hi = if feature_incompat & INCOMPAT_64BIT != 0 {
+            u32le(b, SB_R_BLOCKS_COUNT_HI) as u64
+        } else {
+            0
+        };
+
         Ok(Superblock {
             inodes_count: u32le(b, 0),
             blocks_count: blocks_lo | (blocks_hi << 32),
+            s_r_blocks_count: r_blocks_lo | (r_blocks_hi << 32),
             first_data_block: u32le(b, 20),
             block_size,
             blocks_per_group,
@@ -273,7 +283,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 3 == 0 {
+        while test.is_multiple_of(3) {
             test /= 3;
         }
         if test == 1 {
@@ -281,7 +291,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 5 == 0 {
+        while test.is_multiple_of(5) {
             test /= 5;
         }
         if test == 1 {
@@ -289,7 +299,7 @@ impl Superblock {
         }
 
         let mut test = group;
-        while test % 7 == 0 {
+        while test.is_multiple_of(7) {
             test /= 7;
         }
         test == 1
@@ -529,6 +539,26 @@ impl<D: ReadAt> Ext4<D> {
 
     pub fn uuid(&self) -> [u8; 16] {
         self.sb.uuid
+    }
+
+    pub fn statfs(&self) -> Result<crate::fs::StatFs> {
+        let bs = self.sb.block_size as u64;
+        let total_bytes = self.sb.blocks_count * bs;
+        let free_bytes = self.sb.free_blocks_count * bs;
+        let available_blocks = self.sb.free_blocks_count.saturating_sub(self.sb.s_r_blocks_count);
+        let available_bytes = available_blocks * bs;
+        let total_inodes = self.sb.inodes_count as u64;
+        let free_inodes = self.sb.free_inodes_count as u64;
+        let block_size = self.sb.block_size;
+
+        Ok(crate::fs::StatFs {
+            total_bytes,
+            free_bytes,
+            available_bytes,
+            total_inodes,
+            free_inodes,
+            block_size,
+        })
     }
 
     #[cfg(any(test, feature = "dangerous-write-support"))]
@@ -925,6 +955,14 @@ impl<D: ReadAt> Ext4<D> {
 
                 if ino != 0 {
                     let name_len = block_buf[pos + 6] as usize;
+                    // Size and mtime live only in the inode, so listing with
+                    // them always costs a read per entry — one already paid
+                    // here on every ext4 volume regardless of the filetype
+                    // feature, since the size/mtime read doubles as the type
+                    // fallback below. A read failure (a dangling or corrupt
+                    // entry) degrades to zero/Unknown rather than failing the
+                    // whole listing.
+                    let full = self.read_inode(ino).ok();
                     let file_type = if has_filetype {
                         match block_buf[pos + 7] {
                             1 => FileType::Regular,
@@ -937,12 +975,14 @@ impl<D: ReadAt> Ext4<D> {
                             _ => FileType::Unknown,
                         }
                     } else {
-                        // Without the filetype feature the type lives only in
-                        // the inode, so it costs a read.
-                        self.read_inode(ino)
+                        full.as_ref()
                             .map(|i| i.file_type())
                             .unwrap_or(FileType::Unknown)
                     };
+                    let (size, mtime) = full
+                        .as_ref()
+                        .map(|i| (i.size, i.mtime))
+                        .unwrap_or((0, 0));
 
                     if pos + 8 + name_len <= bs {
                         let raw = &block_buf[pos + 8..pos + 8 + name_len];
@@ -953,6 +993,8 @@ impl<D: ReadAt> Ext4<D> {
                                 inode: ino,
                                 file_type,
                                 is_subvolume: false,
+                                size,
+                                mtime,
                             });
                         }
                     }
@@ -1065,11 +1107,51 @@ impl<D: ReadAt> Ext4<D> {
     }
 }
 
+/// How deep `delete_file`'s directory recursion may descend before refusing.
+/// See `Ext4::delete_file_at_depth`.
+#[cfg(feature = "dangerous-write-support")]
+const MAX_DELETE_DEPTH: usize = 1024;
+
 #[cfg(feature = "dangerous-write-support")]
 impl<D: WriteAt> Ext4<D> {
-    /// Delete a regular file by path. Refuses directories and hardlinks.
+    /// Delete the file or directory at `path`. Refuses hardlinks. A directory
+    /// is emptied first, depth-first, one flushed operation per child — the
+    /// same shape as deleting each child by hand, so a mid-tree failure (a
+    /// hardlinked file, an indirect-block-mapped file our writer refuses)
+    /// leaves exactly what it would if a caller had stopped there themselves.
     /// Follows the Phase 0–4 ordering: collect -> sever name -> zero inode -> free blocks -> flush.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        // `.` and `..` are never real stored entries (`list_inode` filters
+        // both), but `resolve`/`resolve_no_follow` silently collapse them
+        // during path resolution while the plain string split below does
+        // not. Left unchecked, a path like "/foo/." would resolve to "/foo"
+        // itself, so this function would recurse into and delete every child
+        // of "/foo" before the naive `rsplit_once` name (".") failed
+        // `unlink_file`'s name validation at the very end — reporting
+        // failure after already deleting everything inside. "/." reaches
+        // the same way for the whole volume. Refused outright before any
+        // resolution happens, rather than trusting a raw string split to
+        // agree with what path resolution considers "root" or "this
+        // directory".
+        if path.split('/').any(|c| c == "." || c == "..") {
+            return Err(LuksError::UnsupportedFsFeature(
+                "delete path containing '.' or '..' components".into(),
+            ));
+        }
+        self.delete_file_at_depth(path, 0)
+    }
+
+    fn delete_file_at_depth(&mut self, path: &str, depth: usize) -> Result<()> {
+        // A real directory tree is nowhere near this deep; the bound exists
+        // only to turn a cycle in corrupt on-disk data (a child entry whose
+        // inode number aliases one of its own ancestors) into a clean error
+        // instead of an unbounded recursion that aborts the process.
+        if depth > MAX_DELETE_DEPTH {
+            return Err(LuksError::CorruptFs(
+                "directory delete recursed past a sane depth — likely a cycle",
+            ));
+        }
+
         let trimmed = path.trim_start_matches('/');
         if trimmed.is_empty() {
             return Err(LuksError::IsADirectory("/".into()));
@@ -1085,12 +1167,40 @@ impl<D: WriteAt> Ext4<D> {
             return Err(LuksError::NotADirectory(format!("path /{parent_path}")));
         }
 
-        let target_inode = self.resolve_no_follow(path)?;
-        if target_inode.file_type().is_dir() {
-            return Err(LuksError::IsADirectory(path.to_string()));
+        let target_before_recursion = self.resolve_no_follow(path)?;
+        let target_is_dir = target_before_recursion.file_type().is_dir();
+        if target_is_dir {
+            // `link_file`/`unlink_file` both refuse an inline-data directory
+            // before touching its contents (its "blocks" aren't blocks at
+            // all — the crate's own note on `INCOMPAT_INLINE_DATA` above
+            // says mapping them through the ordinary extent path returns
+            // garbage). `list_dir` has no such guard, so without this check
+            // recursing into one would hand that garbage to `delete_file`
+            // as if it were real child names.
+            if target_before_recursion.is_inline() {
+                return Err(LuksError::UnsupportedFsFeature(
+                    "deleting an inline-data directory".into(),
+                ));
+            }
+            let children = self.list_dir(path)?;
+            let base = path.trim_end_matches('/');
+            for child in children {
+                let child_path = if base.is_empty() {
+                    format!("/{}", child.name)
+                } else {
+                    format!("{base}/{}", child.name)
+                };
+                self.delete_file_at_depth(&child_path, depth + 1)?;
+            }
         }
 
-        if target_inode.links > 1 {
+        // Re-resolved: a child's deletion above only ever touches inodes
+        // other than this one's own record, but re-reading rather than
+        // trusting a pre-recursion copy is what makes that "only ever" not
+        // load-bearing.
+        let target_inode = self.resolve_no_follow(path)?;
+
+        if !target_is_dir && target_inode.links > 1 {
             return Err(LuksError::UnsupportedFsFeature(
                 "deleting files with links_count > 1 (hardlinks)".into(),
             ));
@@ -1105,8 +1215,16 @@ impl<D: WriteAt> Ext4<D> {
             return Err(LuksError::CorruptFs("unlinked inode number mismatch"));
         }
 
+        // Phase 1b: a subdirectory's own ".." is what gave its parent the
+        // extra link `create_directory` bumped on the way in — removing the
+        // subdirectory has to give it back, or the parent's i_links_count
+        // only ever grows.
+        if target_is_dir {
+            self.patch_inode_links_count(parent_dir.number as u32, -1)?;
+        }
+
         // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
-        self.free_inode(target_inode.number, false)?;
+        self.free_inode(target_inode.number, target_is_dir)?;
 
         // Phase 3: Return Blocks to the Free Pool
         self.free_blocks(&data_extents)?;

@@ -22,11 +22,21 @@ internal object LuksNative {
     init {
         // Loads libluks_jni.so from the APK's lib/arm64-v8a/. Built by
         // tools/build-android-libs.sh, not by Gradle.
-        System.loadLibrary("luks_jni")
+        try {
+            System.loadLibrary("luks_jni")
+        } catch (_: UnsatisfiedLinkError) {
+            // Expected in host JVM unit test environment
+        }
     }
 
     /** Version of the Rust core. The cheapest possible proof the .so loaded. */
     external fun nativeVersion(): String
+
+    /** Dumps the in-memory bounded forensic ring buffer as formatted text. */
+    external fun nativeDumpForensicLog(): String
+
+    /** Clears the in-memory bounded forensic ring buffer. */
+    external fun nativeClearForensicLog()
 
     /**
      * @param fd from `UsbDeviceConnection.getFileDescriptor()`. Stays owned by
@@ -64,6 +74,18 @@ internal object LuksNative {
 
     /** JSON: `{ path, entries: [{ name, inode, type }] }`, "." and ".." removed. */
     external fun nativeListDir(handle: Long, path: String): String
+
+    /** JSON: `{ path, entries: [{ name, inode, type }] }` with pagination. */
+    external fun nativeListDirPaged(handle: Long, path: String, offset: Long, limit: Long): String
+
+    /** Creates a cancel token for interrupting long-running native operations. */
+    external fun nativeCreateCancelToken(): Long
+
+    /** Signals cancellation on the operation associated with [tokenId]. */
+    external fun nativeCancelOperation(tokenId: Long)
+
+    /** Frees the native cancel token handle. */
+    external fun nativeCloseCancelToken(tokenId: Long)
 
     /** JSON: size, mode, uid, gid, links, type, times. */
     external fun nativeFileInfo(handle: Long, path: String): String
@@ -137,8 +159,22 @@ internal object LuksNative {
     external fun nativeWriteFile(handle: Long, parentPath: String, name: String, data: ByteArray): Long
 
     external fun nativeBeginFile(handle: Long, sizeBytes: Long): Long
+
+    /**
+     * Sibling of [nativeBeginFile] with no upfront size, for a streaming write whose
+     * total length is not known before the first chunk arrives -- the shape the SAF
+     * write proxy needs, since the kernel VFS delivers writes without ever declaring a
+     * length. Same gating as every other write primitive: only linkable when the
+     * loaded `.so` was built with `dangerous-write-support`. Call [nativeWriteSupported]
+     * first.
+     */
+    external fun nativeBeginFileStreaming(handle: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
+    external fun nativeCommitActiveBatch(handle: Long)
     external fun nativeCloseWriter(handle: Long, writer: Long)
     external fun nativeDeleteFile(handle: Long, path: String)
+    external fun nativeCreateDirectory(handle: Long, parentPath: String, name: String): Long
+    external fun nativeRename(handle: Long, oldParent: String, oldName: String, newParent: String, newName: String)
+    external fun nativeStatFs(handle: Long): String
 }

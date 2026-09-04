@@ -9,7 +9,11 @@ use common::{fixture, MockUsbDrive};
 use luks_core::device::ReadAt;
 use luks_core::error::LuksError;
 use luks_core::partition::{self, type_guid, TableKind};
-use luks_core::usb::bot::{CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction};
+use luks_core::usb::bot::{
+    CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CBW_LEN, CBW_SIGNATURE,
+    CSW_LEN, CSW_SIGNATURE,
+};
+use luks_core::usb::scsi::WriteCacheState;
 use luks_core::usb::ScsiBlockDevice;
 
 // --- Bulk-Only Transport wire format ---------------------------------------
@@ -394,4 +398,308 @@ fn guid_formatting_uses_mixed_endian_order() {
         partition::format_guid(&type_guid::LINUX_FS),
         "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
     );
+}
+
+struct CswStallTransport<T> {
+    inner: T,
+    stall_csw: std::cell::Cell<bool>,
+    clear_halt_called: std::cell::Cell<bool>,
+    reset_called: std::cell::Cell<bool>,
+}
+
+impl<T> CswStallTransport<T> {
+    fn new(inner: T) -> Self {
+        Self {
+            inner,
+            stall_csw: std::cell::Cell::new(false),
+            clear_halt_called: std::cell::Cell::new(false),
+            reset_called: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for CswStallTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        if self.stall_csw.get() && buf.len() == 13 && !self.clear_halt_called.get() {
+            return Err(LuksError::UsbTransfer(
+                "USBDEVFS_BULK: errno 32 (Broken pipe) (endpoint stalled)".into(),
+            ));
+        }
+        self.inner.read(buf)
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+        if endpoint_in {
+            self.clear_halt_called.set(true);
+        }
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<(), LuksError> {
+        self.reset_called.set(true);
+        self.inner.reset()
+    }
+}
+
+#[test]
+fn csw_stall_recovers_via_clear_halt() {
+    let raw_drive = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport = CswStallTransport::new(raw_drive);
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    dev.transport().stall_csw.set(true);
+    dev.transport().clear_halt_called.set(false);
+    dev.transport().reset_called.set(false);
+
+    let inq = dev.inquiry().expect("inquiry should recover from CSW stall via clear_halt");
+    assert!(inq.is_block_device());
+    assert!(dev.transport().clear_halt_called.get(), "clear_halt(true) must be called");
+    assert!(!dev.transport().reset_called.get(), "reset() must not be called when clear_halt succeeds");
+}
+
+#[test]
+fn max_scsi_transfer_caps_single_read_commands() {
+    // A transport that allows 1 MiB transfers
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(1024 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    let mut buf = vec![0u8; 1024 * 1024];
+    dev.read_at(0, &mut buf).unwrap();
+
+    let stats = *dev.transport().stats.borrow();
+    // 1 MiB in 128 KiB commands = 8 commands
+    assert!(stats.read_commands >= 8, "must split into at least 8 commands");
+    assert_eq!(stats.largest_read_blocks, 256, "capped at 128 KiB / 512 = 256 blocks");
+}
+
+// --- MODE SENSE / write-cache probe -----------------------------------------
+//
+// `MockUsbDrive` (in `tests/common`) has no notion of the Caching mode page —
+// its command dispatch falls through to a generic "command failed" for any
+// opcode it does not recognise, MODE SENSE(6)/(10) included. Rather than
+// extend that shared fixture (owned by other work in this crate), the tests
+// below wrap a working `MockUsbDrive` in a small transport that intercepts
+// only MODE SENSE(6)/(10) and answers with a caller-supplied body, passing
+// every other opcode straight through so `ScsiBlockDevice::open` still
+// succeeds normally. This follows the same pattern as `FlakyTransport` and
+// `CswStallTransport` above: wrap `BulkTransport`, delegate by default,
+// intercept the one thing under test.
+
+enum ModeSensePhase {
+    /// Not intercepting: reads are the inner transport's business.
+    Idle,
+    /// Serving `response` bytes for the data-in phase of an intercepted
+    /// MODE SENSE.
+    DataIn { pos: usize },
+    /// Serving the CSW that follows an intercepted MODE SENSE.
+    Csw { pos: usize },
+}
+
+/// Wraps a working drive and substitutes a fixed MODE SENSE(6)/(10) response
+/// for opcodes 0x1A and 0x5A. Everything else — INQUIRY, TEST UNIT READY,
+/// READ CAPACITY, and so on — passes straight through to `inner`.
+struct ModeSenseTransport<T> {
+    inner: T,
+    /// The bytes to serve after a MODE SENSE CBW, however short: a genuinely
+    /// truncated response is one of the cases under test, and the reader must
+    /// see exactly what was handed to it, not padding invented here.
+    response: Vec<u8>,
+    phase: std::cell::RefCell<ModeSensePhase>,
+    csw: std::cell::Cell<[u8; CSW_LEN]>,
+}
+
+impl<T> ModeSenseTransport<T> {
+    fn new(inner: T, response: Vec<u8>) -> Self {
+        Self {
+            inner,
+            response,
+            phase: std::cell::RefCell::new(ModeSensePhase::Idle),
+            csw: std::cell::Cell::new([0u8; CSW_LEN]),
+        }
+    }
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for ModeSenseTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        // A CBW is always encoded to exactly CBW_LEN bytes and sent in one
+        // `write` call (see `ScsiBlockDevice::command_inner`), so a CBW-sized
+        // write starting with the signature is unambiguously a fresh command,
+        // never mid-phase payload — MODE SENSE has no OUT data of its own.
+        if data.len() == CBW_LEN
+            && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == CBW_SIGNATURE
+        {
+            let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let opcode = data[15];
+            if opcode == 0x1A || opcode == 0x5A {
+                let mut csw = [0u8; CSW_LEN];
+                csw[0..4].copy_from_slice(&CSW_SIGNATURE.to_le_bytes());
+                csw[4..8].copy_from_slice(&tag.to_le_bytes());
+                // Residue is unchecked for an IN transfer (see the comment in
+                // `command_inner`), so leaving it at 0 is fine even when the
+                // response is shorter than the host asked for.
+                csw[12] = 0; // GOOD
+                self.csw.set(csw);
+                *self.phase.borrow_mut() = ModeSensePhase::DataIn { pos: 0 };
+                return Ok(CBW_LEN);
+            }
+        }
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        let mut phase = self.phase.borrow_mut();
+        match &mut *phase {
+            ModeSensePhase::Idle => {
+                drop(phase);
+                self.inner.read(buf)
+            }
+            ModeSensePhase::DataIn { pos } => {
+                let n = (self.response.len() - *pos).min(buf.len());
+                if n == 0 {
+                    // The device has nothing left to send. A real short
+                    // packet ends the IN phase here; the next `read` call is
+                    // for the CSW, not more of this response.
+                    *phase = ModeSensePhase::Csw { pos: 0 };
+                    return Ok(0);
+                }
+                buf[..n].copy_from_slice(&self.response[*pos..*pos + n]);
+                *pos += n;
+                Ok(n)
+            }
+            ModeSensePhase::Csw { pos } => {
+                let csw = self.csw.get();
+                let n = (CSW_LEN - *pos).min(buf.len());
+                buf[..n].copy_from_slice(&csw[*pos..*pos + n]);
+                *pos += n;
+                if *pos == CSW_LEN {
+                    *phase = ModeSensePhase::Idle;
+                }
+                Ok(n)
+            }
+        }
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<(), LuksError> {
+        self.inner.reset()
+    }
+}
+
+/// Build a MODE SENSE(6) response: 4-byte header (with the given block
+/// descriptor length), that many bytes of block descriptor, then a Caching
+/// mode page carrying `wce` in bit 2 of byte 2.
+///
+/// The block descriptor bytes are filled with `0xEE` — a pattern that looks
+/// nothing like a valid Caching page (page code 0x08) — specifically so a
+/// parser that forgets to skip the descriptor and reads the page from a fixed
+/// offset instead would trip over it rather than accidentally agreeing.
+fn mode_sense_6_response(block_descriptor_len: u8, wce: bool) -> Vec<u8> {
+    let mut d = vec![0u8; 4 + block_descriptor_len as usize + 20];
+    d[3] = block_descriptor_len;
+    for b in &mut d[4..4 + block_descriptor_len as usize] {
+        *b = 0xEE;
+    }
+    let page = &mut d[4 + block_descriptor_len as usize..];
+    page[0] = 0x08; // page code, PS bit clear
+    page[1] = 18; // page length (bytes following this one)
+    page[2] = if wce { 0x04 } else { 0x00 };
+    d[0] = (d.len() - 1) as u8; // mode data length
+    d
+}
+
+#[test]
+fn write_cache_state_reports_enabled_when_wce_bit_is_set() {
+    let inner = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport = ModeSenseTransport::new(inner, mode_sense_6_response(0, true));
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Enabled);
+}
+
+#[test]
+fn write_cache_state_reports_disabled_when_wce_bit_is_clear() {
+    let inner = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport = ModeSenseTransport::new(inner, mode_sense_6_response(0, false));
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Disabled);
+}
+
+/// The descriptor-skip regression: an 8-byte block descriptor sits between
+/// the header and the Caching page, filled with bytes (0xEE) that are not a
+/// valid page code. A parser that reads the page from a fixed offset — i.e.
+/// forgets to skip the descriptor, or skips the wrong number of bytes — reads
+/// the WCE bit from `0xEE` territory instead, which this test was run
+/// against once (see the report) and observed to fail before the offset was
+/// corrected.
+#[test]
+fn write_cache_state_skips_a_nonzero_block_descriptor() {
+    let inner = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport = ModeSenseTransport::new(inner, mode_sense_6_response(8, true));
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Enabled);
+
+    let inner2 = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let transport2 = ModeSenseTransport::new(inner2, mode_sense_6_response(8, false));
+    let dev2 = ScsiBlockDevice::open(transport2).unwrap();
+
+    assert_eq!(dev2.write_cache_state(), WriteCacheState::Disabled);
+}
+
+/// Both MODE SENSE forms rejected as an invalid opcode: MODE SENSE(6) is
+/// probed first, then the drive is also made to reject MODE SENSE(10), so the
+/// fallback is exhausted rather than incidentally succeeding.
+#[test]
+fn write_cache_state_is_unknown_when_mode_sense_is_rejected() {
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img"))
+        .failing(0x1A, [0x05, 0x20, 0x00])
+        .failing(0x5A, [0x05, 0x20, 0x00]);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Unknown);
+}
+
+/// A response too short to contain a Caching page at all — just the 4-byte
+/// header, no block descriptor and nothing after it — must not be read past
+/// its end, and must not be mistaken for an answer.
+#[test]
+fn write_cache_state_is_unknown_on_a_truncated_response() {
+    let inner = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    // Header only: mode data length, medium type, device-specific parameter,
+    // block descriptor length (0). No page follows.
+    let transport = ModeSenseTransport::new(inner, vec![3, 0, 0, 0]);
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Unknown);
+}
+
+/// A response that claims a block descriptor longer than what was actually
+/// returned must not be trusted either — walking off the end of `data` here
+/// would be the same class of bug as the descriptor-skip test above, just in
+/// the direction of reading too far rather than not far enough.
+#[test]
+fn write_cache_state_is_unknown_when_the_descriptor_overruns_the_response() {
+    let inner = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    // Header says a 200-byte block descriptor follows; only 4 bytes of body
+    // exist after the header.
+    let transport = ModeSenseTransport::new(inner, vec![7, 0, 0, 200, 0xEE, 0xEE, 0xEE, 0xEE]);
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    assert_eq!(dev.write_cache_state(), WriteCacheState::Unknown);
 }

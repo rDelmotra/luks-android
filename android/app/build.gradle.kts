@@ -68,6 +68,21 @@ android {
             useLegacyPackaging = false
         }
     }
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+}
+
+// TreeImportTraceTest compares TreeImporter's recorded operation sequence
+// against the checked-in traces the Rust kernel oracle replays. Gradle cannot
+// see that dependency on its own: editing a trace leaves the test task
+// up-to-date, so it does not rerun and a drifted fixture passes. Measured --
+// a deliberately corrupted trace reported BUILD SUCCESSFUL until --rerun-tasks
+// forced it. Declaring the directory as an input closes that.
+tasks.withType<Test>().configureEach {
+    inputs.dir(rootProject.layout.projectDirectory.dir("../fixtures/transfer"))
+        .withPropertyName("transferTraceFixtures")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 // Gradle has no idea Cargo exists. Rather than a plugin that breaks on every
@@ -136,9 +151,13 @@ val checkNoWriteCodeInRelease by tasks.registering {
 
                     tools/build-android-libs.sh
 
-                (--write is debug-only and the script already refuses to pair
-                it with --release; this catches the other order — a leftover
-                debug .so being packaged into a release APK.)
+                (This task is the ONLY thing preventing a write-enabled .so
+                from reaching a release APK. An earlier version of this
+                message claimed build-android-libs.sh refuses to pair --write
+                with --release; it does not, and never did — `--write` alone
+                builds a write-enabled release-profile .so deliberately, for
+                local benchmarking. So this check is the safety boundary, not
+                a backstop for one.)
                 """.trimIndent()
             )
         }
@@ -159,10 +178,13 @@ dependencies {
     implementation(libs.androidx.compose.ui.graphics)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
 
     debugImplementation(libs.androidx.compose.ui.tooling)
 
+    testImplementation(libs.junit)
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
 }
+

@@ -254,6 +254,22 @@ fn reports_file_metadata() {
     }
 }
 
+#[test]
+fn a_directory_listing_reports_size_and_mtime_matching_file_info() {
+    for name in IMAGES {
+        let data = image(name);
+        let fs = Ext4::mount(&data).unwrap();
+
+        let entries = fs.list_dir("/").unwrap();
+        let entry = entries.iter().find(|e| e.name == "hello.txt").unwrap();
+        let info = fs.file_info("/hello.txt").unwrap();
+
+        assert_eq!(entry.size, info.size, "{name}");
+        assert_eq!(entry.mtime, info.mtime, "{name}");
+        assert_eq!(entry.size, 11, "{name}");
+    }
+}
+
 // --- symlinks --------------------------------------------------------------
 
 #[test]
@@ -459,3 +475,34 @@ fn superblock_tail_fields_come_from_their_own_offsets() {
         "s_free_blocks_count_lo (dumpe2fs: Free blocks: 2793) was disturbed",
     );
 }
+
+#[test]
+fn superblock_parses_s_r_blocks_count() {
+    const SB: usize = 1024;
+    // Test on real fixtures
+    for name in IMAGES {
+        let data = image(name);
+        let fs = Ext4::mount(&data).unwrap();
+        let sb = fs.superblock();
+        // Reserved block count in these fixtures is > 0 (standard 5% or minimum allocated)
+        let expected_lo = u32::from_le_bytes(data[SB + 8..SB + 12].try_into().unwrap()) as u64;
+        assert_eq!(sb.s_r_blocks_count & 0xFFFF_FFFF, expected_lo, "{name} s_r_blocks_count_lo");
+    }
+
+    // Test 64-bit high half parsing
+    let mut img = image("csum-uuid-4k.img");
+    let put32 = |b: &mut [u8], off: usize, v: u32| {
+        b[SB + off..SB + off + 4].copy_from_slice(&v.to_le_bytes());
+    };
+    put32(&mut img, 0x08, 0x1234_5678); // s_r_blocks_count_lo
+    put32(&mut img, 0x154, 0x0000_0042); // s_r_blocks_count_hi
+
+    let fs = Ext4::mount(&img).expect("mount patched fixture");
+    let sb = fs.superblock();
+    assert_eq!(
+        sb.s_r_blocks_count,
+        0x0000_0042_1234_5678,
+        "s_r_blocks_count must combine low (0x08) and high (0x154) halves"
+    );
+}
+

@@ -315,3 +315,24 @@ fn a_flush_that_fails_for_any_other_reason_is_still_an_error() {
         "the error should name the command that failed: {err}"
     );
 }
+
+#[test]
+fn max_scsi_transfer_caps_single_write_commands() {
+    let drive = MockUsbDrive::new(image(4096)).with_max_transfer(1024 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    let payload = vec![0x5Au8; 1024 * 1024];
+    dev.write_at(0, &payload).expect("write 1 MiB");
+
+    let stats = *dev.transport().stats.borrow();
+    // 1 MiB in 128 KiB commands = 8 commands
+    assert!(
+        stats.write_commands >= 8,
+        "expected at least 8 write commands, got {}",
+        stats.write_commands
+    );
+    assert_eq!(
+        stats.largest_write_blocks, 256,
+        "capped at 128 KiB / 512 = 256 blocks"
+    );
+}

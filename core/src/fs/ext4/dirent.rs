@@ -243,7 +243,7 @@ impl<D: WriteAt> Ext4<D> {
     /// Whether `name` already exists in `dir`. Creating a duplicate would give
     /// the directory two records with one name, and which one a lookup finds
     /// depends on scan order.
-    fn find_entry(
+    pub(crate) fn find_entry(
         &self,
         dir: &crate::fs::ext4::Inode,
         name: &[u8],

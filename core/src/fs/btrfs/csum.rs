@@ -97,7 +97,7 @@ impl<D: ReadAt> Btrfs<D> {
             return Ok(Verified::NoChecksumTree);
         };
         let sector = self.sector_size() as usize;
-        if sector == 0 || logical % sector as u64 != 0 || data.len() % sector != 0 {
+        if sector == 0 || !logical.is_multiple_of(sector as u64) || !data.len().is_multiple_of(sector) {
             return Err(LuksError::CorruptFs(
                 "btrfs data checksum asked for a range that is not whole sectors",
             ));

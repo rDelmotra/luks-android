@@ -20,11 +20,53 @@ pub mod bridge;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-use jni::objects::{JByteArray, JClass, JString, JValue, JByteBuffer};
+#[cfg(feature = "dangerous-write-support")]
+use jni::objects::JByteArray;
+use jni::objects::{JByteBuffer, JClass, JString, JValue};
 use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use luks_core::error::LuksError;
+
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+mod log {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int};
+
+    const ANDROID_LOG_DEBUG: c_int = 3;
+    const ANDROID_LOG_INFO: c_int = 4;
+    const ANDROID_LOG_WARN: c_int = 5;
+    const ANDROID_LOG_ERROR: c_int = 6;
+    const TAG: &[u8] = b"luks_native\0";
+
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+
+    pub fn write(prio: c_int, msg: &str) {
+        if let Ok(c_msg) = CString::new(msg) {
+            unsafe {
+                __android_log_write(prio, TAG.as_ptr() as *const c_char, c_msg.as_ptr());
+            }
+        }
+    }
+
+    pub fn d(msg: &str) { write(ANDROID_LOG_DEBUG, msg); }
+    pub fn i(msg: &str) { write(ANDROID_LOG_INFO, msg); }
+    pub fn w(msg: &str) { write(ANDROID_LOG_WARN, msg); }
+    pub fn e(msg: &str) { write(ANDROID_LOG_ERROR, msg); }
+}
+
+#[cfg(not(target_os = "android"))]
+#[allow(dead_code)]
+mod log {
+    pub fn d(_msg: &str) {}
+    pub fn i(_msg: &str) {}
+    pub fn w(_msg: &str) {}
+    pub fn e(_msg: &str) {}
+}
 
 const EXCEPTION_CLASS: &str = "dev/luksandroid/LuksException";
 
@@ -64,15 +106,19 @@ fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>
         Ok(Ok(value)) => value,
         Ok(Err(fail)) => {
             let (code, msg) = fail.parts();
+            log::e(&format!("guard failed [{}]: {}", code, msg));
             throw(env, code, &msg);
             default
         }
         Err(payload) => {
             let msg = panic_message(&payload);
+            let err_msg = format!("internal error (this is a bug): {msg}");
+            log::e(&format!("guard panicked: {}", err_msg));
+            luks_core::forensic::record_panic(file!(), line!(), 0, &msg);
             throw(
                 env,
                 bridge::code::PANIC,
-                &format!("internal error (this is a bug): {msg}"),
+                &err_msg,
             );
             default
         }
@@ -122,13 +168,15 @@ fn jstr(env: &mut JNIEnv, s: &JString) -> R<String> {
         .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("bad string argument: {e}")))
 }
 
-fn out_string(env: &mut JNIEnv, s: &str) -> R<jstring> {
-    env.new_string(s).map(|v| v.into_raw()).map_err(|e| {
-        Fail::Msg(
-            bridge::code::GENERIC,
-            format!("cannot allocate string: {e}"),
-        )
-    })
+fn out_string(env: &mut JNIEnv, s: impl AsRef<str>) -> R<jstring> {
+    env.new_string(s.as_ref())
+        .map(|v| v.into_raw())
+        .map_err(|e| {
+            Fail::Msg(
+                bridge::code::GENERIC,
+                format!("cannot allocate string: {e}"),
+            )
+        })
 }
 
 fn out_bytes(env: &mut JNIEnv, b: &[u8]) -> R<jbyteArray> {
@@ -147,6 +195,28 @@ fn bad_handle(msg: &'static str) -> Fail {
 }
 
 // ------------------------------------------------------------------ lifecycle
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDumpForensicLog<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let dump = luks_core::forensic::dump_text();
+        out_string(env, dump)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeClearForensicLog<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) {
+    guard(&mut env, (), |_env| {
+        luks_core::forensic::clear();
+        Ok(())
+    })
+}
 
 #[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeVersion<'l>(
@@ -201,6 +271,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenDevice<'l>(
         let handle = unsafe {
             bridge::open_usb_device(fd, ep_in, ep_out, interface, max_transfer.max(0) as usize)
         }?;
+        log::i(&format!("nativeOpenDevice: opened fd={} ep_in={} ep_out={} interface={}", fd, ep_in, ep_out, interface));
         Ok(bridge::into_raw(bridge::Payload::Device(handle)))
     })
 }
@@ -212,9 +283,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseDevice<'l>(
     handle: jlong,
 ) {
     guard(&mut env, (), |_env| {
-        // SAFETY: freeing a handle we minted. The magic tag makes a double close
-        // or a wrong-type close a no-op rather than a corrupt free.
-        unsafe { bridge::drop_device(handle) };
+        log::i("nativeCloseDevice");
+        bridge::drop_device(handle);
         Ok(())
     })
 }
@@ -226,8 +296,49 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseVolume<'l>(
     handle: jlong,
 ) {
     guard(&mut env, (), |_env| {
-        // SAFETY: as above. The master key inside is zeroed by `Secret::drop`.
-        unsafe { bridge::drop_volume(handle) };
+        log::i("nativeCloseVolume");
+        bridge::drop_volume(handle);
+        Ok(())
+    })
+}
+
+// ----------------------------------------------------------- cancel tokens
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCreateCancelToken<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let token = bridge::register_cancel_token();
+        Ok(token as jlong)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCancelOperation<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    token_id: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        if token_id > 0 {
+            bridge::cancel_operation(token_id as u64);
+        }
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseCancelToken<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    token_id: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        if token_id > 0 {
+            bridge::unregister_cancel_token(token_id as u64);
+        }
         Ok(())
     })
 }
@@ -241,8 +352,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDeviceInfo<'l>(
     handle: jlong,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the device magic tag.
-        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let dev = bridge::device_ref(handle).map_err(bad_handle)?;
         let json = dev.info_json();
         out_string(env, &json)
     })
@@ -261,8 +371,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
     length: jint,
 ) -> jlong {
     guard(&mut env, 0, |env| {
-        // SAFETY: validated against the device magic tag.
-        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let dev = bridge::device_ref(handle).map_err(bad_handle)?;
         let offset = u64::try_from(partition_offset).map_err(|_| {
             Fail::Msg(
                 bridge::code::GENERIC,
@@ -292,7 +401,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
+        let start = std::time::Instant::now();
         let volume = dev.unlock(offset, slice)?;
+        log::i(&format!("nativeUnlock: volume unlocked in {} ms", start.elapsed().as_millis()));
         Ok(bridge::into_raw(bridge::Payload::Volume(volume)))
     })
 }
@@ -306,8 +417,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeVolumeInfo<'l>(
     handle: jlong,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let json = vol.info_json();
         out_string(env, &json)
     })
@@ -321,10 +431,28 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeListDir<'l>(
     path: JString<'l>,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path = jstr(env, &path)?;
         let json = vol.list_dir_json(&path)?;
+        out_string(env, &json)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeListDirPaged<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    offset: jlong,
+    limit: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let offset_val = usize::try_from(offset.max(0)).unwrap_or(0);
+        let limit_val = usize::try_from(limit.max(0)).unwrap_or(0);
+        let json = vol.list_directory_paged(&path, offset_val, limit_val)?;
         out_string(env, &json)
     })
 }
@@ -337,8 +465,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileInfo<'l>(
     path: JString<'l>,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path = jstr(env, &path)?;
         let json = vol.file_info_json(&path)?;
         out_string(env, &json)
@@ -356,8 +483,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFile<'l>(
     max_bytes: jlong,
 ) -> jbyteArray {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path = jstr(env, &path)?;
         let cap = if max_bytes <= 0 {
             32 * 1024 * 1024
@@ -384,8 +510,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadChunk<'l>(
     len: jint,
 ) -> jbyteArray {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path = jstr(env, &path)?;
         if offset < 0 || len <= 0 {
             return Err(Fail::Msg(
@@ -413,11 +538,47 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256<'l>(
     chunk_bytes: jint,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path = jstr(env, &path)?;
         let json = vol.sha256_json(&path, chunk_bytes.max(0) as usize)?;
         out_string(env, &json)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256WithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    chunk_bytes: jint,
+    cancel_token: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let json = vol.sha256_json_with_cancel(&path, chunk_bytes.max(0) as usize, token)?;
+        out_string(env, &json)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFileStream<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    path: JString<'l>,
+    chunk_bytes: jint,
+    cancel_token: jlong,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let mut sink = std::io::sink();
+        let bytes = vol.read_file_stream(&path, &mut sink, chunk_bytes.max(0) as usize, token)?;
+        Ok(bytes as jlong)
     })
 }
 
@@ -434,8 +595,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkRead<'l>(
     chunk_bytes: jint,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the device magic tag.
-        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let dev = bridge::device_ref(handle).map_err(bad_handle)?;
         let json = dev.benchmark_json(bytes.max(0) as u64, chunk_bytes.max(0) as usize)?;
         out_string(env, &json)
     })
@@ -456,8 +616,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBenchmarkWrite<'l>(
     chunk_bytes: jint,
 ) -> jstring {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        // SAFETY: validated against the device magic tag.
-        let dev = unsafe { bridge::device_ref(handle) }.map_err(bad_handle)?;
+        let dev = bridge::device_ref(handle).map_err(bad_handle)?;
         let json = dev.benchmark_write_json(bytes.max(0) as u64, chunk_bytes.max(0) as usize)?;
         out_string(env, &json)
     })
@@ -521,14 +680,15 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteFile<'l>(
     data: JByteArray<'l>,
 ) -> jlong {
     guard(&mut env, 0, |env| {
-        // SAFETY: validated against the volume magic tag.
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let parent_path = jstr(env, &parent_path)?;
         let name = jstr(env, &name)?;
         let bytes = env
             .convert_byte_array(&data)
             .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot read data: {e}")))?;
+        let start = std::time::Instant::now();
         let ino = vol.write_file(&parent_path, &name, &bytes)?;
+        log::i(&format!("nativeWriteFile: wrote {} bytes in {} ms", bytes.len(), start.elapsed().as_millis()));
         Ok(ino as jlong)
     })
 }
@@ -542,10 +702,30 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
     size: jlong,
 ) -> jlong {
     guard(&mut env, 0, |_env| {
-        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
         let size = u64::try_from(size)
             .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative file size".into()))?;
         let writer = vol.begin_file(size)?;
+        Ok(bridge::into_raw(bridge::Payload::Writer(
+            bridge::WriterHandle {
+                volume_handle: volume,
+                volume_id: vol.id,
+                writer: std::sync::Mutex::new(Some(writer)),
+            },
+        )))
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFileStreaming<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let writer = vol.begin_file_streaming()?;
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
@@ -567,8 +747,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
     len: jint,
 ) {
     guard(&mut env, (), |env| {
-        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
-        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
         if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
@@ -598,6 +778,48 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
 
 #[cfg(feature = "dangerous-write-support")]
 #[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunkWithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    writer: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+    cancel_token: jlong,
+) {
+    guard(&mut env, (), |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
+        if wh.volume_id != vol.id {
+            return Err(bad_handle("writer belongs to another volume"));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let state = slot
+            .as_mut()
+            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        Ok(vol.write_file_chunk_with_cancel(state, slice, token)?)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
@@ -607,8 +829,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
     name: JString<'l>,
 ) -> jlong {
     guard(&mut env, 0, |env| {
-        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
-        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
         if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
@@ -620,9 +842,28 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
             .unwrap_or_else(|p| p.into_inner())
             .take()
             .ok_or_else(|| bad_handle("writer is finished or closed"))?;
+        let start = std::time::Instant::now();
         let result = vol.finish_file(state, &parent_path, &name);
-        unsafe { bridge::drop_writer(writer) };
-        Ok(result? as jlong)
+        bridge::drop_writer(writer);
+        let ino = result?;
+        log::i(&format!("nativeFinishFile: file finished in {} ms", start.elapsed().as_millis()));
+        Ok(ino as jlong)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCommitActiveBatch<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let start = std::time::Instant::now();
+        vol.commit_active_batch()?;
+        log::i(&format!("nativeCommitActiveBatch: committed in {} ms", start.elapsed().as_millis()));
+        Ok(())
     })
 }
 
@@ -635,15 +876,18 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
     writer: jlong,
 ) {
     guard(&mut env, (), |_env| {
-        let vol = unsafe { bridge::volume_ref(volume) }.map_err(bad_handle)?;
-        let wh = unsafe { bridge::writer_ref(writer) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
         if wh.volume_id != vol.id {
             return Err(bad_handle("writer belongs to another volume"));
         }
-        if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            vol.abandon_file(state);
-        }
-        unsafe { bridge::drop_writer(writer) };
+        let abandon_res = if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            vol.abandon_file(state)
+        } else {
+            Ok(())
+        };
+        bridge::drop_writer(writer);
+        abandon_res?;
         Ok(())
     })
 }
@@ -657,9 +901,65 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDeleteFile<'l>(
     path: JString<'l>,
 ) {
     guard(&mut env, (), |env| {
-        let vol = unsafe { bridge::volume_ref(handle) }.map_err(bad_handle)?;
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
         let path_str = jstr(env, &path)?;
         vol.delete_file(&path_str)?;
+        log::i("nativeDeleteFile: file deleted");
         Ok(())
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCreateDirectory<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    parent_path: JString<'l>,
+    name: JString<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let parent_path_str = jstr(env, &parent_path)?;
+        let name_str = jstr(env, &name)?;
+        let ino = vol.create_directory(&parent_path_str, &name_str)?;
+        log::i("nativeCreateDirectory: directory created");
+        Ok(ino as jlong)
+    })
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeRename<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    old_parent: JString<'l>,
+    old_name: JString<'l>,
+    new_parent: JString<'l>,
+    new_name: JString<'l>,
+) {
+    guard(&mut env, (), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let old_parent_str = jstr(env, &old_parent)?;
+        let old_name_str = jstr(env, &old_name)?;
+        let new_parent_str = jstr(env, &new_parent)?;
+        let new_name_str = jstr(env, &new_name)?;
+        vol.rename(&old_parent_str, &old_name_str, &new_parent_str, &new_name_str)?;
+        log::i("nativeRename: item renamed");
+        Ok(())
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeStatFs<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let json = vol.statfs_json()?;
+        out_string(env, &json)
     })
 }

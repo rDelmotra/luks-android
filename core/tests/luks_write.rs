@@ -21,7 +21,7 @@
 //! If it matches, the drive we write is a drive Linux can read.
 #![cfg(feature = "dangerous-write-support")]
 
-use luks_core::device::{FileDevice, ReadAt, WriteAt};
+use luks_core::device::{FileDevice, ReadAt};
 use luks_core::fs::MountedFs;
 use luks_core::luks::{self, LuksVolume};
 
