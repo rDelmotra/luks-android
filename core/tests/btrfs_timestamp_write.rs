@@ -70,7 +70,7 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
     match output {
         Ok(out) => {
             if out.status.success() {
-                println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+                println!("ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
                 true
             } else {
                 eprintln!(

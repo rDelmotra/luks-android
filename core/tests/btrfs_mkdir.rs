@@ -68,13 +68,13 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
         Ok(out) => {
             if out.status.success() {
                 println!(
-                    "✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}",
+                    "ORACLE VERIFIED: verify-btrfs.sh passed for {}",
                     image_path.display()
                 );
                 true
             } else {
                 eprintln!(
-                    "❌ ORACLE FAILED (exit code {:?}):\nstdout:\n{}\nstderr:\n{}",
+                    "ORACLE FAILED (exit code {:?}):\nstdout:\n{}\nstderr:\n{}",
                     out.status.code(),
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)

@@ -101,7 +101,7 @@ fn run_verify_script(image_path: &PathBuf) -> (bool, String, String) {
         Ok(out) => {
             let success = out.status.success();
             if success {
-                println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+                println!("ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
             }
             (
                 success,

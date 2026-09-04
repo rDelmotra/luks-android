@@ -8,17 +8,17 @@
 # here if the .so is missing, so the two cannot silently drift.
 #
 # Usage:
-#   tools/build-android-libs.sh              # arm64 only, release  (the Pixel)
+#   tools/build-android-libs.sh              # arm64 only, release  (standard mobile target)
 #   tools/build-android-libs.sh --debug      # unoptimised
 #   tools/build-android-libs.sh --all-abis   # arm64 + armv7 + x86_64
 #   tools/build-android-libs.sh --debug --write   # + the write path, unoptimised
 #   tools/build-android-libs.sh --write           # + the write path, release profile —
 #                                                  # local benchmarking only, see below
 #
-# ⚠️  --debug builds AES ~60x slower and Argon2 slower still. Use it to chase a
+# WARNING: --debug builds AES ~60x slower and Argon2 slower still. Use it to chase a
 #     crash, never to judge performance.
 #
-# ⚠️  --write links `dangerous-write-support` into the .so. `--write` alone
+# WARNING: --write links `dangerous-write-support` into the .so. `--write` alone
 #     (no `--debug`) is accepted deliberately — see the note by WRITE= below —
 #     and builds a write-enabled *release-profile* .so for local benchmarking.
 #     This script does NOT refuse that combination and never did; do not rely
@@ -106,7 +106,7 @@ if [[ -f "$JNILIBS/arm64-v8a/libluks_jni.so" ]]; then
 fi
 
 if [[ "$WRITE" == 1 ]]; then
-    echo "⚠️  this .so has the write path linked in — rebuild without --write" >&2
+    echo "WARNING: this .so has the write path linked in — rebuild without --write" >&2
     echo "    before doing anything except deliberately testing writes." >&2
 fi
 

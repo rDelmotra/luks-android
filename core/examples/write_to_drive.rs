@@ -3,7 +3,7 @@
 //! ```text
 //! cargo build --release --features dangerous-write-support --example write_to_drive
 //! printf 'test' | sudo ./target/release/examples/write_to_drive \
-//!     /dev/rdisk4 61524148224 ./some-file.txt name-on-drive.txt
+//!     /dev/rdiskN <expected-bytes> ./some-file.txt name-on-drive.txt
 //! ```
 //!
 //! The expected byte count is mandatory and is checked against the device
@@ -54,7 +54,7 @@ fn main() {
         Ok(ino) => {
             println!();
             println!("OK — wrote inode {ino}. Unplug cleanly, then verify with a Linux");
-            println!("kernel rather than with this tool. See STATE.md.");
+            println!("kernel rather than with this tool.");
         }
         Err(e) => {
             eprintln!();

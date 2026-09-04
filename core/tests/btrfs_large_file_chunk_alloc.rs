@@ -94,7 +94,7 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
     match output {
         Ok(out) => {
             if out.status.success() {
-                println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+                println!("ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
                 true
             } else {
                 eprintln!(
@@ -171,7 +171,7 @@ fn verify_kernel_readback_sha256(image_path: &PathBuf, files: &[(&str, &str)]) -
     match script_output {
         Ok(out) => {
             if out.status.success() {
-                println!("✅ ORACLE VERIFIED: kernel sha256 passed for {}", image_path.display());
+                println!("ORACLE VERIFIED: kernel sha256 passed for {}", image_path.display());
                 true
             } else {
                 eprintln!(

@@ -181,8 +181,8 @@ impl FileDevice {
     /// # Why the length is not optional
     ///
     /// Device numbering is assigned by plug order on every OS this targets,
-    /// not fixed by identity. In this project's own history `/dev/disk4` was a
-    /// an encrypted storage device in one session and an unrelated 61 GB stick in the
+    /// not fixed by identity. For instance, a dynamic path like `/dev/diskN` can be
+    /// an encrypted storage device in one session and an unrelated secondary drive in the
     /// next — same path, different drive. A path checked by a human at one
     /// moment and opened at another can mean a different disk.
     ///
@@ -222,8 +222,8 @@ impl FileDevice {
     /// Neither obvious way to get a device's size works here.
     /// `metadata().len()` reports 0 for special files — this crate already
     /// treats that as "length unknown" for reads. And `seek(SeekFrom::End)`
-    /// **also reports 0** on a macOS raw character device: measured directly
-    /// on `/dev/rdisk4`, a 61,524,148,224-byte stick, which returned 0. An
+    /// **also reports 0** on a macOS raw character device: tested directly
+    /// on raw block devices which returned 0. An
     /// ioctl (`DKIOCGETBLOCKCOUNT`) would answer, but this crate is
     /// `#![forbid(unsafe_code)]` and that belongs in a platform helper.
     ///
@@ -555,7 +555,7 @@ impl WriteAt for FileDevice {
             // regular file ENOTTY would be a real, surprising error and stays
             // one. Caveat, worth stating: this does not force the *drive's
             // own* write cache — nothing available without an ioctl does.
-            // Seen live on /dev/rdisk4, 2026-08-05 (INCIDENTS.md).
+            // Observed on raw macOS character device nodes.
             Err(e) if self.align != 0 && e.raw_os_error() == Some(25) => Ok(()),
             Err(source) => Err(LuksError::Io {
                 path: self.path.clone(),

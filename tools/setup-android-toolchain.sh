@@ -24,7 +24,7 @@ MIN_FREE_GB=15   # NDK alone is ~5-7 GB; 8 was optimistic
 API_LEVEL=29          # linker API level; matches DEC-012 minSdk
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
-ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
+ok()   { printf '    \033[32m[OK]\033[0m %s\n' "$*"; }
 warn() { printf '    \033[33m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31mFAIL:\033[0m %s\n' "$*" >&2; exit 1; }
 
@@ -39,7 +39,7 @@ free_gb=$(df -g / | awk 'NR==2 {print $4}')
 ok "${free_gb} GB free"
 
 command -v brew >/dev/null || die "Homebrew not found."
-command -v java >/dev/null || die "No JDK on PATH. sdkmanager needs one (you have JDK 21 per STATE.md)."
+command -v java >/dev/null || die "No JDK on PATH. sdkmanager needs one (JDK 17+ recommended)."
 ok "brew + JDK present"
 
 # Homebrew's rust and rustup's can both be on PATH (DEC-021 keeps Homebrew's
@@ -237,11 +237,11 @@ cat << EOF
 
 Open a new terminal (or 'source ~/.zshrc') so the PATH changes take effect.
 
-Next, per STATE.md Phase 1c/1d:
+Next steps:
   1. Add "cdylib" to crate-type in core/Cargo.toml to emit the .so
   2. Optionally: brew install --cask android-studio   (DEC-016; IDE only)
   3. Create the Android app (Empty Compose Activity, minSdk $API_LEVEL)
-  4. Plug in the Pixel 8 and confirm: adb devices
+  4. Plug in your Android test device and confirm: adb devices
 
 Note: do NOT install the Android Emulator. USB host passthrough does not work
 in it, so every Phase 1 test needs the physical phone regardless.

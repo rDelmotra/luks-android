@@ -60,7 +60,7 @@ pub struct MockUsbDrive {
     /// Report capacity via the 0xFFFFFFFF escape, forcing READ CAPACITY(16).
     pub force_rc16: bool,
     /// Opcodes to answer with CSW status 1 — "that failed" — instead of doing
-    /// them. A real Pixel 8 refused every `WRITE(10)` this way while reads kept
+    /// them. A physical Android device refused every `WRITE(10)` this way while reads kept
     /// working, and nothing here could reproduce that: the mock had no way to
     /// say no.
     pub fail_opcodes: RefCell<Vec<u8>>,

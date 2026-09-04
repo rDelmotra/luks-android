@@ -2,13 +2,13 @@
 //!
 //! ```text
 //! cargo build --release --example check_size
-//! sudo ./target/release/examples/check_size /dev/rdisk4 61524148224
+//! sudo ./target/release/examples/check_size /dev/rdiskN <expected-bytes>
 //! ```
 //!
 //! Exists because the check in `FileDevice::open_writable` cannot be tested on
 //! a raw device from `cargo test`: opening one needs root, and a test that
 //! needed root would simply be skipped and rot. `seek(SeekFrom::End)` reporting
-//! 0 on `/dev/rdisk4` was found this way, after being assumed to work.
+//! 0 on raw character devices was found this way, after being assumed to work.
 //!
 //! This opens the device **read-only** and never writes, so it is safe to point
 //! at anything, including a disk holding real data.

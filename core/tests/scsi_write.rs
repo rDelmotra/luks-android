@@ -183,7 +183,7 @@ fn the_write_path_reaches_a_luks_volume_through_scsi() {
 
 #[test]
 fn a_refused_write_carries_the_drive_s_reason() {
-    // The failure this reproduces happened on hardware: a Pixel 8 refused
+    // The failure this reproduces happened on hardware: an Android test device refused
     // every WRITE(10) with CSW status 1 while reads kept working perfectly,
     // and the error reaching the UI was the bare text "SCSI command failed" —
     // equally consistent with a write-protected drive, a CDB the drive would
@@ -224,7 +224,7 @@ fn a_refused_write_carries_the_drive_s_reason() {
 fn reads_still_work_while_writes_are_refused() {
     // Exactly the shape of the hardware failure, and worth pinning: if a
     // refused write left the bus desynchronised, the next read would fail too
-    // and the diagnosis would point at the wrong layer. On the Pixel a 26-byte
+    // and the diagnosis would point at the wrong layer. On physical hardware a 26-byte
     // export succeeded after three refused writes.
     let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x2A, [0x7, 0x27, 0x00]);
     let dev = ScsiBlockDevice::open(drive).unwrap();

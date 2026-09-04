@@ -9,7 +9,7 @@
 # reader. This one is the kernel's own idea of a LUKS2 Btrfs drive, and the
 # Btrfs writer will be graded against `btrfs check` and `btrfs scrub` on it.
 #
-# ⚠️ The passphrase is a *test* passphrase. Anything written to a drive made by
+# WARNING: The passphrase is a *test* passphrase. Anything written to a drive made by
 # this script is readable by anyone who has read this file. The stick is a test
 # target and must never hold real data.
 #

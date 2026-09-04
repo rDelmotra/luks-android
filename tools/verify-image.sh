@@ -58,9 +58,8 @@ REMOTE_SH="/tmp/$NAME.sh"
 LOCAL_SH="$(mktemp)"
 trap 'rm -f "$LOCAL_SH"' EXIT
 
-# ⚠️ The remote script is copied as a *file* and then run, rather than piped
-# into `sudo bash -s`. This is the gotcha recorded in STATE.md, and it cost an
-# hour once before: if the script arrives on stdin, it is competing with the
+# NOTE: The remote script is copied as a *file* and then run, rather than piped
+# into `sudo bash -s`. If the script arrives on stdin, it is competing with the
 # passphrase that `cryptsetup --key-file=-` also wants from stdin. The symptom
 # is not an error but a hang, or — as here — a passphrase that silently reads
 # as empty and fails with "No key available with this passphrase."

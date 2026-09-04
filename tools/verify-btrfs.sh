@@ -32,7 +32,7 @@
 # 2026-08-14, not assumed. That is this script's control: a check that cannot
 # fail on a known-bad input is not a check.
 #
-# ⚠️ scrub's own exit code is NOT enough. Measured 2026-08-14: zeroing only
+# NOTE: scrub's own exit code is NOT enough. Measured 2026-08-14: zeroing only
 # the second DUP metadata mirror of a live tree block (exactly the failure
 # mode §2 of feature-btrfs-write.md exists to catch) makes `btrfs scrub start
 # -Bdr` print "Error summary: verify=4 / Corrected: 4 / Uncorrectable: 0" and

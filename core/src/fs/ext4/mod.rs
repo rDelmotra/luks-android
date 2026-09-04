@@ -54,7 +54,7 @@ const RO_COMPAT_QUOTA: u32 = 0x0100;
 /// bit == block hands out block numbers wrong by the cluster ratio — on top
 /// of other files.
 ///
-/// ⚠️ This is a **ro_compat** bit (0x0200 there), *not* incompat — old
+/// NOTE: This is a **ro_compat** bit (0x0200 there), *not* incompat — old
 /// kernels may still mount bigalloc read-only, which is exactly the situation
 /// this crate is in. The same value in `feature_incompat` is `flex_bg`, which
 /// nearly every modern filesystem has: testing the wrong field refuses to

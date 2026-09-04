@@ -69,7 +69,7 @@ fn run_verify_script(image_path: &PathBuf) -> bool {
     match output {
         Ok(out) => {
             if out.status.success() {
-                println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+                println!("ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
                 true
             } else {
                 eprintln!(
@@ -327,7 +327,7 @@ fn test_deliberate_corrupted_checksums_fails_scrub() {
             "Expected scrub failure message in output, got:\n{}",
             combined_output
         );
-        println!("✅ CONTROL CONFIRMED: verify-btrfs.sh correctly failed on corrupted checksums");
+        println!("CONTROL CONFIRMED: verify-btrfs.sh correctly failed on corrupted checksums");
     }
 
     let _ = fs::remove_file(&temp_img);

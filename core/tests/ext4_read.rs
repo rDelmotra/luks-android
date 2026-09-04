@@ -369,7 +369,7 @@ impl luks_core::device::ReadAt for Counting {
     }
 }
 
-/// 🐛 Regression guard for a bug found on real hardware, not by this suite.
+/// Regression guard for a bug found on real hardware, not by this suite.
 ///
 /// `read_inode_data` used to map and read **one filesystem block at a time**,
 /// re-walking the extent tree for each. Every test still passed — the bytes

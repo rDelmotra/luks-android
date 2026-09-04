@@ -98,7 +98,7 @@ fn run_verify_script(image_path: &Path) -> (bool, String) {
         .expect("execute verify-btrfs.sh");
 
     if output.status.success() {
-        println!("✅ ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
+        println!("ORACLE VERIFIED: verify-btrfs.sh passed for {}", image_path.display());
     }
 
     let combined = format!(
@@ -142,7 +142,7 @@ fn run_btrfs_check(image_path: &Path) -> (bool, String) {
         .expect("execute btrfs check in colima");
 
     if output.status.success() {
-        println!("✅ ORACLE VERIFIED: btrfs check passed for {}", image_path.display());
+        println!("ORACLE VERIFIED: btrfs check passed for {}", image_path.display());
     }
 
     let combined = format!(

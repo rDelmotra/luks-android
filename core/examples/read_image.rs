@@ -17,7 +17,7 @@
 //! shell pipeline lands in `~/.zsh_history` where it outlives the session.
 //!
 //! ```text
-//! sudo cargo run --release --example read_image -- /dev/rdisk4s3  # prompts
+//! sudo cargo run --release --example read_image -- /dev/rdiskNsM  # prompts
 //! printf 'test' | cargo run --release --example read_image -- disk.img  # scripted
 //! ```
 //!

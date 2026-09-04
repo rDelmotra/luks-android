@@ -139,7 +139,7 @@ pub fn opcode_name(op: u8) -> String {
 /// protected, bad LBA, a field this drive does not accept, a dying medium —
 /// arrives only in response to a REQUEST SENSE issued afterwards, and is lost
 /// the moment any other command is sent. Before this existed, a real
-/// `WRITE(10)` refusal on a Pixel 8 surfaced as the bare text "SCSI command
+/// `WRITE(10)` refusal on an Android test device surfaced as the bare text "SCSI command
 /// failed", which is compatible with every one of those causes and identifies
 /// none of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -673,7 +673,7 @@ impl DeviceHandle {
     /// isolates exactly that: one buffer allocated once, no LUKS, no ext4, no
     /// Java array. If it also reports ~7 MB/s the write path is innocent and
     /// the cost is the device, the bus or the kernel. If it reports ~22 — what
-    /// the same drive does from a Mac at the same command size — the gap is
+    /// the same drive does from a desktop workstation at the same command size — the gap is
     /// ours after all, and lives somewhere this bypasses.
     ///
     /// # Where it writes

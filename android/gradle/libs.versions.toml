@@ -1,6 +1,6 @@
 # Versions checked against the actual Maven metadata on 2026-08-01, not guessed.
 #
-# ⚠️  These are NOT the newest releases, and that is forced, not conservatism.
+# NOTE: These are NOT the newest releases, and that is forced, not conservatism.
 #
 # The androidx line has moved to requiring AGP 9.1+ and `compileSdk 37`
 # (core-ktx 1.19.0, lifecycle 2.11.0 and activity-compose 1.13.0 all fail the

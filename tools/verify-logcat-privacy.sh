@@ -72,18 +72,18 @@ for token in "${TOKENS[@]}"; do
     # Search case-insensitively in the logcat output
     MATCHES="$(grep -i -F "$token" "$LOG_FILE" || true)"
     if [ -n "$MATCHES" ]; then
-        echo "❌ LEAK DETECTED: token '$token' found in logcat output:" >&2
+        echo "FAIL: LEAK DETECTED: token '$token' found in logcat output:" >&2
         echo "$MATCHES" | sed 's/^/    /' >&2
         LEAKS_FOUND=$((LEAKS_FOUND + 1))
     else
-        echo "✅ OK: token '$token' not present in logcat"
+        echo "OK: token '$token' not present in logcat"
     fi
 done
 
 # General pattern checks: verify no full paths (/storage/..., /hiu/..., etc) appeared in luks_err lines
 ERR_PATH_MATCHES="$(grep 'luks_err' "$LOG_FILE" | grep -E '(/[a-zA-Z0-9_\.\-]+){2,}' || true)"
 if [ -n "$ERR_PATH_MATCHES" ]; then
-    echo "⚠️ WARNING: potential path pattern found in luks_err logcat:" >&2
+    echo "WARNING: potential path pattern found in luks_err logcat:" >&2
     echo "$ERR_PATH_MATCHES" | sed 's/^/    /' >&2
 fi
 

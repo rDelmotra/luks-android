@@ -9,7 +9,7 @@
 //! mounted OS install.
 //!
 //! ```text
-//! sudo cargo run --release --example btrfs_probe -- /dev/rdisk4s3
+//! sudo cargo run --release --example btrfs_probe -- /dev/rdiskNsM
 //! ```
 //!
 //! The passphrase is prompted for with echo off, exactly as `read_image.rs`

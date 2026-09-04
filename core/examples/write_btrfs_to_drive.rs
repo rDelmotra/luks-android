@@ -3,7 +3,7 @@
 //! ```text
 //! cargo build --release --features dangerous-write-support --example write_btrfs_to_drive
 //! printf 'test' | sudo ./target/release/examples/write_btrfs_to_drive \
-//!     /dev/rdisk4 4294967296 ./some-file.txt name-on-drive.txt
+//!     /dev/rdiskN <expected-bytes> ./some-file.txt name-on-drive.txt
 //! ```
 //!
 //! The btrfs sibling of `write_to_drive.rs`. Same discipline: the expected
@@ -17,8 +17,8 @@
 //! anything outside `FS_TREE_OBJECTID` (feature-btrfs-write.md, "not doing
 //! this yet"). A filesystem whose free-space tree spans more than one leaf
 //! is refused by name (Fix 1, 2026-08-14) rather than silently mishandled —
-//! this is the gate that currently keeps the real storage device out of reach; a
-//! 4 GiB test stick's free-space tree fits in one leaf and is unaffected.
+//! this is the gate that currently keeps large storage devices out of reach; a
+//! partition whose free-space tree fits in one leaf is unaffected.
 
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;

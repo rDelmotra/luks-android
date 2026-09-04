@@ -8,7 +8,7 @@
 #   * Redacts all salts and digests before printing.
 #   * Writes its temp file to a private dir and shreds it on exit.
 #
-# Usage:  ./tools/luks-params.sh /dev/disk4s3
+# Usage:  ./tools/luks-params.sh /dev/diskNsM
 set -euo pipefail
 
 DEV="${1:?usage: luks-params.sh /dev/diskNsM}"

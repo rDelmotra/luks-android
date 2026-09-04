@@ -10,11 +10,11 @@
 #     if #[cfg(all(target_arch = "aarch64", aes_armv8, not(aes_force_soft)))]
 #
 # So on aarch64 the crate silently compiles the pure-software (fixslice)
-# implementation unless this flag is passed — even though every Apple Silicon
-# Mac and every modern Android phone has hardware AES, and even though
+# implementation unless this flag is passed — even though ARM64 processors
+# and modern Android devices have hardware AES, and even though
 # `cfg!(target_feature = "aes")` reports true.
 #
-# Measured on this machine (`cargo run --release --example xts_bench`),
+# Measured in reference benchmarks (`cargo run --release --example xts_bench`),
 # AES-256-XTS decryption:
 #
 #     without the flag      65 MiB/s      <- software fixslice

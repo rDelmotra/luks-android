@@ -4,9 +4,9 @@
 //! cargo test --release --features dangerous-write-support --test write_target
 //! ```
 //!
-//! Device numbering is assigned by plug order, not by identity. In this
-//! project's own history `/dev/disk4` was an encrypted storage device in one session and
-//! an unrelated 61 GB stick in the next. The check exists so that a path which
+//! Device numbering is assigned by plug order, not by identity. For instance,
+//! a dynamic path like `/dev/diskN` can be an encrypted storage device in one session and
+//! an unrelated secondary drive in the next. The check exists so that a path which
 //! has come to mean a different drive fails loudly instead of being written to.
 #![cfg(feature = "dangerous-write-support")]
 

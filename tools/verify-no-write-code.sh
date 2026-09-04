@@ -119,7 +119,7 @@ fi
 # --- the artifact that actually ships --------------------------------------
 #
 # Everything above inspects target/debug, which is what `cargo build` produces
-# on this Mac. The APK does not contain that file. It contains whatever is in
+# on the development host. The APK does not contain that file. It contains whatever is in
 # android/app/src/main/jniLibs, put there by tools/build-android-libs.sh, and
 # until this section existed nothing here ever looked at it — so a green run of
 # this script said nothing about the binary a phone would load.
@@ -133,7 +133,7 @@ JNILIB="android/app/src/main/jniLibs/arm64-v8a/libluks_jni.so"
 if [ -f "$JNILIB" ]; then
     if grep -qaE "$JNI_PATTERN" "$JNILIB"; then
         echo
-        echo "⚠️  WARNING: $JNILIB has the write path linked in." >&2
+        echo "WARNING: $JNILIB has the write path linked in." >&2
         echo "    A debug APK built from this tree can write to a drive. That is" >&2
         echo "    fine while testing writes and wrong the rest of the time." >&2
         echo "    Rebuild without it:  tools/build-android-libs.sh --debug" >&2

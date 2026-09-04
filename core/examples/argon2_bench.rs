@@ -10,8 +10,8 @@
 //!    walked sequentially, the times match — which would mean the drive's p=4
 //!    buys us nothing and unlock is ~4x slower than a naive estimate suggests.
 //!
-//! 2. **Roughly how long does a 1 GiB derivation take?** This is a Mac, so the
-//!    absolute number is optimistic for a Pixel 8 — but it establishes the order
+//! 2. **Roughly how long does a 1 GiB derivation take?** This is a desktop host, so the
+//!    absolute number is optimistic for mobile ARM64 — but it establishes the order
 //!    of magnitude and the shape of the memory/time curve.
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -59,6 +59,6 @@ fn main() {
         run(&format!("{} MiB", m / 1024), m, 4, 4);
     }
 
-    println!("\nNote: measured on Apple Silicon. A Pixel 8 will be slower —");
+    println!("\nNote: measured on desktop host. Mobile ARM64 devices will be slower —");
     println!("Argon2 is memory-bandwidth bound and phone LPDDR is well behind.");
 }
