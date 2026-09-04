@@ -1,6 +1,6 @@
 //! A small cache of parsed tree nodes.
 //!
-//! Measured on the developer's 1 TB drive, reading one 492 MiB file: **4254
+//! Measured on the developer's storage device, reading one 492 MiB file: **4254
 //! device reads, of which 3729 were 16 KiB tree nodes** against 618 large data
 //! reads. Six metadata reads per data read, because every call to
 //! [`verify_data`](super::csum) starts a fresh `search_le` at the checksum

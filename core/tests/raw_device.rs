@@ -1,7 +1,7 @@
 //! Reading through the alignment-widening path used for raw character devices.
 //!
 //! Why this exists: on macOS `/dev/rdiskN` is 5.4x faster than `/dev/diskN` for
-//! large sequential reads (measured on the developer's SSD: 722 vs 132 MiB/s),
+//! large sequential reads (measured on the developer's storage device: 722 vs 132 MiB/s),
 //! because the buffered node copies every byte through the page cache for data
 //! that is read exactly once. The catch is that the raw node rejects any read
 //! whose offset or length is not block-aligned — and the LUKS header parse does

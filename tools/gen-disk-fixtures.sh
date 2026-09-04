@@ -94,7 +94,7 @@ fi
 # encrypted volume rather than only on a bare image.
 #
 # Default geometry deliberately — not mixed block groups — so this matches what
-# is actually on the developer's drive. That costs a 128 MiB image, since
+# is actually on a reference drive. That costs a 128 MiB image, since
 # btrfs's floor for a non-mixed filesystem is ~109 MiB, but almost all of it is
 # never written and so stays zeros through the encryption: LUKS only produces
 # ciphertext where something was stored.

@@ -14,7 +14,7 @@
 //! That reasoning expired when data checksums landed. Every byte of every file
 //! now goes through here, and the table version was measured at **472 MiB/s** —
 //! 1.1 seconds of the 6.06 seconds it took to read a 515 MB file off the
-//! developer's drive, 18% of the total, to compute checksums. The hardware
+//! developer's storage device, 18% of the total, to compute checksums. The hardware
 //! instruction makes that disappear.
 //!
 //! The two conventions below are the part no crate can be trusted to guess at,

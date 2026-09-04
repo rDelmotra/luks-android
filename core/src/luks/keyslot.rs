@@ -32,7 +32,7 @@ use zeroize::Zeroize;
 const KEYSLOT_SECTOR_SIZE: usize = 512;
 
 /// Derive the key that unwraps a keyslot. This is the expensive step: for a
-/// Fedora default (argon2id, 1 GiB) it allocates 1 GiB and runs for seconds.
+/// standard Linux default (argon2id, 1 GiB) it allocates 1 GiB and runs for seconds.
 pub fn derive_key(kdf: &Kdf, password: &[u8], out_len: usize) -> Result<Secret> {
     let mut out = vec![0u8; out_len];
 
@@ -342,7 +342,7 @@ pub fn try_keyslot<D: ReadAt + ?Sized>(
 
 /// Try every keyslot until one opens.
 ///
-/// Cost is per slot, so a wrong password on a Fedora volume pays the full
+/// Cost is per slot, so a wrong password on a standard Linux volume pays the full
 /// Argon2 price for each slot before failing.
 pub fn unlock<D: ReadAt + ?Sized>(
     device: &D,

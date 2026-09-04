@@ -75,7 +75,7 @@ ln -s nested/deep.txt "$ROOT/docs/link-to-deep"
 # geometry: 4 KiB sectors, 16 KiB nodes, and metadata DUP — which means the
 # metadata chunk has two stripes for the same logical range and the reader has
 # to pick one. That is not an exotic case; it is what mkfs does by default on
-# anything it does not think is an SSD.
+# anything it does not think is a solid-state drive.
 if want plain; then
 echo "Building plain.img..."
 IMG="$OUT/plain.img"
@@ -154,7 +154,7 @@ echo "  -> mixed-4k.img"
 fi
 
 # --- subvol.img: more than one fs tree --------------------------------------
-# The fixture the developer's own drive needs. A Fedora install keeps / and
+# Reference subvolume fixture. A standard Linux install keeps / and
 # /home in separate subvolumes, and a subvolume is a *separate fs tree* — a
 # directory entry pointing at one carries a tree id where every other entry
 # carries an inode number. Read it as an inode number and you land on an
@@ -164,7 +164,7 @@ fi
 #
 #   /toplevel.txt              plain file, proves the top level is still normal
 #   /plaindir/note.txt         plain directory, must NOT be treated as a crossing
-#   /root/etc/hostname         subvolume off the top level (the Fedora shape)
+#   /root/etc/hostname         subvolume off the top level (standard Linux shape)
 #   /home/user/docs/deep.txt   subvolume, content several levels down
 #   /home/user/snap/inside.txt subvolume nested *inside another subvolume*
 #   /snapshots/home-snap/...   read-only snapshot, parent dir is not the root

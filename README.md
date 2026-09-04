@@ -76,7 +76,7 @@ flowchart TD
     end
     
     Core -->|BulkTransport Trait| USBFS[Userspace USBFS Driver<br/>URB Arena & Drain Recovery]
-    USBFS -->|ioctl /dev/bus/usb| Drive[(Physical USB-OTG Storage<br/>NVMe SSD / Thumb Drive)]
+    USBFS -->|ioctl /dev/bus/usb| Drive[(Physical USB-OTG Storage<br/>External Drive / Flash Storage)]
 ```
 
 ---

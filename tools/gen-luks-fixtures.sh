@@ -63,7 +63,7 @@ make_luks2() {
 
 echo "Generating LUKS2 fixtures..."
 
-# Matches the shape of a Fedora install: aes-xts-plain64, 512-byte sectors.
+# Matches the shape of a standard Linux install: aes-xts-plain64, 512-byte sectors.
 make_luks2 luks2-argon2id-512 "${WEAK[@]}" \
     --type luks2 --cipher aes-xts-plain64 --key-size 512 --sector-size 512
 

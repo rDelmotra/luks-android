@@ -61,8 +61,8 @@ LOOP="$(losetup --find --show --partscan "$IMG")"
 PART="${LOOP}p1"
 [ -b "$PART" ] || { echo "no partition device at $PART" >&2; exit 1; }
 
-# Argon2id with 1 GiB of memory, matching the real SSD's header, so unlock
-# timing measured on the phone against this stick is comparable to the SSD's
+# Argon2id with 1 GiB of memory, matching the reference storage device header, so unlock
+# timing measured on the phone against this stick is comparable to the reference device's
 # 6.76 s rather than an artefact of a cheaper KDF.
 cryptsetup luksFormat \
     --type luks2 \

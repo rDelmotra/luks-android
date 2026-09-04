@@ -3,7 +3,7 @@
 #
 # Different in purpose from gen-disk-fixtures.sh. Those fixtures use deliberately
 # weak KDF parameters so `cargo test` stays fast. This one uses the REAL
-# parameters of the developer's 1 TB Fedora drive, so unlocking the stick on the
+# parameters of the developer's storage device, so unlocking the stick on the
 # phone exercises the 1 GiB Argon2 allocation — the project's top open risk —
 # without ever touching the real drive.
 #

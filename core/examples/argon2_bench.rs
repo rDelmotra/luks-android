@@ -1,4 +1,4 @@
-//! Measures Argon2id cost at the parameters found on the developer's drive.
+//! Measures Argon2id cost at standard 1 GiB reference parameters.
 //!
 //!   cargo run --release --example argon2_bench
 //!

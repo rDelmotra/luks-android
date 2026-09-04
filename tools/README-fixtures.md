@@ -14,7 +14,7 @@ implementation, so they disagree with us whenever we are wrong.
 
 | Fixture | Exercises |
 |---|---|
-| `luks2-argon2id-512.img` | The developer's Fedora drive shape: aes-xts-plain64, 512-byte sectors |
+| `luks2-argon2id-512.img` | Standard Linux LUKS2 drive layout: aes-xts-plain64, 512-byte sectors |
 | `luks2-argon2id-4096.img` | 4096-byte sectors — renumbers the XTS tweak |
 | `luks2-argon2i.img` | argon2i instead of argon2id |
 | `luks2-pbkdf2.img` | PBKDF2 KDF — the memory-cheap path |

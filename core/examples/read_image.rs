@@ -22,7 +22,7 @@
 //! ```
 //!
 //! Prefer `/dev/rdiskN` over `/dev/diskN` on macOS. The raw character device
-//! measured 722 MiB/s against the buffered node's 132 on the developer's SSD,
+//! measured 722 MiB/s against the buffered node's 132 on the developer's storage device,
 //! because the buffered path copies through the page cache for data that is
 //! read exactly once. `FileDevice` handles the block-alignment the raw node
 //! demands.
@@ -286,7 +286,7 @@ fn run(path: &str, password: &[u8], target: Option<&str>) -> luks_core::error::R
     );
 
     // On btrfs the interesting content usually is not in the top-level tree:
-    // a Fedora install keeps / and /home in separate subvolumes.
+    // a standard Linux install keeps / and /home in separate subvolumes.
     let subvols = fs.subvolumes()?;
     if !subvols.is_empty() {
         println!("subvolumes ({}):", subvols.len());

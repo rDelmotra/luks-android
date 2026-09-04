@@ -3,7 +3,7 @@
 //! [`super::Btrfs::walk_tree`] visits every item, which is right for the chunk
 //! tree — a few dozen items that all have to be collected anyway. It is
 //! catastrophically wrong for anything else. The fs tree on the developer's
-//! 1 TB drive holds millions of items across gigabytes of nodes; listing one
+//! A large drive holds millions of items across gigabytes of nodes; listing one
 //! directory by walking it would read the whole filesystem over USB, which is
 //! the same read-amplification mistake that made the ext4 reader take minutes
 //! to hash a single file.

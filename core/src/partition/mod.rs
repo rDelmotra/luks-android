@@ -31,7 +31,7 @@ pub mod type_guid {
         0x4F,
     ];
     /// `E6D6D379-F507-44C2-A23C-238F2A3DF928` — LVM, which sits between LUKS and
-    /// the filesystem on Fedora Server and older installs.
+    /// the filesystem on standard Linux server and older installs.
     pub const LINUX_LVM: [u8; 16] = [
         0x79, 0xD3, 0xD6, 0xE6, 0x07, 0xF5, 0xC2, 0x44, 0xA2, 0x3C, 0x23, 0x8F, 0x2A, 0x3D, 0xF9,
         0x28,

@@ -694,7 +694,7 @@ impl ReadAt for CountingDevice {
 #[test]
 fn searching_costs_the_depth_of_the_tree_not_its_size() {
     // The whole reason the cursor exists. On this fixture the difference is
-    // 2 reads against 14; on the developer's 1 TB drive it is the difference
+    // 2 reads against 14; on the developer's storage device it is the difference
     // between opening a directory and reading the filesystem.
     let counting = CountingDevice {
         inner: device("plain.img"),
@@ -1222,7 +1222,7 @@ fn streaming_a_file_does_not_re_descend_the_trees_per_chunk() {
     // descent of two trees: the fs tree, to find the extent covering the
     // offset, and the checksum tree, to verify what came back. Both start at a
     // root that never changes, so the same nodes were fetched again per chunk.
-    // On the developer's 1 TB drive that was 3729 metadata reads against 618
+    // On the developer's storage device that was 3729 metadata reads against 618
     // data reads — 88% of all I/O, and about sixty fetches of each distinct
     // node.
     //
@@ -1487,7 +1487,7 @@ fn reports_the_default_subvolume_without_browsing_from_it() {
     assert_eq!(fs.fs_tree().root_dirid, 256);
 }
 
-/// A filesystem nobody has run `set-default` on — the Fedora case — must not
+/// A filesystem nobody has run `set-default` on — the standard Linux case — must not
 /// error just because the entry is absent.
 #[test]
 fn a_filesystem_with_no_default_entry_answers_with_the_top_level() {
@@ -1569,7 +1569,7 @@ fn the_top_level_lists_subvolumes_as_directories() {
     );
 }
 
-/// The Fedora shape: content that lives in a different fs tree from the root.
+/// Standard subvolume layout: content that lives in a different fs tree from the root.
 #[test]
 fn reads_a_file_inside_a_subvolume() {
     let fs = mount("subvol.img");

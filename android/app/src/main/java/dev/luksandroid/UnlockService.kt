@@ -14,7 +14,7 @@ import android.os.IBinder
  *
  * It does no work. Its entire purpose is to change the process's `oom_adj` so
  * Android's low-memory killer will not take the app during the Argon2
- * allocation — which for the developer's real drive is **1 GiB**, the single
+ * allocation — which for a standard 1 GiB Argon2id drive is **1 GiB**, the single
  * largest thing this app ever does and the top-rated risk in the project since
  * before any code existed.
  *

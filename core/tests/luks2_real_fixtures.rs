@@ -21,7 +21,7 @@ fn parse(name: &str) -> luks::Luks2Header {
     luks::parse(&load(name)).unwrap_or_else(|e| panic!("{name} failed to parse: {e}"))
 }
 
-/// The shape of the developer's Fedora drive: aes-xts-plain64, 512-byte sectors.
+/// The shape of a standard Linux encrypted drive: aes-xts-plain64, 512-byte sectors.
 #[test]
 fn argon2id_512_matches_cryptsetup() {
     let h = parse("luks2-argon2id-512.img");

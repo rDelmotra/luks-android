@@ -136,7 +136,7 @@ const RAW_ALIGN: u64 = 4096;
 /// # Raw character devices
 ///
 /// On macOS a disk appears twice: `/dev/diskN` goes through the buffer cache,
-/// `/dev/rdiskN` is the raw character device. Measured on the developer's SSD,
+/// `/dev/rdiskN` is the raw character device. Measured on the developer's storage device,
 /// the raw node is **5.4x faster** for large sequential reads (722 vs 132
 /// MiB/s), because the buffered node copies every byte through the page cache
 /// for data that is read exactly once. But the raw node will only accept reads
@@ -182,7 +182,7 @@ impl FileDevice {
     ///
     /// Device numbering is assigned by plug order on every OS this targets,
     /// not fixed by identity. In this project's own history `/dev/disk4` was a
-    /// 1 TB Fedora SSD in one session and an unrelated 61 GB stick in the
+    /// an encrypted storage device in one session and an unrelated 61 GB stick in the
     /// next — same path, different drive. A path checked by a human at one
     /// moment and opened at another can mean a different disk.
     ///

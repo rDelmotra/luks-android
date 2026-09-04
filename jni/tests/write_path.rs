@@ -389,7 +389,7 @@ fn closing_the_writer_lets_another_volume_take_over() {
 // (`writing_into_a_btrfs_subvolume_is_refused_by_name_not_miswritten`), a
 // duplicate name is refused as a conflict
 // (`a_btrfs_duplicate_name_is_refused_as_a_conflict_not_as_corruption`),
-// and the real 1 TB SSD stays refused by its own free-space-tree shape —
+// and the real storage device stays refused by its own free-space-tree shape —
 // see `feature-btrfs-write.md` Fix 1 — which this small fixture cannot
 // exercise and is not this file's job to.
 

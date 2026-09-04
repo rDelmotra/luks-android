@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 const HDR_SIZE: usize = 16 * 1024;
 const BINARY_LEN: usize = 4096;
 
-/// Realistic Fedora-style metadata: argon2id at 1 GiB, aes-xts-plain64,
+/// Realistic Linux reference metadata: argon2id at 1 GiB, aes-xts-plain64,
 /// 16 MiB payload offset.
-fn fedora_like_json() -> String {
+fn standard_linux_json() -> String {
     r#"{
       "keyslots": {
         "0": {
@@ -97,7 +97,7 @@ fn write_copy(buf: &mut [u8], offset: usize, magic: &[u8; 6], seqid: u64, json: 
 
 /// A complete two-copy LUKS2 header region (32 KiB).
 fn build(primary_seqid: u64, secondary_seqid: u64) -> Vec<u8> {
-    let json = fedora_like_json();
+    let json = standard_linux_json();
     let mut buf = vec![0u8; HDR_SIZE * 2];
     write_copy(&mut buf, 0, b"LUKS\xba\xbe", primary_seqid, &json);
     write_copy(&mut buf, HDR_SIZE, b"SKUL\xba\xbe", secondary_seqid, &json);
@@ -200,7 +200,7 @@ fn parses_large_integers_sent_as_json_strings() {
 
 #[test]
 fn accepts_4096_byte_sectors() {
-    let json = fedora_like_json().replace("\"sector_size\": 512", "\"sector_size\": 4096");
+    let json = standard_linux_json().replace("\"sector_size\": 512", "\"sector_size\": 4096");
     let mut buf = vec![0u8; HDR_SIZE * 2];
     write_copy(&mut buf, 0, b"LUKS\xba\xbe", 1, &json);
     write_copy(&mut buf, HDR_SIZE, b"SKUL\xba\xbe", 1, &json);
@@ -210,7 +210,7 @@ fn accepts_4096_byte_sectors() {
 
 #[test]
 fn accepts_fixed_segment_size() {
-    let json = fedora_like_json().replace("\"size\": \"dynamic\"", "\"size\": \"981467136\"");
+    let json = standard_linux_json().replace("\"size\": \"dynamic\"", "\"size\": \"981467136\"");
     let mut buf = vec![0u8; HDR_SIZE * 2];
     write_copy(&mut buf, 0, b"LUKS\xba\xbe", 1, &json);
     write_copy(&mut buf, HDR_SIZE, b"SKUL\xba\xbe", 1, &json);
@@ -281,7 +281,7 @@ fn finds_the_backup_even_at_a_non_default_metadata_size() {
     // 32 KiB metadata instead of the 16 KiB default, with a garbage size field
     // in the primary so the parser is forced to probe for the backup.
     const BIG: usize = 32 * 1024;
-    let json = fedora_like_json();
+    let json = standard_linux_json();
     let mut buf = vec![0u8; BIG * 2];
 
     let write_at = |buf: &mut Vec<u8>, off: usize, magic: &[u8; 6], seqid: u64| {

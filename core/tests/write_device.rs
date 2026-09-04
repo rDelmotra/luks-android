@@ -9,7 +9,7 @@
 //! Without the feature this file compiles to nothing, which is the point being
 //! tested as much as anything here: a default build has no way to obtain a
 //! writable descriptor, so it cannot corrupt a drive by any code path at all.
-//! That is what makes pointing the reader at the developer's real 1 TB SSD
+//! That is what makes pointing the reader at the developer's storage device
 //! safe as a *property* rather than as a promise, and it is the property most
 //! at risk now that a writer exists.
 #![cfg(feature = "dangerous-write-support")]

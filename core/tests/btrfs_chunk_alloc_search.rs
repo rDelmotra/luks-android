@@ -162,7 +162,7 @@ fn decide_data_chunk_size_edge_cases() {
     assert_eq!(decide_data_chunk_size(1 * GIB), 112 * MIB); // 10% = 102.4 MB -> ceil to 16MB = 112 MB (7 * 16MB)
     assert_eq!(decide_data_chunk_size(2 * GIB), 208 * MIB); // 10% = 204.8 MB -> ceil to 16MB = 208 MB (13 * 16MB)
 
-    // Very large drives (1 TB, 2 TB, 10 TB) -> always capped at 1 GiB per stripe
+    // Very large drives (large multi-terabyte drives) -> always capped at 1 GiB per stripe
     assert_eq!(decide_data_chunk_size(1000 * GIB), SZ_1G);
     assert_eq!(decide_data_chunk_size(2000 * GIB), SZ_1G);
     assert_eq!(decide_data_chunk_size(10000 * GIB), SZ_1G);

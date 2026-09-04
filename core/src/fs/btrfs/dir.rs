@@ -122,7 +122,7 @@ impl<D: ReadAt> Btrfs<D> {
     ///
     /// **Subvolume boundaries are crossed**, and the tree comes back with the
     /// inode because of it. A btrfs subvolume is a separate fs tree, so
-    /// `/home/user/docs` on a Fedora install is three components in one tree
+    /// `/home/user/docs` on a standard Linux install is three components in one tree
     /// and the rest in another; refusing to cross would make most of such a
     /// drive unreachable, and crossing without saying so would leave the caller
     /// holding an inode number it would resolve against the wrong tree.

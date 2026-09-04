@@ -9,7 +9,7 @@
 //! — and every checksum on the way will verify, because the data it reads is
 //! genuine, just not the data that was asked for.
 //!
-//! This is not an exotic corner. A Fedora install puts `/` and `/home` in
+//! This is not an exotic corner. A standard Linux install puts `/` and `/home` in
 //! separate subvolumes; openSUSE adds a `.snapshots` tree per rollback point.
 //! On such a drive an FS_TREE-only reader shows a near-empty root and nothing
 //! else, which looks far more like "the drive is broken" than like a missing
@@ -224,7 +224,7 @@ impl<D: ReadAt> Btrfs<D> {
     ///
     /// Stored as a single directory entry named `default` in the root tree's
     /// own directory. Absent on a filesystem nobody has run
-    /// `btrfs subvolume set-default` on — Fedora, for one — in which case the
+    /// `btrfs subvolume set-default` on — standard Linux defaults, for one — in which case the
     /// answer is the top level.
     ///
     /// Reported rather than obeyed. Browsing starts at the top level whatever

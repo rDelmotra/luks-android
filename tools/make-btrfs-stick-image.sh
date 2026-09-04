@@ -115,7 +115,7 @@ wait_for_partitions "$LOOP" || {
 PART="${LOOP}p1"
 [ -b "$PART" ] || { echo "no partition device at $PART" >&2; exit 1; }
 
-# Argon2id with 1 GiB of memory by default (matching the real SSD's header), or
+# Argon2id with 1 GiB of memory by default (matching the reference storage device header), or
 # 256 MiB / 1 thread if --fast-kdf / --phone-kdf / PHONE_KDF=1 is specified.
 cryptsetup luksFormat \
     --type luks2 \
