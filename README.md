@@ -125,17 +125,29 @@ Navigate to the `android/` directory to build the APK:
 
 ```bash
 cd android
-./gradlew assembleDebug
 
-# Install directly to a connected device
+# Production Release Build (~3.5 MB, R8-optimized)
+./gradlew assembleRelease
+# Output: app/build/outputs/apk/release/app-release-unsigned.apk
+
+# Debug Build (Fast local testing & diagnostics)
+./gradlew assembleDebug
+# Install directly to a connected device:
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+> [!TIP]
+> The release build runs R8 shrinking and resource optimization to produce a compact **~3.5 MB APK**. Selective inlined vector icons avoid the 55 MB `material-icons-extended` bloat, keeping both debug and release builds lean.
 
 ---
 
 ## 🧪 Testing & Verification
 
 The testing framework enforces strict correctness. Tests are graded against an actual Linux kernel running in a virtual environment, checking filesystem mounts and executing `btrfs check`, `btrfs scrub`, and `e2fsck`.
+
+**0. Generate Test Fixtures**
+
+Only the small LUKS header and transfer-trace fixtures are committed to the repo. The btrfs, ext4, and whole-disk images are generated locally — see [`tools/README-fixtures.md`](tools/README-fixtures.md) for exact commands per platform.
 
 **1. Workspace Unit & Integration Tests**
 ```bash

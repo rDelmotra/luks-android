@@ -40,6 +40,7 @@
 # ---- docs & license (public facing) ----
 !README.md
 !LICENSE
+!tools/README-fixtures.md
 
 # ---- the tiny fixtures needed to run tests without any generation step ----
 !fixtures/luks/*.img
@@ -51,6 +52,7 @@
 # ============================================================
 *.md
 !README.md
+!tools/README-fixtures.md
 *.txt
 !fixtures/luks/EXPECTED.txt
 *.img
