@@ -280,7 +280,7 @@ open class LuksProxyCallback(
      * window between that check and this commit -- the same TOCTOU sliver documented on
      * [LuksDocumentsProvider.renameDocument]. Matched on [LuksException.code] via
      * [LuksException.isAlreadyExists], never on a message substring -- that pattern was
-     * deliberately removed from this codebase (commit 25f09ee).
+     * deliberately removed from this codebase (commit 072bd75).
      *
      * There is no byte-preserving retry available at that point, and this is a hard
      * architectural fact, not a gap left for later: `nativeFinishFile` (jni/src/lib.rs) calls
