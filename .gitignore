@@ -39,7 +39,8 @@
 
 # ---- docs & license (public facing) ----
 !README.md
-!LICENSE
+!LICENSE-APACHE
+!LICENSE-MIT
 !tools/README-fixtures.md
 !doc/*.md
 !CONTRIBUTING.md

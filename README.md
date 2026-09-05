@@ -6,7 +6,7 @@ A rootless, userspace storage and cryptographic stack for Android: LUKS2 decrypt
 <!-- <img src="./readmeAssets/social-preview.png" alt="LUKS-Android Userspace Storage Stack" width="860" /> -->
 
 [![Latest release](https://img.shields.io/github/v/release/rDelmotra/luks-android?style=flat-square&label=release&color=0969da&labelColor=0d1117)](https://github.com/rDelmotra/luks-android/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=0d1117)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square&labelColor=0d1117)](LICENSE-APACHE)
 
 - [What is LUKS-Android?](#what-is-luks-android)
 - [Quickstart](#quickstart)
@@ -149,4 +149,6 @@ Full test suite, kernel-oracle grading, and live diagnostic log extraction are i
 
 Created and maintained by **Rehaan Delmotra**.
 
-Licensed under the **[MIT License](LICENSE)**.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
