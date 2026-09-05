@@ -43,7 +43,6 @@
 !tools/README-fixtures.md
 !doc/*.md
 !CONTRIBUTING.md
-!CODE_OF_CONDUCT.md
 !SECURITY.md
 
 # ---- the tiny fixtures needed to run tests without any generation step ----
@@ -59,7 +58,6 @@
 !tools/README-fixtures.md
 !doc/*.md
 !CONTRIBUTING.md
-!CODE_OF_CONDUCT.md
 !SECURITY.md
 *.txt
 !fixtures/luks/EXPECTED.txt

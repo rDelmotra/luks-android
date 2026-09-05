@@ -140,7 +140,7 @@ Full test suite, kernel-oracle grading, and live diagnostic log extraction are i
 ## Contributing
 
 Contributions, bug reports, and discussions are welcome:
-- Review [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- Review [CONTRIBUTING.md](CONTRIBUTING.md).
 - Open issues with complete hardware details, kernel versions, and ADB diagnostic logs.
 - Security disclosures: please review [SECURITY.md](SECURITY.md).
 

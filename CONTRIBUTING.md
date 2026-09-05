@@ -33,7 +33,3 @@ Changes to the Btrfs/ext4 write path or the USBFS transport are gated on a real 
 ## Commit messages
 
 Clear, imperative summary line. Explain *why* in the body if it's not obvious from the diff — not a restatement of the diff itself. Reference issue numbers where relevant.
-
-## Code of conduct
-
-This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
