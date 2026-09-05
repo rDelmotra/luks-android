@@ -24,7 +24,7 @@ Include what you can: affected file/commit, reproduction steps, and impact (what
 
 ## Response
 
-This is a solo-maintained, pre-1.0 project. There's no SLA, but security reports get priority over feature work — expect an initial response within a few days. Only the latest tagged release is supported; there's no back-porting of fixes to older tags.
+This is a solo-maintained, pre-1.0 project — best-effort, no fixed SLA. Security reports get priority over feature work. Only the latest tagged release is supported; there's no back-porting of fixes to older tags.
 
 ## Disclosure
 

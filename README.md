@@ -60,7 +60,7 @@ adb install -r android/app/build/outputs/apk/release/app-release-unsigned.apk
 ```
 
 > [!TIP]
-> No ADB? Open the [release APK link](https://github.com/rDelmotra/luks-android/releases/latest) directly on the Android device, download it, and tap the file to install. You'll need to allow "Install unknown apps" for whichever app you downloaded it with (Chrome, Files, etc.) — Android will prompt for this automatically on first install.
+> No ADB? Open the [release APK link](https://github.com/rDelmotra/luks-android/releases/latest) directly on the Android device and tap the downloaded file to install — Android will prompt to allow "Install unknown apps" for the browser or file manager you used.
 
 ---
 
@@ -139,10 +139,9 @@ Full test suite, kernel-oracle grading, and live diagnostic log extraction are i
 
 ## Contributing
 
-Contributions, bug reports, and discussions are welcome:
-- Review [CONTRIBUTING.md](CONTRIBUTING.md).
-- Open issues with complete hardware details, kernel versions, and ADB diagnostic logs.
-- Security disclosures: please review [SECURITY.md](SECURITY.md).
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR — testing and hardware-in-the-loop expectations are there.
+- Bug reports: include hardware details, kernel version, and ADB diagnostic logs.
+- Security issues go through [SECURITY.md](SECURITY.md), not a public issue.
 
 ---
 

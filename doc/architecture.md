@@ -56,4 +56,4 @@ Measured on physical ARM64 hardware (Android 14+):
 | **SAF DocumentsProvider** | Supported | Planned | Exposes storage to Android system file pickers (Read-only) |
 
 > [!NOTE]
-> This matrix describes what the source on `main` supports. The downloadable `v0.1.0` release APK is a read-only build — see the caution note in the [root README](../README.md#quickstart). Write support ships in a tagged release once it's release-hardened.
+> This matrix describes what the source on `main` supports. The downloadable `v0.1.0` release APK is a read-only build — see the note in the [root README](../README.md#quickstart). Write support ships in a tagged release once it's release-hardened.

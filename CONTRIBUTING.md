@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions, bug reports, and discussions are welcome. This project is solo-maintained and pre-1.0, so please read this before opening a PR — it'll save both of us time.
+This project is solo-maintained and pre-1.0. Read this before opening a PR — it'll save both of us time.
 
 ## Reporting bugs
 
