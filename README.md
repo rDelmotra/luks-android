@@ -40,8 +40,8 @@ Traditional solutions require rooting the Android device, installing custom kern
 
 **[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `luks-android-v0.1.0-arm64.apk` directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
 
-> [!CAUTION]
-> The `v0.1.0` release APK is **read-only** (browse and export only) — release builds are compiled with write code stripped out by default. Btrfs/ext4 write support exists on `main` but hasn't shipped in a tagged release yet. See [Feature Support Matrix](doc/architecture.md#feature-support-matrix) for exact per-feature status, and [Security & Safety](#security--safety) for why release builds ship this way.
+> [!NOTE]
+> The `v0.1.0` release APK is **read-only** (browse and export only) — release builds are compiled with write code stripped out by default, by design. Btrfs/ext4 write support exists on `main` but hasn't shipped in a tagged release yet. See [Feature Support Matrix](doc/architecture.md#feature-support-matrix) for exact per-feature status, and [Security & Safety](#security--safety) for why release builds ship this way.
 
 | Target | Artifact | Size | Description |
 | :--- | :--- | :--- | :--- |
