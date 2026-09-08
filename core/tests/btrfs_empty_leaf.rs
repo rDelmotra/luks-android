@@ -135,28 +135,20 @@ fn find_empty_children<D: luks_core::device::ReadAt>(
     fs: &Btrfs<D>,
     bytenr: u64,
     out: &mut Vec<(u64, u64, u8)>,
-) {
-    let node = match fs.read_node(bytenr) {
-        Ok(n) => n,
-        // An unreadable node is a different bug, and the oracle will say so
-        // far better than a panic here would.
-        Err(_) => return,
-    };
+) -> Result<(), luks_core::error::LuksError> {
+    let node = fs.read_node(bytenr)?;
     if node.is_leaf() {
-        return;
+        return Ok(());
     }
     for i in 0..node.nr_items {
-        let ptr = match node.key_ptr(i) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if let Ok(child) = fs.read_node(ptr.blockptr) {
-            if child.nr_items == 0 {
-                out.push((bytenr, ptr.blockptr, child.level));
-            }
-            find_empty_children(fs, ptr.blockptr, out);
+        let ptr = node.key_ptr(i)?;
+        let child = fs.read_node(ptr.blockptr)?;
+        if child.nr_items == 0 {
+            out.push((bytenr, ptr.blockptr, child.level));
         }
+        find_empty_children(fs, ptr.blockptr, out)?;
     }
+    Ok(())
 }
 
 #[test]
@@ -212,7 +204,8 @@ fn deleting_files_never_leaves_an_empty_leaf_linked_from_its_parent() {
 
     let root = fs_ro.fs_tree();
     let mut empties = Vec::new();
-    find_empty_children(&fs_ro, root.bytenr, &mut empties);
+    find_empty_children(&fs_ro, root.bytenr, &mut empties)
+        .expect("traversing fs_tree nodes must succeed");
 
     assert!(
         empties.is_empty(),

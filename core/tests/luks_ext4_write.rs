@@ -248,7 +248,9 @@ fn the_files_that_were_already_in_the_container_survive() {
                 .into_iter()
                 .filter(|e| !e.file_type.is_dir())
                 .map(|e| {
-                    let data = fs.read_file(&format!("/{}", e.name)).unwrap_or_default();
+                    let data = fs
+                        .read_file(&format!("/{}", e.name))
+                        .expect("reading pre-existing baseline file");
                     (e.name, data)
                 })
                 .collect()
@@ -270,6 +272,10 @@ fn the_files_that_were_already_in_the_container_survive() {
         let volume = LuksVolume::open(&dev, 0, None, &header, PASSWORD).expect("unlock");
         let fs = Ext4::mount(volume).expect("mount");
 
+        assert!(
+            !before.is_empty(),
+            "{rel}: expected pre-existing files to verify, but found none"
+        );
         for (name, data) in &before {
             let got = fs
                 .read_file(&format!("/{name}"))

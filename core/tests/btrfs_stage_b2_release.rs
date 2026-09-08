@@ -7,6 +7,8 @@
 
 #![cfg(feature = "dangerous-write-support")]
 
+mod common;
+
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::write::file::BtrfsFileWriter;
@@ -45,11 +47,16 @@ fn copy_to_temp(name: &str) -> PathBuf {
     dst
 }
 
-fn run_verify_btrfs(img_path: &Path) -> (bool, String) {
+fn run_verify_btrfs(img_path: &Path) -> Option<(bool, String)> {
+    if !common::oracle::gate() {
+        return None;
+    }
+
     let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("tools")
         .join("verify-btrfs.sh");
+    assert!(script_path.exists(), "verify-btrfs.sh must exist at {:?}", script_path);
 
     let output = Command::new("bash")
         .arg(&script_path)
@@ -60,7 +67,7 @@ fn run_verify_btrfs(img_path: &Path) -> (bool, String) {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("STDOUT:\n{stdout}\nSTDERR:\n{stderr}");
-    (output.status.success(), combined)
+    Some((output.status.success(), combined))
 }
 
 #[test]
@@ -160,7 +167,10 @@ fn test_legitimate_abandon_and_resume_remains_clean() {
     assert_eq!(readback, payload_commit);
 
     // 4. Kernel oracle verify
-    let (clean, output) = run_verify_btrfs(&img);
+    let Some((clean, output)) = run_verify_btrfs(&img) else {
+        let _ = fs::remove_file(&img);
+        return;
+    };
     assert!(
         clean,
         "verify-btrfs.sh must pass clean after abandon and write. Output:\n{output}"
