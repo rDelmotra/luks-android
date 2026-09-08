@@ -590,10 +590,6 @@ where
         let pre_bytes = leaf_payload_bytes(&leaf.items);
         mutate_fn(&mut leaf)?;
         let post_bytes = leaf_payload_bytes(&leaf.items);
-        debug_assert!(
-            post_bytes <= pre_bytes,
-            "GAP-1 violation: cow_descend mutate_fn expanded leaf from {pre_bytes} to {post_bytes} without split capability"
-        );
         if post_bytes > pre_bytes {
             return Err(crate::error::LuksError::CorruptFs(
                 "btrfs mutation expanded leaf size without split capability",

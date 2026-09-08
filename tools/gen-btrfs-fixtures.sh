@@ -25,12 +25,14 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol large}"
+TARGETS="${2:-plain compress mixed-4k subvol large nonmixed-4k sha256-4k}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
 UUID_SUBVOL="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
+UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
+UUID_SHA256="12121212-3434-5656-7878-909090909090"
 
 want() { case " $TARGETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -233,6 +235,38 @@ printf 'baseline metadata\n' > "$MNT/baseline/info.txt"
 sync
 umount "$MNT"
 echo "  -> large.img"
+fi
+
+# --- nonmixed-4k.img: 4k nodesize, dedicated metadata chunk -----------------
+# 1 GiB capacity, 4096-byte nodes, non-mixed layout.
+# Used by structural transition tests to trigger interior node splits
+# (level 1 -> 2) on EXTENT_TREE and CSUM_TREE without mixed block group bounds.
+if want nonmixed-4k; then
+echo "Building nonmixed-4k.img..."
+IMG="$OUT/nonmixed-4k.img"
+rm -f "$IMG"
+truncate -s 1G "$IMG"
+mkfs.btrfs -q -f -n 4096 -L BTRFS4K -U "$UUID_NONMIXED" "$IMG"
+echo "  -> nonmixed-4k.img"
+fi
+
+# --- sha256-4k.img: 32-byte checksums ---------------------------------------
+# Every other fixture is crc32c (csum_type 0). `CsumType::Sha256` is a type the
+# driver claims to support (superblock.rs:72) and that `mkfs.btrfs --csum
+# sha256` really produces, but nothing has ever written to one.
+#
+# The size difference is the point: a checksum is 32 bytes instead of 4, so
+# `max_csum_item_bytes / csum_size` drops from ~990 sectors per EXTENT_CSUM
+# item to ~123. The same file therefore emits roughly 8x as many csum items,
+# and the csum tree's leaf packing and split behaviour are nothing like the
+# crc32c case the whole write path was developed against.
+if want sha256-4k; then
+echo "Building sha256-4k.img..."
+IMG="$OUT/sha256-4k.img"
+rm -f "$IMG"
+truncate -s 1G "$IMG"
+mkfs.btrfs -q -f -n 4096 --csum sha256 -L BTRFSSHA -U "$UUID_SHA256" "$IMG"
+echo "  -> sha256-4k.img"
 fi
 
 # --- ground truth -----------------------------------------------------------

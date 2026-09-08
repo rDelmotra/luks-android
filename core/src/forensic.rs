@@ -210,7 +210,7 @@ fn ledger_record_transition(line: &str) {
     if let Some(path) = transition_ledger_path() {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
 }

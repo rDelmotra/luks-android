@@ -79,6 +79,37 @@ pub fn check_writeable_fs(sb: &Superblock) -> Result<()> {
         )));
     }
 
+    // 5. Only crc32c checksums can be written correctly.
+    //
+    // `CsumType::Sha256` parses, mounts and *reads* correctly — `csum_type`
+    // drives verification through `Superblock::verify_csum`, and the read path
+    // is size-agnostic. The write path is not. `FileWriter::checksums` is
+    // `Vec<(u64, u32)>` (`write/file.rs:15`) — one `u32` per sector, which
+    // cannot hold a 32-byte digest — and the streaming builder that consumes
+    // it, `build_extent_csum_items_from_checksums` (`write/node.rs:701`),
+    // hardcodes the checksum width: `max_csum_item_bytes(node_size, 4)`,
+    // `sectors_per_item = max_item / 4`, and a 4-byte `crc.to_le_bytes()`
+    // payload per sector. That builder is what `Batch::commit` uses
+    // (`write/batch.rs:624`), so it is the path every streamed file takes —
+    // which is every file the Android app transfers.
+    //
+    // Measured 2026-09-09 on a `mkfs.btrfs --csum sha256` fixture: writing 40
+    // files of 1,536,000 bytes emitted `total csum bytes: 60000` where 480,000
+    // were required (40 x 375 sectors x 32 bytes), and `btrfs check` reported
+    // `some csum missing` against every one of inodes 257-296. The write
+    // reported success. Nothing refused it.
+    //
+    // Refusing by name is this module's convention for a shape we understand
+    // but have not implemented, and it is strictly better than the alternative
+    // here: a silently unverifiable filesystem is the one outcome this driver
+    // treats as unacceptable. Reading such a volume stays fully supported.
+    if !matches!(sb.csum_type, crate::fs::btrfs::superblock::CsumType::Crc32c) {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "btrfs write on {:?} checksums (read is supported; only crc32c can be written)",
+            sb.csum_type
+        )));
+    }
+
     Ok(())
 }
 
