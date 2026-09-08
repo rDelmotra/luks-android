@@ -20,7 +20,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 thiserror = "2"
 zeroize = { version = "1.8", features = ["derive"] }
 base64 = "0.22"
-argon2 = "0.5"
+argon2 = { version = "0.5", features = ["zeroize"] }
 pbkdf2 = "0.12"
 hmac = "0.12"
 # `zeroize` is NOT default in `aes` — without it every expanded key schedule
