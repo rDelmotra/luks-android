@@ -271,7 +271,7 @@ open class LuksDocumentsProvider(
 
         val volume = session.volume ?: state.volume
         val statFs = runCatching {
-            runBlocking {
+            volume.getCachedStatFs() ?: runBlocking {
                 session.withLease { it.statFs() }
             }
         }.getOrNull()

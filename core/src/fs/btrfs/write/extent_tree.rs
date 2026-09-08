@@ -17,6 +17,7 @@ use std::collections::HashMap;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
+use crate::fs::btrfs::cursor::Cursor;
 use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
     Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
@@ -448,6 +449,51 @@ impl ExtentTree {
     pub fn total_allocated_bytes(&self) -> u64 {
         self.extents.iter().map(|e| e.length).sum()
     }
+}
+
+/// Read all `BLOCK_GROUP_ITEM`s using point lookups for each chunk in `fs.chunk_map()`.
+///
+/// This avoids a full depth-first scan of the entire extent tree (which contains
+/// hundreds of thousands of `EXTENT_ITEM` and `METADATA_ITEM` entries), eliminating
+/// multi-second stalls and keeping the 2 MiB Btrfs node cache intact.
+pub fn read_block_groups<D: ReadAt>(fs: &Btrfs<D>) -> Result<Vec<BlockGroupItem>> {
+    let root = fs.tree_root(EXTENT_TREE_OBJECTID)?;
+    let mut block_groups = Vec::new();
+    let chunks = fs.chunk_map().chunks();
+
+    for chunk in chunks {
+        let key = Key::new(chunk.logical, BLOCK_GROUP_ITEM_KEY, chunk.length);
+        let cursor = Cursor::search(fs, root.bytenr, &key)?;
+        if cursor.valid() && cursor.key()? == key {
+            let bg = BlockGroupItem::parse(&key, cursor.data()?)?;
+            block_groups.push(bg);
+        } else {
+            // Fallback: search with offset 0 in case the length field in the key differs
+            let search_key = Key::new(chunk.logical, BLOCK_GROUP_ITEM_KEY, 0);
+            let cursor = Cursor::search(fs, root.bytenr, &search_key)?;
+            if cursor.valid() {
+                let found = cursor.key()?;
+                if found.objectid == chunk.logical && found.item_type == BLOCK_GROUP_ITEM_KEY {
+                    let bg = BlockGroupItem::parse(&found, cursor.data()?)?;
+                    block_groups.push(bg);
+                }
+            }
+        }
+    }
+
+    if block_groups.is_empty() && !chunks.is_empty() {
+        // Fallback: full extent tree scan filtering solely on BLOCK_GROUP_ITEM_KEY
+        // (without allocating or cloning any EXTENT_ITEM / METADATA_ITEMs).
+        fs.walk_tree(root.bytenr, &mut |k, data| {
+            if k.item_type == BLOCK_GROUP_ITEM_KEY {
+                block_groups.push(BlockGroupItem::parse(&k, data)?);
+            }
+            Ok(())
+        })?;
+    }
+
+    block_groups.sort_by_key(|bg| bg.start);
+    Ok(block_groups)
 }
 
 // The four functions below were moved here (verbatim, plus import fixups)
