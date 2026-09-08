@@ -41,18 +41,25 @@ impl FsKind {
     }
 }
 
-/// Which filesystem is on this volume.
-///
-/// Errors rather than guessing when the answer is not clear, because both ways
-/// of guessing are bad: reading a stale signature shows the user a filesystem
-/// that was deleted, and reading the wrong one of two live ones shows them
-/// somebody else's files.
-pub fn detect<D: ReadAt + ?Sized>(device: &D) -> Result<FsKind> {
-    // A full superblock parse, not a magic comparison: this verifies the
-    // checksum and that the block claims the offset it was read from, so a
-    // stale copy left in re-used space is rejected here rather than surviving
-    // to confuse the mount.
-    let btrfs = BtrfsSuperblock::find(device).is_ok();
+#[derive(Debug, Clone)]
+pub enum DetectedFs {
+    Ext4,
+    Btrfs(BtrfsSuperblock),
+}
+
+impl From<DetectedFs> for FsKind {
+    fn from(detected: DetectedFs) -> Self {
+        match detected {
+            DetectedFs::Ext4 => FsKind::Ext4,
+            DetectedFs::Btrfs(_) => FsKind::Btrfs,
+        }
+    }
+}
+
+/// Detect which filesystem is on this volume, returning the verified superblock
+/// when Btrfs is present so mount does not repeat disk I/O and checksums (C-5).
+pub fn detect_fs<D: ReadAt + ?Sized>(device: &D) -> Result<DetectedFs> {
+    let btrfs = BtrfsSuperblock::find(device).ok();
 
     let mut magic = [0u8; 2];
     // A device too small to hold an ext4 superblock is simply not ext4; that
@@ -61,15 +68,25 @@ pub fn detect<D: ReadAt + ?Sized>(device: &D) -> Result<FsKind> {
         && u16::from_le_bytes(magic) == EXT4_MAGIC;
 
     match (btrfs, ext4) {
-        (true, false) => Ok(FsKind::Btrfs),
-        (false, true) => Ok(FsKind::Ext4),
+        (Some(sb), false) => Ok(DetectedFs::Btrfs(sb)),
+        (None, true) => Ok(DetectedFs::Ext4),
         // Both signatures present. Formatting normally wipes the old one, so
         // this means either a partial reformat or a deliberately crafted
         // image. Picking one would be a coin flip over which data the user
         // sees.
-        (true, true) => Err(LuksError::AmbiguousFs),
-        (false, false) => Err(LuksError::UnknownFs),
+        (Some(_), true) => Err(LuksError::AmbiguousFs),
+        (None, false) => Err(LuksError::UnknownFs),
     }
+}
+
+/// Which filesystem is on this volume.
+///
+/// Errors rather than guessing when the answer is not clear, because both ways
+/// of guessing are bad: reading a stale signature shows the user a filesystem
+/// that was deleted, and reading the wrong one of two live ones shows them
+/// somebody else's files.
+pub fn detect<D: ReadAt + ?Sized>(device: &D) -> Result<FsKind> {
+    detect_fs(device).map(FsKind::from)
 }
 
 #[cfg(test)]

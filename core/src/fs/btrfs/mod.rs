@@ -107,6 +107,7 @@ pub struct Btrfs<D: ReadAt> {
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
     nodes: cache::NodeCache,
+    pub(crate) subvol_cache: std::sync::Mutex<Option<Vec<Subvolume>>>,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) active_batch: Option<write::Batch>,
     #[cfg(feature = "dangerous-write-support")]
@@ -120,7 +121,12 @@ impl<D: ReadAt> Btrfs<D> {
     /// map without which nothing else on the filesystem can be read.
     pub fn mount(device: D) -> Result<Self> {
         let sb = Superblock::find(&device)?;
+        Self::mount_with_superblock(device, sb)
+    }
 
+    /// Mount Btrfs reusing an already found and verified superblock, cutting
+    /// redundant superblock search and CRC32c verification (C-5).
+    pub fn mount_with_superblock(device: D, sb: Superblock) -> Result<Self> {
         // A non-empty log tree means this filesystem was not unmounted
         // cleanly — a yanked drive, a crash, a phone that pulled the cable.
         // The newest writes live in that tree and **not** in the trees this
@@ -149,6 +155,7 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            subvol_cache: std::sync::Mutex::new(None),
             #[cfg(feature = "dangerous-write-support")]
             active_batch: None,
             #[cfg(feature = "dangerous-write-support")]
@@ -222,7 +229,20 @@ impl<D: ReadAt> Btrfs<D> {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {
             if let Some(raw) = batch.pending_blocks.get(&logical) {
-                return Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid);
+                let csum = if raw.len() >= 4 {
+                    u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4]))
+                } else {
+                    0
+                };
+                let mut cache = batch.pending_nodes.lock().unwrap();
+                if let Some((cached_csum, ref node)) = cache.get(&logical) {
+                    if *cached_csum == csum {
+                        return Ok(node.clone());
+                    }
+                }
+                let node = Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid)?;
+                cache.insert(logical, (csum, node.clone()));
+                return Ok(node);
             }
         }
         if let Some(node) = self.nodes.get(logical) {
@@ -402,6 +422,9 @@ impl<D: ReadAt> Btrfs<D> {
         self.nodes.clear();
         self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
         if let Ok(mut guard) = self.statfs_cache.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.subvol_cache.lock() {
             *guard = None;
         }
     }
