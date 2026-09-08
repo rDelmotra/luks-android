@@ -252,13 +252,13 @@ fn the_linux_kernel_can_mount_it_and_read_the_file_back() {
 }
 
 fn verify_script(which: &str) -> Option<String> {
-    let script = format!("{}/../tools/{which}", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&script).exists() {
-        return None;
-    }
     if !common::oracle::gate() {
         return None;
     }
-
+    let script = format!("{}/../tools/{which}", env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        std::path::Path::new(&script).exists(),
+        "oracle gate passed, but {which} was not found at {script}"
+    );
     Some(script)
 }

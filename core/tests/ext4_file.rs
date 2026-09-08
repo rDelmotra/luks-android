@@ -229,14 +229,14 @@ fn e2fsck_reports_only_the_expected_orphan_complaints() {
 }
 
 fn verify_script() -> Option<String> {
-    let script = format!("{}/../tools/verify-ext4.sh", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&script).exists() {
-        return None;
-    }
     if !common::oracle::gate() {
         return None;
     }
-
+    let script = format!("{}/../tools/verify-ext4.sh", env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        std::path::Path::new(&script).exists(),
+        "oracle gate passed, but verify-ext4.sh was not found at {script}"
+    );
     Some(script)
 }
 
