@@ -35,7 +35,9 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -250,6 +252,83 @@ fun DiagnosticsScreen(
                     }
                 }
                 forensicLogText?.let { log ->
+                    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    ) {
+                        Text(
+                            text = log,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.padding(12.dp),
+                        )
+                    }
+                }
+            }
+        }
+
+        // Persistent Session File Log Card
+        var sessionLogText by remember { mutableStateOf<String?>(null) }
+        val clipboardManager = LocalClipboardManager.current
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    text = "Session File Log (On-Disk)",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "Persistent rolling log file saved to internal storage (luks_session.log). Zero password / zero file contents exposure.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Button(
+                        onClick = {
+                            val dump = dev.luksandroid.Trace.readSessionLog()
+                            sessionLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("View / Refresh")
+                    }
+                    Button(
+                        onClick = {
+                            val dump = dev.luksandroid.Trace.readSessionLog()
+                            if (dump.isNotBlank()) {
+                                clipboardManager.setText(AnnotatedString(dump))
+                            }
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("Copy Log")
+                    }
+                    Button(
+                        onClick = {
+                            dev.luksandroid.Trace.clearSessionLog()
+                            sessionLogText = "(Log cleared)"
+                        },
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text("Clear")
+                    }
+                }
+                sessionLogText?.let { log ->
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
                     OutlinedCard(
                         modifier = Modifier.fillMaxWidth(),

@@ -170,7 +170,7 @@ object UsbMassStorage {
                 target.usbInterface.id,
                 maxTransfer,
             )
-            return LuksDevice(handle, connection, target.usbInterface)
+            return LuksDevice(handle, connection, target.usbInterface, target.device)
         } catch (t: Throwable) {
             // The LuksDevice was never constructed, so nothing else will free
             // these. Leaking a claimed interface leaves the drive unusable to

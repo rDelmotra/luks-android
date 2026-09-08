@@ -12,15 +12,79 @@ object Trace {
     const val TAG = "luks"
     const val TAG_ERR = "luks_err"
 
+    private val logLock = Any()
+    private var sessionLogFile: java.io.File? = null
+    private var sessionOldLogFile: java.io.File? = null
+    private val logDateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+    private const val MAX_LOG_SIZE_BYTES = 2 * 1024 * 1024L // 2 MiB
+
+    fun initFileLogging(context: android.content.Context) {
+        synchronized(logLock) {
+            val base = context.filesDir
+            sessionLogFile = java.io.File(base, "luks_session.log")
+            sessionOldLogFile = java.io.File(base, "luks_session.log.old")
+        }
+    }
+
+    private fun appendToFile(level: String, tag: String, text: String) {
+        if (!BuildConfig.DEBUG) return
+        synchronized(logLock) {
+            val cur = sessionLogFile ?: return
+            val prev = sessionOldLogFile
+            runCatching {
+                if (cur.exists() && cur.length() > MAX_LOG_SIZE_BYTES) {
+                    if (prev != null && prev.exists()) {
+                        prev.delete()
+                    }
+                    if (prev != null) {
+                        cur.renameTo(prev)
+                    }
+                }
+                val ts = logDateFormat.format(java.util.Date())
+                cur.appendText("$ts $level/$tag: $text\n")
+            }
+        }
+    }
+
+    fun readSessionLog(): String {
+        return synchronized(logLock) {
+            runCatching {
+                val cur = sessionLogFile
+                if (cur != null && cur.exists()) {
+                    cur.readText()
+                } else {
+                    ""
+                }
+            }.getOrDefault("")
+        }
+    }
+
+    fun clearSessionLog() {
+        synchronized(logLock) {
+            runCatching {
+                sessionLogFile?.delete()
+                sessionOldLogFile?.delete()
+            }
+        }
+    }
+
     @Suppress("DEPRECATION")
     private fun currentThreadTag(): String = "tid=${Thread.currentThread().id}"
 
     fun i(msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.i(TAG, "[${currentThreadTag()}] $msg") }
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.i(TAG, formatted) }
+            appendToFile("I", TAG, formatted)
+        }
     }
 
     fun i(tag: String, msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.i(tag, "[${currentThreadTag()}] $msg") }
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.i(tag, formatted) }
+            appendToFile("I", tag, formatted)
+        }
     }
 
     /**
@@ -32,11 +96,19 @@ object Trace {
      * and/or a `LuksException.code`, never `t` or `t.message`.
      */
     fun e(msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.e(TAG, "[${currentThreadTag()}] $msg") }
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.e(TAG, formatted) }
+            appendToFile("E", TAG, formatted)
+        }
     }
 
     fun e(tag: String, msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.e(tag, "[${currentThreadTag()}] $msg") }
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.e(tag, formatted) }
+            appendToFile("E", tag, formatted)
+        }
     }
 
     /**
@@ -70,7 +142,9 @@ object Trace {
      * path cannot be passed here even by mistake.
      */
     fun err(code: Int, operation: String, detail: ErrDetail = ErrDetail.None) {
-        runCatching { Log.e(TAG_ERR, "[${currentThreadTag()}] ${formatErr(code, operation, detail)}") }
+        val formatted = "[${currentThreadTag()}] ${formatErr(code, operation, detail)}"
+        runCatching { Log.e(TAG_ERR, formatted) }
+        appendToFile("E", TAG_ERR, formatted)
     }
 
     /**

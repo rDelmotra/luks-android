@@ -84,6 +84,7 @@ import dev.luksandroid.session.SessionState
 import dev.luksandroid.ui.SecurePassphraseField
 import dev.luksandroid.ui.theme.SuccessGreen
 import dev.luksandroid.ui.theme.WarningAmber
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -134,15 +135,35 @@ fun DevicesScreen(
                 UsbMassStorage.findTargets(context)
             }
             targets = list
+            val sessionDev = LuksSession.device as? LuksDevice
             // Clean up stale device entries for devices no longer present or already closed
             val validKeys = list.map { keyOf(it) }.toSet()
+            deviceStates.forEach { (k, v) ->
+                if (v is DeviceItemState.Opened && (k !in validKeys || !v.device.isOpen)) {
+                    if (v.device !== sessionDev) {
+                        runCatching { v.device.close() }
+                    }
+                }
+            }
             deviceStates = deviceStates.filter { (k, v) ->
                 k in validKeys && (v !is DeviceItemState.Opened || v.device.isOpen)
             }
-            // Auto-open devices that already have permissions granted
+            // Auto-open devices that already have permissions granted, respecting active session
             list.forEach { target ->
                 val key = keyOf(target)
-                if (UsbMassStorage.hasPermission(context, target.device) &&
+                val activeUsb = LuksSession.activeUsbDevice
+                val isSessionTarget = activeUsb != null && (
+                    target.device.deviceId == activeUsb.deviceId ||
+                    (target.device.vendorId == activeUsb.vendorId && target.device.productId == activeUsb.productId)
+                )
+
+                if (isSessionTarget && (LuksSession.state.value is SessionState.Unlocked || LuksSession.state.value is SessionState.Unlocking)) {
+                    if (sessionDev != null && sessionDev.isOpen) {
+                        deviceStates = deviceStates + (key to DeviceItemState.Opened(sessionDev))
+                    } else if (LuksSession.state.value is SessionState.Unlocking) {
+                        deviceStates = deviceStates + (key to DeviceItemState.Opening)
+                    }
+                } else if (UsbMassStorage.hasPermission(context, target.device) &&
                     deviceStates[key] !is DeviceItemState.Opened &&
                     deviceStates[key] !is DeviceItemState.Opening
                 ) {
@@ -180,6 +201,12 @@ fun DevicesScreen(
         }
         onDispose {
             runCatching { context.unregisterReceiver(receiver) }
+            val sessionDev = LuksSession.device as? LuksDevice
+            deviceStates.values.forEach { state ->
+                if (state is DeviceItemState.Opened && state.device !== sessionDev) {
+                    runCatching { state.device.close() }
+                }
+            }
         }
     }
 
@@ -1069,18 +1096,30 @@ private fun PassphraseEntryDialog(
 private suspend fun openTarget(
     context: Context,
     target: UsbMassStorage.Target,
-): DeviceItemState = try {
-    val device = withContext(Dispatchers.IO) {
-        UsbMassStorage.open(context, target)
+): DeviceItemState {
+    var device: LuksDevice? = null
+    return try {
+        device = withContext(Dispatchers.IO) {
+            UsbMassStorage.open(context, target)
+        }
+        Trace.i("DevicesScreen: opened ${target.label} successfully")
+        DeviceItemState.Opened(device)
+    } catch (e: CancellationException) {
+        runCatching { device?.close() }
+        throw e
+    } catch (e: LuksException) {
+        runCatching { device?.close() }
+        Trace.err(e.code, "open_target")
+        Trace.e("DevicesScreen: open failed [${e.code}]")
+        DeviceItemState.Failed("[${e.code}] ${e.message}")
+    } catch (e: Exception) {
+        if (e is CancellationException) {
+            runCatching { device?.close() }
+            throw e
+        }
+        runCatching { device?.close() }
+        Trace.err(-1, "open_target")
+        Trace.e("DevicesScreen: open failed: ${Trace.throwableSummary(e)}")
+        DeviceItemState.Failed(e.message ?: e.toString())
     }
-    Trace.i("DevicesScreen: opened ${target.label} successfully")
-    DeviceItemState.Opened(device)
-} catch (e: LuksException) {
-    Trace.err(e.code, "open_target")
-    Trace.e("DevicesScreen: open failed [${e.code}]")
-    DeviceItemState.Failed("[${e.code}] ${e.message}")
-} catch (e: Exception) {
-    Trace.err(-1, "open_target")
-    Trace.e("DevicesScreen: open failed: ${Trace.throwableSummary(e)}")
-    DeviceItemState.Failed(e.message ?: e.toString())
 }

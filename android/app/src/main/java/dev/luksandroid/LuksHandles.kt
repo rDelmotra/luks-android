@@ -1,5 +1,6 @@
 package dev.luksandroid
 
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import org.json.JSONObject
@@ -121,6 +122,7 @@ class LuksDevice internal constructor(
     private var handle: Long,
     private val connection: UsbDeviceConnection,
     private val usbInterface: UsbInterface,
+    val usbDevice: UsbDevice? = null,
 ) : AutoCloseable {
 
     val info: DeviceInfo = if (handle == 0L) {
@@ -221,7 +223,7 @@ class LuksDevice internal constructor(
 
 /** An unlocked volume with a mounted filesystem. */
 open class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
-    private val activeWriters = mutableSetOf<FileWriter>()
+    private val activeWriters = java.util.concurrent.ConcurrentHashMap.newKeySet<FileWriter>()
 
     open val info: VolumeInfo = if (handle == 0L) {
         VolumeInfo(
