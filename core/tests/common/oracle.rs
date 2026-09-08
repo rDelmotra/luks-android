@@ -177,23 +177,51 @@ fn record(kind: &str, location: &str) {
 /// - Down and `ALLOW_NO_ORACLE` is not set: **panics.** A test that would
 ///   otherwise report "clean" without a kernel ever looking at the image is
 ///   worse than a failing test.
+static CACHED_ORACLE_AVAILABLE: std::sync::OnceLock<(bool, &'static str)> = std::sync::OnceLock::new();
+
+fn is_oracle_available() -> (bool, &'static str) {
+    *CACHED_ORACLE_AVAILABLE.get_or_init(|| {
+        // 1. If running natively on Linux with kernel tools available
+        if cfg!(target_os = "linux") {
+            let has_tools = Command::new("btrfs")
+                .arg("version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if has_tools {
+                return (true, "native Linux kernel");
+            }
+        }
+
+        // 2. If running under macOS with Colima VM up
+        let colima_up = Command::new("colima")
+            .arg("status")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if colima_up {
+            return (true, "colima VM");
+        }
+
+        (false, "neither Linux native tools nor running Colima VM found")
+    })
+}
+
+/// The gate function every oracle-graded test calls before invoking
+/// kernel grading scripts.
 #[track_caller]
 pub fn gate() -> bool {
     let loc = std::panic::Location::caller().to_string();
 
-    let colima_up = Command::new("colima")
-        .arg("status")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let (available, backend) = is_oracle_available();
 
-    if colima_up {
+    if available {
         let n = ORACLE_EXECUTED.fetch_add(1, Ordering::SeqCst) + 1;
         record(KIND_RAN, &loc);
         // Left as a capturable print on purpose: this is the safe outcome, and
         // several hundred of these would drown the SKIPPED lines that matter.
         // `--nocapture` shows them; the ledger always has them.
-        eprintln!("oracle #{n} (this binary): colima is up, verifying at {loc}");
+        eprintln!("oracle #{n} (this binary): {backend} is up, verifying at {loc}");
         return true;
     }
 
@@ -203,19 +231,19 @@ pub fn gate() -> bool {
 
     if !allow_offline {
         panic!(
-            "ORACLE UNAVAILABLE at {loc}: colima is not running, so this test \
-             cannot be graded against a real kernel. Refusing to report success \
-             without that grading — a green run must mean the kernel actually \
-             looked at the image. Set ALLOW_NO_ORACLE=1 to explicitly opt out \
-             and run offline (e.g. `ALLOW_NO_ORACLE=1 cargo test ...`)."
+            "ORACLE UNAVAILABLE at {loc}: neither a real Linux kernel nor Colima VM is available \
+             ({backend}), so this test cannot be graded against a real kernel. Refusing to report \
+             success without that grading — a green run must mean the kernel actually looked at \
+             the image. Set ALLOW_NO_ORACLE=1 to explicitly opt out and run offline \
+             (e.g. `ALLOW_NO_ORACLE=1 cargo test ...`)."
         );
     }
 
     let n = ORACLE_SKIPPED.fetch_add(1, Ordering::SeqCst) + 1;
     record(KIND_SKIPPED, &loc);
     write_uncaptured(&format!(
-        "\u{26A0}\u{FE0F}  ORACLE SKIPPED (#{n} this binary) at {loc}: colima is not \
-         running and ALLOW_NO_ORACLE=1 permits it. This run did NOT verify \
+        "\u{26A0}\u{FE0F}  ORACLE SKIPPED (#{n} this binary) at {loc}: kernel oracle is not \
+         available and ALLOW_NO_ORACLE=1 permits it. This run did NOT verify \
          against a real kernel — treat it as unproven, not as passing.\n"
     ));
     false

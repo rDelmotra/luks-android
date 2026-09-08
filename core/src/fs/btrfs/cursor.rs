@@ -98,7 +98,7 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// `write/txn.rs` needs to walk backwards past a run of reserved-objectid
     /// items (e.g. `ORPHAN_OBJECTID`) that can occupy the tail of the
     /// rightmost leaf, and `search_le` alone only steps back once.
-    pub(crate) fn retreat(&mut self) -> Result<()> {
+    pub fn retreat(&mut self) -> Result<()> {
         let last = self.path.len() - 1;
         let (_, i) = &mut self.path[last];
         if *i > 0 {
