@@ -140,12 +140,15 @@ class BrowserCancellationTest {
     @Test
     fun testRefreshStatFs_rethrowsCancellationException() = runBlocking {
         val testScope = CoroutineScope(Dispatchers.Default + Job())
+        mockVolume.shouldThrowInStatFs = CancellationException("Scope cancelled during statfs")
         var cancellationRethrown = false
 
         val job = testScope.launch {
             try {
                 try {
-                    throw CancellationException("Scope cancelled during statfs")
+                    withContext(Dispatchers.IO) {
+                        LuksSession.withLease { v -> v.statFs() }
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -160,11 +163,13 @@ class BrowserCancellationTest {
         job.join()
         testScope.cancel()
         assertTrue("CancellationException must be rethrown in refreshStatFs", cancellationRethrown)
+        assertEquals("Active leases must be 0 after cancelled statfs", 0, LuksSession.activeLeases)
     }
 
     @Test
     fun testLoadDirectory_rethrowsCancellationException_andDoesNotLaunchSnackbarOnCancelledScope() = runBlocking {
         val testScope = CoroutineScope(Dispatchers.Default + Job())
+        mockVolume.shouldThrowInListDir = CancellationException("Navigation cancelled coroutine")
         var cancellationRethrown = false
         var snackbarLaunched = false
 
@@ -175,7 +180,9 @@ class BrowserCancellationTest {
         val job = CoroutineScope(Dispatchers.Default).launch {
             try {
                 try {
-                    throw CancellationException("Navigation cancelled coroutine")
+                    withContext(Dispatchers.IO) {
+                        LuksSession.withLease { v -> v.listDir("/") }
+                    }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: LuksException) {
@@ -196,6 +203,7 @@ class BrowserCancellationTest {
         job.join()
         assertTrue("CancellationException must be propagated", cancellationRethrown)
         assertFalse("Snackbar must not be launched when scope is inactive", snackbarLaunched)
+        assertEquals("Active leases must be 0 after cancelled listDir", 0, LuksSession.activeLeases)
     }
 
     @Test
@@ -223,9 +231,12 @@ class BrowserCancellationTest {
         var deleteCancelled = false
 
         // Create Directory
+        mockVolume.shouldThrowInCreateDir = CancellationException("create cancelled")
         try {
             try {
-                throw CancellationException("create cancelled")
+                withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.createDirectory("/", "new_folder") }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
@@ -235,11 +246,15 @@ class BrowserCancellationTest {
         } catch (e: CancellationException) {
             createCancelled = true
         }
+        assertEquals("Active leases must be 0 after cancelled createDirectory", 0, LuksSession.activeLeases)
 
         // Rename
+        mockVolume.shouldThrowInRename = CancellationException("rename cancelled")
         try {
             try {
-                throw CancellationException("rename cancelled")
+                withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.rename("/", "old", "/", "new") }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
@@ -249,11 +264,15 @@ class BrowserCancellationTest {
         } catch (e: CancellationException) {
             renameCancelled = true
         }
+        assertEquals("Active leases must be 0 after cancelled rename", 0, LuksSession.activeLeases)
 
         // Delete
+        mockVolume.shouldThrowInDelete = CancellationException("delete cancelled")
         try {
             try {
-                throw CancellationException("delete cancelled")
+                withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.deleteFile("/test.txt") }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
@@ -263,6 +282,7 @@ class BrowserCancellationTest {
         } catch (e: CancellationException) {
             deleteCancelled = true
         }
+        assertEquals("Active leases must be 0 after cancelled deleteFile", 0, LuksSession.activeLeases)
 
         assertTrue("Create directory rethrows cancellation", createCancelled)
         assertTrue("Rename rethrows cancellation", renameCancelled)
