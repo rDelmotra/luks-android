@@ -51,11 +51,11 @@ if [ "$MODE" = "live" ]; then
     adb logcat -G 16M >/dev/null
     adb logcat -c
 
-    echo "==> capturing logcat stream (luks:V luks_err:V) to $LOG_FILE..."
+    echo "==> capturing logcat stream (luks:V luks_err:V luks_native:V) to $LOG_FILE..."
     echo "==> perform your test operations on device now (create, rename, delete)."
     echo "==> press Ctrl+C or Enter when done to analyze logs."
 
-    adb logcat -s luks:V luks_err:V > "$LOG_FILE" 2>&1 &
+    adb logcat -s luks:V luks_err:V luks_native:V > "$LOG_FILE" 2>&1 &
     LOGCAT_PID=$!
 
     trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT
@@ -65,7 +65,13 @@ if [ "$MODE" = "live" ]; then
     trap - EXIT
 fi
 
-echo "==> analyzing logcat output ($(wc -l < "$LOG_FILE" | tr -d ' ') lines captured)..."
+TOTAL_LINES="$(wc -l < "$LOG_FILE" | tr -d ' ')"
+echo "==> analyzing logcat output ($TOTAL_LINES lines captured)..."
+
+if [ "$TOTAL_LINES" -lt 10 ]; then
+    echo "VACUOUS: log file has fewer than 10 lines ($TOTAL_LINES lines) — logcat was empty or unpopulated." >&2
+    exit 1
+fi
 
 LEAKS_FOUND=0
 for token in "${TOKENS[@]}"; do
@@ -80,15 +86,16 @@ for token in "${TOKENS[@]}"; do
     fi
 done
 
-# General pattern checks: verify no full paths (/storage/..., /hiu/..., etc) appeared in luks_err lines
-ERR_PATH_MATCHES="$(grep 'luks_err' "$LOG_FILE" | grep -E '(/[a-zA-Z0-9_\.\-]+){2,}' || true)"
+# General pattern checks: verify no full paths (/storage/..., /hiu/..., etc) appeared in luks_err or luks_native lines
+ERR_PATH_MATCHES="$(grep -E 'luks_err|luks_native' "$LOG_FILE" | grep -E '(/[a-zA-Z0-9_\.\-]+){2,}' || true)"
 if [ -n "$ERR_PATH_MATCHES" ]; then
-    echo "WARNING: potential path pattern found in luks_err logcat:" >&2
+    echo "FAIL: potential path pattern found in luks_err/luks_native logcat:" >&2
     echo "$ERR_PATH_MATCHES" | sed 's/^/    /' >&2
+    LEAKS_FOUND=$((LEAKS_FOUND + 1))
 fi
 
 if [ "$LEAKS_FOUND" -gt 0 ]; then
-    echo "==> FAILED: $LEAKS_FOUND forbidden token(s) leaked to logcat." >&2
+    echo "==> FAILED: $LEAKS_FOUND forbidden token(s) or paths leaked to logcat." >&2
     exit 1
 else
     echo "==> PASSED: zero filename leaks detected across ${#TOKENS[@]} token(s)."
