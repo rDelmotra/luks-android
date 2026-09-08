@@ -601,9 +601,6 @@ fun BrowserScreen(
                 }
             } finally {
                 isRefreshing = false
-                if (scope.isActive) {
-                    refreshStatFs()
-                }
             }
         }
     }
@@ -1081,13 +1078,14 @@ fun BrowserScreen(
                                 if (scope.isActive) {
                                     scope.launch {
                                         try {
-                                            onLockRequested()
                                             LuksSession.lock()
+                                            onLockRequested()
                                         } catch (e: CancellationException) {
                                             throw e
                                         } catch (e: Exception) {
                                             if (e is CancellationException) throw e
                                             Trace.err(-1, "lock")
+                                            onLockRequested()
                                         }
                                     }
                                 }

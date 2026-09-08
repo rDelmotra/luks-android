@@ -128,22 +128,41 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 val checkNoWriteCodeInRelease by tasks.registering {
     val soFile = layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libluks_jni.so")
     doLast {
-        val needle = "nativeWriteFile".toByteArray(Charsets.US_ASCII)
+        val needles = listOf(
+            "nativeBenchmarkWrite",
+            "nativeWriteFile",
+            "nativeBeginFile",
+            "nativeBeginFileStreaming",
+            "nativeWriteChunk",
+            "nativeWriteChunkWithCancel",
+            "nativeFinishFile",
+            "nativeCommitActiveBatch",
+            "nativeCloseWriter",
+            "nativeDeleteFile",
+            "nativeCreateDirectory",
+            "nativeRename",
+        ).map { it to it.toByteArray(Charsets.US_ASCII) }
         val hay = soFile.asFile.readBytes()
-
-        var found = false
-        outer@ for (i in 0..hay.size - needle.size) {
-            for (j in needle.indices) {
-                if (hay[i + j] != needle[j]) continue@outer
-            }
-            found = true
-            break
+        check(hay.size > 100_000) {
+            "${soFile.asFile.relativeTo(rootDir)} is suspiciously small (${hay.size} bytes); expected a valid compiled ELF shared library"
         }
 
-        if (found) {
+        var foundSymbol: String? = null
+        for ((name, needle) in needles) {
+            outer@ for (i in 0..hay.size - needle.size) {
+                for (j in needle.indices) {
+                    if (hay[i + j] != needle[j]) continue@outer
+                }
+                foundSymbol = name
+                break
+            }
+            if (foundSymbol != null) break
+        }
+
+        if (foundSymbol != null) {
             throw GradleException(
                 """
-                ${soFile.asFile.relativeTo(rootDir)} exports nativeWriteFile.
+                ${soFile.asFile.relativeTo(rootDir)} exports $foundSymbol.
 
                 This is a release build, and a release build must not contain
                 the write path at all. The .so currently in jniLibs was built

@@ -82,15 +82,16 @@ fn copy_to_temp(src_name: &str) -> PathBuf {
     dst
 }
 
-fn run_verify_script(image_path: &Path) -> (bool, String) {
+fn run_verify_script(image_path: &Path) -> Option<(bool, String)> {
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("tools")
         .join("verify-btrfs.sh");
 
     if !common::oracle::gate() {
-        return (true, String::new());
+        return None;
     }
+    assert!(script.exists(), "verify-btrfs.sh must exist at {:?}", script);
 
     let output = Command::new(&script)
         .arg(image_path)
@@ -106,12 +107,12 @@ fn run_verify_script(image_path: &Path) -> (bool, String) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    (output.status.success(), combined)
+    Some((output.status.success(), combined))
 }
 
-fn run_btrfs_check(image_path: &Path) -> (bool, String) {
+fn run_btrfs_check(image_path: &Path) -> Option<(bool, String)> {
     if !common::oracle::gate() {
-        return (true, String::new());
+        return None;
     }
 
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -150,7 +151,7 @@ fn run_btrfs_check(image_path: &Path) -> (bool, String) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    (output.status.success(), combined)
+    Some((output.status.success(), combined))
 }
 
 // ============================================================================
@@ -181,7 +182,10 @@ fn test_pass_i1_disabled_exclusions_fails_scrub() {
     drop(fs);
 
     // Run Oracle verification script (btrfs check -> mount -> btrfs scrub)
-    let (clean, output) = run_verify_script(&temp_img);
+    let Some((clean, output)) = run_verify_script(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "verify-btrfs.sh MUST fail when superblock mirror 1 is overwritten");
@@ -235,7 +239,10 @@ fn test_pass_i1_enabled_exclusions_keeps_image_clean() {
 
     drop(fs);
 
-    let (clean, output) = run_verify_script(&temp_img);
+    let Some((clean, output)) = run_verify_script(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
     assert!(clean, "verify-btrfs.sh must pass clean with exclusions enabled. Output:\n{output}");
 }
@@ -272,13 +279,11 @@ fn test_pass_i1_stress_allocation_records_highest_logical_metadata() {
         let mut stack = vec![root];
         while let Some(bytenr) = stack.pop() {
             highest_metadata_bytenr = highest_metadata_bytenr.max(bytenr);
-            if let Ok(node) = fs.read_node(bytenr) {
-                if !node.is_leaf() {
-                    for j in 0..node.nr_items {
-                        if let Ok(ptr) = node.key_ptr(j) {
-                            stack.push(ptr.blockptr);
-                        }
-                    }
+            let node = fs.read_node(bytenr).expect("read metadata node");
+            if !node.is_leaf() {
+                for j in 0..node.nr_items {
+                    let ptr = node.key_ptr(j).expect("read key pointer");
+                    stack.push(ptr.blockptr);
                 }
             }
         }
@@ -295,7 +300,10 @@ fn test_pass_i1_stress_allocation_records_highest_logical_metadata() {
 
     drop(fs);
 
-    let (clean, output) = run_verify_script(&temp_img);
+    let Some((clean, output)) = run_verify_script(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
     assert!(clean, "verify-btrfs.sh must pass clean after 684 files stress test. Output:\n{output}");
 }
@@ -335,7 +343,10 @@ fn test_pass_i2_omit_dev_extent() {
     drop(fs);
 
     // 4. Run btrfs check --readonly
-    let (clean, output) = run_btrfs_check(&temp_img);
+    let Some((clean, output)) = run_btrfs_check(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "btrfs check MUST fail when DEV_EXTENT is omitted");
@@ -378,7 +389,10 @@ fn test_pass_i2_overlapping_dev_extent() {
     drop(fs);
 
     // 4. Run btrfs check --readonly
-    let (clean, output) = run_btrfs_check(&temp_img);
+    let Some((clean, output)) = run_btrfs_check(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "btrfs check MUST fail when DEV_EXTENTs overlap");
@@ -421,7 +435,10 @@ fn test_pass_i2_bad_dev_item_bytes_used() {
     drop(fs);
 
     // 4. Run btrfs check --readonly
-    let (clean, output) = run_btrfs_check(&temp_img);
+    let Some((clean, output)) = run_btrfs_check(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "btrfs check MUST fail when DEV_ITEM.bytes_used does not match sum of DEV_EXTENTs");
@@ -464,7 +481,10 @@ fn test_pass_i2_chunk_length_mismatch() {
     drop(fs);
 
     // 4. Run btrfs check --readonly
-    let (clean, output) = run_btrfs_check(&temp_img);
+    let Some((clean, output)) = run_btrfs_check(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "btrfs check MUST fail when CHUNK_ITEM length != block group length");
@@ -526,7 +546,10 @@ fn test_pass_i2_overlapping_chunk_range() {
     drop(fs);
 
     // 4. Run btrfs check --readonly
-    let (clean, output) = run_btrfs_check(&temp_img);
+    let Some((clean, output)) = run_btrfs_check(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
 
     assert!(!clean, "btrfs check MUST fail when chunk logical ranges overlap");
@@ -575,7 +598,10 @@ fn test_pass_i3_chunk_map_refresh_omission_fails_commit() {
 
     drop(fs);
 
-    let (clean, output) = run_verify_script(&temp_img);
+    let Some((clean, output)) = run_verify_script(&temp_img) else {
+        let _ = fs::remove_file(&temp_img);
+        return;
+    };
     let _ = fs::remove_file(&temp_img);
     assert!(clean, "verify-btrfs.sh must pass clean after properly refreshed chunk commit. Output:\n{output}");
 }

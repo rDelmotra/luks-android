@@ -143,6 +143,8 @@ object UsbMassStorage {
      * the second claim is a no-op. Rust claims anyway so the crate is correct on
      * its own terms rather than depending on this caller.
      */
+    private val openCounter = java.util.concurrent.atomic.AtomicLong(1)
+
     fun open(context: Context, target: Target, maxTransfer: Int = 0): LuksDevice {
         val manager = context.getSystemService(Context.USB_SERVICE) as UsbManager
         val connection = manager.openDevice(target.device)
@@ -150,6 +152,9 @@ object UsbMassStorage {
                 "could not open ${target.label} (permission revoked, or unplugged)",
                 LuksException.TRANSPORT,
             )
+
+        val openNum = openCounter.getAndIncrement()
+        Trace.i("UsbMassStorage.open [open #$openNum]: opened ${target.label}")
 
         try {
             if (!connection.claimInterface(target.usbInterface, true)) {
@@ -165,7 +170,7 @@ object UsbMassStorage {
                 target.usbInterface.id,
                 maxTransfer,
             )
-            return LuksDevice(handle, connection, target.usbInterface)
+            return LuksDevice(handle, connection, target.usbInterface, target.device)
         } catch (t: Throwable) {
             // The LuksDevice was never constructed, so nothing else will free
             // these. Leaking a claimed interface leaves the drive unusable to

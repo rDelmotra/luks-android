@@ -1,5 +1,6 @@
 package dev.luksandroid
 
+import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbInterface
 import org.json.JSONObject
@@ -121,6 +122,7 @@ class LuksDevice internal constructor(
     private var handle: Long,
     private val connection: UsbDeviceConnection,
     private val usbInterface: UsbInterface,
+    val usbDevice: UsbDevice? = null,
 ) : AutoCloseable {
 
     val info: DeviceInfo = if (handle == 0L) {
@@ -221,7 +223,7 @@ class LuksDevice internal constructor(
 
 /** An unlocked volume with a mounted filesystem. */
 open class LuksVolume internal constructor(private var handle: Long) : AutoCloseable {
-    private val activeWriters = mutableSetOf<FileWriter>()
+    private val activeWriters = java.util.concurrent.ConcurrentHashMap.newKeySet<FileWriter>()
 
     open val info: VolumeInfo = if (handle == 0L) {
         VolumeInfo(
@@ -367,33 +369,75 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
      */
     open fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
         check(handle != 0L) { "volume is closed" }
-        return LuksNative.nativeWriteFile(handle, parentPath, name, data)
+        val ino = LuksNative.nativeWriteFile(handle, parentPath, name, data)
+        invalidateStatFsCache()
+        return ino
     }
 
     open fun deleteFile(path: String) {
         if (handle == 0L) throw IllegalStateException("volume is closed")
         LuksNative.nativeDeleteFile(handle, path)
+        invalidateStatFsCache()
     }
 
     open fun commitActiveBatch() {
         if (handle == 0L) throw IllegalStateException("volume is closed")
         LuksNative.nativeCommitActiveBatch(handle)
+        invalidateStatFsCache()
     }
 
     open fun createDirectory(parentPath: String, name: String): Long {
         check(handle != 0L) { "volume is closed" }
-        return LuksNative.nativeCreateDirectory(handle, parentPath, name)
+        val ino = LuksNative.nativeCreateDirectory(handle, parentPath, name)
+        invalidateStatFsCache()
+        return ino
     }
 
     open fun rename(oldParent: String, oldName: String, newParent: String, newName: String) {
         check(handle != 0L) { "volume is closed" }
         LuksNative.nativeRename(handle, oldParent, oldName, newParent, newName)
+        invalidateStatFsCache()
+    }
+
+    private val statFsCounter = java.util.concurrent.atomic.AtomicLong(1)
+    private var cachedStatFs: StatFsInfo? = null
+    private var lastStatFsTimeMs: Long = 0L
+    private val statFsLock = Any()
+
+    open fun getCachedStatFs(maxAgeMs: Long = 5_000L): StatFsInfo? {
+        synchronized(statFsLock) {
+            val cached = cachedStatFs ?: return null
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastStatFsTimeMs < maxAgeMs) {
+                return cached
+            }
+            return null
+        }
+    }
+
+    open fun invalidateStatFsCache() {
+        synchronized(statFsLock) {
+            cachedStatFs = null
+            lastStatFsTimeMs = 0L
+        }
     }
 
     open fun statFs(): StatFsInfo {
         check(handle != 0L) { "volume is closed" }
+        synchronized(statFsLock) {
+            val cached = cachedStatFs
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (cached != null && (now - lastStatFsTimeMs) < 5_000L) {
+                return cached
+            }
+        }
+
+        val callId = statFsCounter.getAndIncrement()
+        Trace.i("LuksVolume.statFs [call #$callId]: start volume=$handle")
+        val start = System.currentTimeMillis()
         val o = JSONObject(LuksNative.nativeStatFs(handle))
-        return StatFsInfo(
+        val elapsed = System.currentTimeMillis() - start
+        val info = StatFsInfo(
             totalBytes = o.getLong("totalBytes"),
             freeBytes = o.getLong("freeBytes"),
             availableBytes = o.getLong("availableBytes"),
@@ -401,6 +445,12 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             freeInodes = o.getLong("freeInodes"),
             blockSize = o.getInt("blockSize"),
         )
+        Trace.i("LuksVolume.statFs [call #$callId]: done in ${elapsed}ms total=${info.totalBytes} avail=${info.availableBytes}")
+        synchronized(statFsLock) {
+            cachedStatFs = info
+            lastStatFsTimeMs = android.os.SystemClock.elapsedRealtime()
+        }
+        return info
     }
 
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
@@ -409,6 +459,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         check(sizeBytes >= 0) { "negative file size" }
         val writer = FileWriter(LuksNative.nativeBeginFile(handle, sizeBytes))
         activeWriters += writer
+        invalidateStatFsCache()
         return writer
     }
 
@@ -421,6 +472,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         check(handle != 0L) { "volume is closed" }
         val writer = FileWriter(LuksNative.nativeBeginFileStreaming(handle))
         activeWriters += writer
+        invalidateStatFsCache()
         return writer
     }
 
@@ -428,8 +480,11 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         writer.write(data, offset, length)
     }
 
-    open fun finishFile(writer: FileWriter, parentPath: String, name: String): Long =
-        writer.finish(parentPath, name)
+    open fun finishFile(writer: FileWriter, parentPath: String, name: String): Long {
+        val ino = writer.finish(parentPath, name)
+        invalidateStatFsCache()
+        return ino
+    }
 
     open fun abandonFile(writer: FileWriter) {
         writer.abandon()
@@ -473,7 +528,9 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             val wh = writerHandle
             writerHandle = 0
             activeWriters -= this
-            return LuksNative.nativeFinishFile(handle, wh, parentPath, name)
+            val result = LuksNative.nativeFinishFile(handle, wh, parentPath, name)
+            invalidateStatFsCache()
+            return result
         }
 
         open fun abandon() {

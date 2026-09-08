@@ -131,6 +131,18 @@ open class TransferController {
     }
 
     /**
+     * Resets any acquired locks and cancels active transfers when session is torn down.
+     */
+    fun resetTransferLocks() {
+        activeJobs.keys.toList().forEach { id ->
+            cancelTransfer(id)
+        }
+        if (transferMutex.isLocked) {
+            runCatching { transferMutex.unlock() }
+        }
+    }
+
+    /**
      * Starts an export on the manager's own scope, holding a [LuksSession] lease
      * for the whole transfer (so the idle timer cannot lock the session out from
      * under it). Returns the transfer id immediately; observe [transfers] for

@@ -170,8 +170,18 @@ fn derived_free_space_map_matches_free_space_tree_exactly() {
             .unwrap_or_else(|e| panic!("{name} read_free_space_tree: {e}"))
             .unwrap_or_else(|| panic!("{name} missing free space tree"));
 
+        assert!(
+            !free_space_map.block_groups.is_empty(),
+            "{name}: expected at least one block group in free_space_map"
+        );
+        assert!(
+            !fst_ranges.is_empty(),
+            "{name}: expected non-empty free space tree ranges"
+        );
+
         // For each active block group, the derived free ranges must match
         // the Free Space Tree's recorded FREE_SPACE_EXTENT entries inside that block group.
+        let mut total_ranges_checked = 0;
         for bg_space in &free_space_map.block_groups {
             let bg_start = bg_space.block_group.start;
             let bg_end = bg_start + bg_space.block_group.length;
@@ -194,7 +204,12 @@ fn derived_free_space_map_matches_free_space_tree_exactly() {
                     "{name} (BG {bg_start:#x}): free range index {i} mismatch: derived={derived:?}, fst={fst:?}"
                 );
             }
+            total_ranges_checked += bg_space.free_ranges.len();
         }
+        assert!(
+            total_ranges_checked > 0,
+            "{name}: expected to verify at least one free range, but checked 0"
+        );
     }
 }
 

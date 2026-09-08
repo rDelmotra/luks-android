@@ -11,6 +11,9 @@
 #![allow(dead_code)]
 
 pub mod oracle;
+pub mod btree_validator;
+pub mod mem_device;
+pub mod scratch;
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};

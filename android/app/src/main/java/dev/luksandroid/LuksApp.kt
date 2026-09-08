@@ -16,6 +16,7 @@ class LuksApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        Trace.initFileLogging(this)
         Trace.i("LuksApp", "Application initializing; LuksSession initialized")
         
         sessionLifecycle = LuksSessionLifecycle(LuksSession)

@@ -779,16 +779,17 @@ impl DeviceHandle {
     pub fn unlock(&self, partition_offset: u64, password: &[u8]) -> Result<VolumeHandle> {
         // The container's length is what bounds every write inside it. The
         // caller passes only an offset — that is what the partition list it
-        // was shown contains — so look the matching partition back up rather
-        // than widening the JNI signature. A bare container has no table and
-        // no bound tighter than the device, which is an honest `None`; the
-        // extra scan is nothing beside the Argon2 run below.
-        let partition_len = partition::scan(&self.dev, 512).ok().and_then(|t| {
-            t.partitions
-                .iter()
-                .find(|p| p.offset_bytes() == partition_offset)
-                .map(|p| p.size_bytes())
-        });
+        // was shown contains. We look up the matching partition from `self.table`
+        // which was already parsed using the true device sector size (512 or 4096)
+        // during device opening. This avoids redundant disk I/O and fixes the
+        // critical 4Kn sector boundary defect where a 512-byte scan fails and
+        // strips write boundary enforcement.
+        let partition_len = self
+            .table
+            .partitions
+            .iter()
+            .find(|p| p.offset_bytes() == partition_offset)
+            .map(|p| p.size_bytes());
         let header = luks::read_from(&self.dev, partition_offset)?;
         let volume = LuksVolume::open(
             self.dev.clone(),
@@ -886,7 +887,13 @@ impl VolumeHandle {
             b.file_type
                 .is_dir()
                 .cmp(&a.file_type.is_dir())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| {
+                    a.name
+                        .chars()
+                        .flat_map(char::to_lowercase)
+                        .cmp(b.name.chars().flat_map(char::to_lowercase))
+                })
+                .then_with(|| a.name.cmp(&b.name))
         });
 
         let items: Vec<Value> = entries
@@ -919,7 +926,13 @@ impl VolumeHandle {
             b.file_type
                 .is_dir()
                 .cmp(&a.file_type.is_dir())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then_with(|| {
+                    a.name
+                        .chars()
+                        .flat_map(char::to_lowercase)
+                        .cmp(b.name.chars().flat_map(char::to_lowercase))
+                })
+                .then_with(|| a.name.cmp(&b.name))
         });
 
         let total_count = entries.len();

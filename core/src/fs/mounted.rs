@@ -16,7 +16,7 @@
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::{self, Btrfs};
-use crate::fs::detect::{detect, FsKind};
+use crate::fs::detect::{detect_fs, DetectedFs, FsKind};
 use crate::fs::ext4::{self, Ext4};
 use crate::fs::{DirEntry, FileInfo, FileType};
 
@@ -64,9 +64,9 @@ impl<D: ReadAt> MountedFs<D> {
     /// `LuksVolume` to retry means running Argon2 a second time. See
     /// [`crate::fs::detect`].
     pub fn mount(device: D) -> Result<Self> {
-        match detect(&device)? {
-            FsKind::Ext4 => Ok(MountedFs::Ext4(Ext4::mount(device)?)),
-            FsKind::Btrfs => Ok(MountedFs::Btrfs(Btrfs::mount(device)?)),
+        match detect_fs(&device)? {
+            DetectedFs::Ext4 => Ok(MountedFs::Ext4(Ext4::mount(device)?)),
+            DetectedFs::Btrfs(sb) => Ok(MountedFs::Btrfs(Btrfs::mount_with_superblock(device, sb)?)),
         }
     }
 

@@ -193,11 +193,13 @@ class TraceLeakTest {
         val callSiteRegex = Regex("Trace\\.(err|e|i)\\(")
         val violations = mutableListOf<String>()
 
+        var totalCallSitesMatched = 0
         for (file in files) {
             val text = file.readText()
             val localAliases = bannedLocalAliases(text)
 
             for (m in callSiteRegex.findAll(text)) {
+                totalCallSitesMatched++
                 val openParenIndex = m.range.last
                 val args = extractCallArgs(text, openParenIndex)
                 val idents = interpolatedIdentifiers(args)
@@ -220,6 +222,10 @@ class TraceLeakTest {
             }
         }
 
+        assertTrue(
+            "Expected at least 50 Trace call sites to be scanned, found $totalCallSitesMatched",
+            totalCallSitesMatched >= 50,
+        )
         assertTrue(
             "Trace call sites must not interpolate name/path/file/dir/entry/documentId-like " +
                 "variables (directly, or via a renamed local alias):\n" +
@@ -254,9 +260,11 @@ class TraceLeakTest {
         val bareIdentifierRegex = Regex("^[a-zA-Z_][a-zA-Z0-9_]*$")
         val violations = mutableListOf<String>()
 
+        var totalCallSitesMatched = 0
         for (file in files) {
             val text = file.readText()
             for (m in callSiteRegex.findAll(text)) {
+                totalCallSitesMatched++
                 val fnName = m.groupValues[1]
                 val openParenIndex = m.range.last
                 val args = extractCallArgs(text, openParenIndex)
@@ -276,6 +284,10 @@ class TraceLeakTest {
             }
         }
 
+        assertTrue(
+            "Expected at least 50 Trace call sites to be scanned, found $totalCallSitesMatched",
+            totalCallSitesMatched >= 50,
+        )
         assertTrue(
             "Trace call sites must not pass a bare identifier as a 2nd/3rd argument " +
                 "(this is how a raw Throwable variable used to reach Log.e):\n" +

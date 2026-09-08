@@ -21,13 +21,22 @@ class UsbDetachReceiver(
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == UsbManager.ACTION_USB_DEVICE_DETACHED) {
-            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val detachedDev = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
             } else {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
             }
-            Trace.i("UsbDetachReceiver", "USB device detached: ${device?.deviceName ?: "unknown"}")
+            val active = session.activeUsbDevice
+            if (active != null && detachedDev != null) {
+                val matches = (detachedDev.deviceId == active.deviceId) ||
+                    (detachedDev.vendorId == active.vendorId && detachedDev.productId == active.productId)
+                if (!matches) {
+                    Trace.i("UsbDetachReceiver", "Ignoring detach for unrelated USB device")
+                    return
+                }
+            }
+            Trace.i("UsbDetachReceiver", "Active USB device detached")
             session.notifyDeviceDetached()
         }
     }

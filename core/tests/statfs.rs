@@ -79,6 +79,30 @@ fn btrfs_statfs_computes_bounded_available_bytes() {
         assert!(stat.available_bytes <= stat.free_bytes, "available {} <= free {}", stat.available_bytes, stat.free_bytes);
         assert!(stat.free_bytes <= stat.total_bytes, "free {} <= total {}", stat.free_bytes, stat.total_bytes);
         assert!(stat.available_bytes > 0, "available bytes should be positive on test fixture");
+
+        // Verify caching: second call returns identical results
+        let stat_cached = fs.statfs().expect("btrfs statfs cached");
+        assert_eq!(stat, stat_cached);
+    }
+}
+
+#[test]
+fn btrfs_read_block_groups_matches_extent_tree_read() {
+    use luks_core::fs::btrfs::write::extent_tree::{read_block_groups, ExtentTree};
+    let fixtures = ["plain.img", "mixed-4k.img", "compress.img"];
+
+    for name in fixtures {
+        let path = btrfs_scratch(name, "bg-verify");
+        let fs = open_btrfs(&path);
+
+        let fast_bgs = read_block_groups(&fs).expect("read_block_groups");
+        let full_tree = ExtentTree::read(&fs).expect("ExtentTree::read");
+
+        assert!(!fast_bgs.is_empty(), "block groups must not be empty for {name}");
+        assert_eq!(fast_bgs.len(), full_tree.block_groups.len(), "block group count mismatch on {name}");
+        for (fast, full) in fast_bgs.iter().zip(full_tree.block_groups.iter()) {
+            assert_eq!(fast, full, "block group mismatch on {name}: fast={fast:?}, full={full:?}");
+        }
     }
 }
 

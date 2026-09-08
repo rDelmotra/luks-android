@@ -1,6 +1,7 @@
 package dev.luksandroid.session
 
 import android.content.Context
+import android.hardware.usb.UsbDevice
 import dev.luksandroid.Entry
 import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
@@ -24,6 +25,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -62,6 +64,8 @@ open class SessionController(
     var device: AutoCloseable? = null
         private set
     var volume: LuksVolume? = null
+        private set
+    var activeUsbDevice: UsbDevice? = null
         private set
 
     internal var volumeCloseable: AutoCloseable? = null
@@ -196,6 +200,7 @@ open class SessionController(
     ): SessionState = mutex.withLock {
         Trace.i("LuksSession: unlocking partition at offset ${partition.offsetBytes}")
         _state.value = SessionState.Unlocking(partition)
+        this.activeUsbDevice = device.usbDevice
         val started = timeProvider()
         try {
             val vol = UnlockService.holding(context) {
@@ -217,12 +222,14 @@ open class SessionController(
             this.volume = vol
             this.volumeCloseable = vol
             this.deviceCloseable = device
+            this.activeUsbDevice = device.usbDevice
 
             val unlocked = SessionState.Unlocked(vol, partition, entries)
             _state.value = unlocked
             restartIdleTimer()
             unlocked
         } catch (e: LuksException) {
+            this.activeUsbDevice = null
             Trace.err(e.code, "unlock")
             Trace.e("LuksSession: unlock failed [${e.code}]")
             val msg = if (e.isWrongPassword) "wrong passphrase" else "[${e.code}] ${e.message}"
@@ -230,6 +237,7 @@ open class SessionController(
             _state.value = failed
             failed
         } catch (e: Exception) {
+            this.activeUsbDevice = null
             Trace.err(-1, "unlock")
             Trace.e("LuksSession: unlock failed: ${Trace.throwableSummary(e)}")
             val failed = SessionState.Failed(e.message ?: e.toString(), partition)
@@ -271,11 +279,15 @@ open class SessionController(
         try {
             Trace.i("LuksSession: locking session, waiting for leases to drain")
             if (_activeLeases.value > 0) {
-                _activeLeases.first { it == 0 }
+                withTimeoutOrNull(5000L) {
+                    _activeLeases.first { it == 0 }
+                } ?: Trace.i("LuksSession: active leases did not drain within 5s, proceeding with teardown")
             }
-            mutex.withLock {
-                teardownHandles()
-                _state.value = SessionState.Locked
+            withContext(kotlinx.coroutines.NonCancellable) {
+                mutex.withLock {
+                    teardownHandles()
+                    _state.value = SessionState.Locked
+                }
             }
         } finally {
             isLocking.set(false)
@@ -381,6 +393,7 @@ open class SessionController(
         this.device = device
         this.volumeCloseable = volumeCloseable
         this.deviceCloseable = deviceCloseable
+        this.activeUsbDevice = (device as? LuksDevice)?.usbDevice
         val dummyVol = volume ?: LuksVolume(0L)
         val s = SessionState.Unlocked(dummyVol, partition, entries)
         _state.value = s
@@ -388,7 +401,7 @@ open class SessionController(
         s
     }
 
-    private fun teardownHandles() {
+    private suspend fun teardownHandles() = withContext(Dispatchers.IO) {
         cancelIdleTimer()
         val volC = volumeCloseable ?: volume
         val devC = deviceCloseable ?: device
@@ -396,6 +409,9 @@ open class SessionController(
         device = null
         volumeCloseable = null
         deviceCloseable = null
+        activeUsbDevice = null
+
+        TransferManager.resetTransferLocks()
 
         // 1. Volume must close FIRST
         try {

@@ -77,11 +77,8 @@ fi
 # and non-generic, so it is either an exported symbol or it does not exist.
 # There is no "compiled but unreachable" middle state to argue about — which
 # makes this the one artifact-level check that proves what it claims.
-# Both the whole-file and the streaming (unknown-size) entry points count:
-# a build that dropped nativeWriteFile but still exported
-# nativeBeginFileStreaming could still write a drive one chunk at a time, and
-# the single-literal check would have called that clean.
-JNI_PATTERN='nativeWriteFile|nativeBeginFileStreaming'
+# All whole-file, streaming, directory, and modification entry points count:
+JNI_PATTERN='nativeBenchmarkWrite|nativeWriteFile|nativeBeginFile|nativeBeginFileStreaming|nativeWriteChunk|nativeWriteChunkWithCancel|nativeFinishFile|nativeCommitActiveBatch|nativeCloseWriter|nativeDeleteFile|nativeCreateDirectory|nativeRename'
 
 DYLIB_HITS() {
     # cdylib extension differs by host; the Android build produces the .so.

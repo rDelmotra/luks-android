@@ -47,9 +47,15 @@ pub fn derive_key(kdf: &Kdf, password: &[u8], out_len: usize) -> Result<Secret> 
             let params = Params::new(p.memory, p.time, p.cpus, Some(out_len))
                 .map_err(|e| LuksError::KdfFailed(e.to_string()))?;
 
-            Argon2::new(algorithm, Version::V0x13, params)
-                .hash_password_into(password, p.salt.expose(), &mut out)
-                .map_err(|e| LuksError::KdfFailed(e.to_string()))?;
+            // Allocate an explicit memory arena so we can safely zeroize it
+            // before freeing back to the system allocator. Argon2::Block does
+            // not implement Drop, so without this the 1 GiB password matrix
+            // remains in un-wiped heap memory (E-1).
+            let mut blocks = vec![argon2::Block::default(); params.block_count()];
+            let res = Argon2::new(algorithm, Version::V0x13, params)
+                .hash_password_into_with_memory(password, p.salt.expose(), &mut out, &mut blocks);
+            blocks.zeroize();
+            res.map_err(|e| LuksError::KdfFailed(e.to_string()))?;
         }
         Kdf::Pbkdf2 {
             salt,

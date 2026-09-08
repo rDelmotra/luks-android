@@ -418,14 +418,14 @@ fn e2fsck_complains_only_about_the_leak_after_a_net_allocation() {
 
 /// Path to `tools/verify-ext4.sh`, or `None` if the VM it needs is not up.
 fn verify_script() -> Option<String> {
-    let script = format!("{}/../tools/verify-ext4.sh", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&script).exists() {
-        return None;
-    }
     if !common::oracle::gate() {
         return None;
     }
-
+    let script = format!("{}/../tools/verify-ext4.sh", env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        std::path::Path::new(&script).exists(),
+        "oracle gate passed, but verify-ext4.sh was not found at {script}"
+    );
     Some(script)
 }
 

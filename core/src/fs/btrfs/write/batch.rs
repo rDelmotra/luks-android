@@ -22,7 +22,7 @@ use crate::fs::btrfs::write::file::BtrfsFileWriter;
 use crate::fs::btrfs::write::interval_set::IntervalSet;
 use crate::fs::btrfs::write::node;
 use crate::fs::btrfs::write::txn::Transaction;
-use crate::fs::btrfs::Btrfs;
+use crate::fs::btrfs::{Btrfs, Node};
 
 /// Snapshot of batch state taken before adding a file, enabling single-file rollback.
 #[derive(Debug, Clone)]
@@ -47,6 +47,7 @@ pub struct Batch {
     pub fs_root: (u64, u8),
     pub csum_root: Option<(u64, u8)>,
     pub pending_blocks: HashMap<u64, Vec<u8>>,
+    pub pending_nodes: std::sync::Mutex<HashMap<u64, (u32, Node)>>,
     pub blocks_to_add: Vec<(u64, u8, u64)>,
     pub blocks_to_remove: Vec<(u64, u8)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
@@ -87,6 +88,7 @@ impl Batch {
             fs_root,
             csum_root: None,
             pending_blocks: HashMap::new(),
+            pending_nodes: std::sync::Mutex::new(HashMap::new()),
             blocks_to_add: Vec::new(),
             blocks_to_remove: Vec::new(),
             data_extents_to_add: Vec::new(),
@@ -124,6 +126,7 @@ impl Batch {
         self.fs_root = mark.fs_root;
         self.csum_root = mark.csum_root;
         self.pending_blocks = mark.pending_blocks;
+        self.pending_nodes.lock().unwrap().clear();
         self.blocks_to_add = mark.blocks_to_add;
         self.blocks_to_remove = mark.blocks_to_remove;
         self.data_extents_to_add = mark.data_extents_to_add;

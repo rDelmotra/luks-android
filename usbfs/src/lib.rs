@@ -152,13 +152,28 @@ impl RawUsbFs for RealUsbFs {
     }
 
     fn poll(&self, fd: RawFd, events: libc::c_short, timeout_ms: i32) -> std::result::Result<libc::c_short, i32> {
+        let deadline = if timeout_ms >= 0 {
+            Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+        } else {
+            None
+        };
         loop {
+            let cur_timeout = match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        return Err(libc::ETIMEDOUT);
+                    }
+                    (dl - now).as_millis().clamp(0, timeout_ms as u128) as i32
+                }
+                None => -1,
+            };
             let mut pfd = libc::pollfd {
                 fd,
                 events,
                 revents: 0,
             };
-            let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            let rc = unsafe { libc::poll(&mut pfd, 1, cur_timeout) };
             if rc < 0 {
                 let e = errno();
                 if e == libc::EINTR {
@@ -421,6 +436,10 @@ impl UsbFsTransport {
     /// must be reported rather than retried forever.
     pub const MIN_MAX_TRANSFER: usize = 4 * 1024;
 
+    /// Maximum transfer ceiling. With MAX_URB_SLOTS = 32 and CHUNK_SIZE = 128 KiB,
+    /// a transfer above 4 MiB exceeds the arena slot capacity and must be clamped (B-5).
+    pub const MAX_MAX_TRANSFER: usize = MAX_URB_SLOTS * (128 * 1024);
+
     /// Wrap a usbfs file descriptor.
     ///
     /// # Safety
@@ -468,7 +487,8 @@ impl UsbFsTransport {
     }
 
     pub fn with_max_transfer(mut self, bytes: usize) -> Self {
-        self.max_transfer = Arc::new(AtomicUsize::new(bytes.max(Self::MIN_MAX_TRANSFER)));
+        let clamped = bytes.clamp(Self::MIN_MAX_TRANSFER, Self::MAX_MAX_TRANSFER);
+        self.max_transfer = Arc::new(AtomicUsize::new(clamped));
         self
     }
 
@@ -577,6 +597,7 @@ impl UsbFsTransport {
                 offset += chunk_len;
             }
 
+            let attempted = offset;
             let num_urbs = chunks.len();
             let mut arena = self.arena.lock().unwrap();
             let (generation, slot_indices) = arena.allocate(num_urbs)?;
@@ -608,6 +629,12 @@ impl UsbFsTransport {
                 }
                 slot.submitted = true;
                 submitted_count += 1;
+            }
+
+            // Free any slots that were allocated in the arena but never submitted to the kernel (B-3)
+            for &slot_idx in &slot_indices[submitted_count..] {
+                arena.slots[slot_idx].in_use = false;
+                arena.slots[slot_idx].submitted = false;
             }
 
             luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
@@ -667,7 +694,7 @@ impl UsbFsTransport {
                                 let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
                                 if !was_discarded && completion_err.is_none() {
                                     completion_err = Some(err);
-                                    for &other_idx in &slot_indices {
+                                    for &other_idx in &slot_indices[..submitted_count] {
                                         let other = &mut arena.slots[other_idx];
                                         if other.submitted && !other.reaped {
                                             let _ = self.raw.ioctl(
@@ -685,26 +712,30 @@ impl UsbFsTransport {
                             // Stale completion from older generation reclaimed
                             slot.in_use = false;
                         }
+                    } else {
+                        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::UnrecognizedReap {
+                            ptr: reaped as usize,
+                        });
                     }
                 }
             }
 
             let err = submit_err.or(completion_err).or(reap_err);
 
-            if err.is_some() || completed < submitted_count {
+            if submitted_count > 0 && (err.is_some() || completed < submitted_count) {
                 drain_unreaped(
                     self.fd,
                     &*self.raw,
                     &self.state,
                     &mut arena,
                     generation,
-                    &slot_indices,
+                    &slot_indices[..submitted_count],
                     self.timeout_ms,
                     &mut completed,
                     submitted_count,
                 );
-            } else {
-                for &slot_idx in &slot_indices {
+            } else if submitted_count > 0 && err.is_none() {
+                for &slot_idx in &slot_indices[..submitted_count] {
                     arena.slots[slot_idx].in_use = false;
                 }
             }
@@ -714,12 +745,11 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let shrinkable = (e == libc::EINVAL || e == libc::ENOMEM)
-                        && limit > Self::MIN_MAX_TRANSFER;
-                    if shrinkable {
+                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
+                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
                         let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
                         self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if prefix == 0 {
+                        if is_shrinkable_error && prefix == 0 {
                             // Nothing reached the wire this round — safe to
                             // redo the whole thing at the smaller size rather
                             // than reporting a zero-byte failure.
@@ -735,7 +765,7 @@ impl UsbFsTransport {
                         // above or returned below.
                         return Ok(prefix);
                     }
-                    return Err(bulk_err(prefix, limit, e));
+                    return Err(bulk_err(attempted, limit, e));
                 }
             }
         }
@@ -766,6 +796,7 @@ impl UsbFsTransport {
                 remaining = rest;
             }
 
+            let attempted = limit.min(buf_len);
             let num_urbs = chunks.len();
             let mut arena = self.arena.lock().unwrap();
             let (generation, slot_indices) = arena.allocate(num_urbs)?;
@@ -797,6 +828,12 @@ impl UsbFsTransport {
                 }
                 slot.submitted = true;
                 submitted_count += 1;
+            }
+
+            // Free any slots that were allocated in the arena but never submitted to the kernel (B-3)
+            for &slot_idx in &slot_indices[submitted_count..] {
+                arena.slots[slot_idx].in_use = false;
+                arena.slots[slot_idx].submitted = false;
             }
 
             luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
@@ -857,7 +894,7 @@ impl UsbFsTransport {
                                 let was_discarded = err == libc::ENOENT || err == libc::ECONNRESET;
                                 if !was_discarded && completion_err.is_none() {
                                     completion_err = Some(err);
-                                    for &other_idx in &slot_indices {
+                                    for &other_idx in &slot_indices[..submitted_count] {
                                         let other = &mut arena.slots[other_idx];
                                         if other.submitted && !other.reaped {
                                             let _ = self.raw.ioctl(
@@ -875,7 +912,7 @@ impl UsbFsTransport {
                                 let short_read = slot.urb.actual_length < slot.urb.buffer_length;
                                 if short_read && !discarded_for_short_read {
                                     discarded_for_short_read = true;
-                                    for &other_idx in &slot_indices {
+                                    for &other_idx in &slot_indices[..submitted_count] {
                                         let other = &mut arena.slots[other_idx];
                                         if other.submitted && !other.reaped {
                                             let _ = self.raw.ioctl(
@@ -891,26 +928,30 @@ impl UsbFsTransport {
                             // Stale completion from older generation reclaimed
                             slot.in_use = false;
                         }
+                    } else {
+                        luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::UnrecognizedReap {
+                            ptr: reaped as usize,
+                        });
                     }
                 }
             }
 
             let err = submit_err.or(completion_err).or(reap_err);
 
-            if err.is_some() || completed < submitted_count {
+            if submitted_count > 0 && (err.is_some() || completed < submitted_count) {
                 drain_unreaped(
                     self.fd,
                     &*self.raw,
                     &self.state,
                     &mut arena,
                     generation,
-                    &slot_indices,
+                    &slot_indices[..submitted_count],
                     self.timeout_ms,
                     &mut completed,
                     submitted_count,
                 );
-            } else {
-                for &slot_idx in &slot_indices {
+            } else if submitted_count > 0 && err.is_none() {
+                for &slot_idx in &slot_indices[..submitted_count] {
                     arena.slots[slot_idx].in_use = false;
                 }
             }
@@ -920,12 +961,11 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let shrinkable = (e == libc::EINVAL || e == libc::ENOMEM)
-                        && limit > Self::MIN_MAX_TRANSFER;
-                    if shrinkable {
+                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
+                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
                         let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
                         self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if prefix == 0 {
+                        if is_shrinkable_error && prefix == 0 {
                             // Nothing reached the wire this round — safe to
                             // redo the whole thing at the smaller size rather
                             // than reporting a zero-byte failure.
@@ -941,7 +981,7 @@ impl UsbFsTransport {
                         // below.
                         return Ok(prefix);
                     }
-                    return Err(bulk_err(prefix, limit, e));
+                    return Err(bulk_err(attempted, limit, e));
                 }
             }
         }
@@ -993,8 +1033,17 @@ fn drain_unreaped(
         }
         let rem_ms = (deadline - now).as_millis().clamp(10, 500) as i32;
 
-        if raw.poll(fd, libc::POLLOUT, rem_ms).is_err() {
-            continue;
+        match raw.poll(fd, libc::POLLOUT, rem_ms) {
+            Ok(_) => {}
+            Err(e) => {
+                if e == libc::ENODEV || e == libc::EBADF || e == libc::ESHUTDOWN {
+                    luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::DrainAborted {
+                        errno: e,
+                    });
+                    break;
+                }
+                continue;
+            }
         }
 
         let mut reaped: *mut c_void = std::ptr::null_mut();
@@ -1004,6 +1053,13 @@ fn drain_unreaped(
             &mut reaped as *mut *mut c_void as *mut c_void,
         );
         if rc < 0 {
+            let e = errno();
+            if e == libc::ENODEV || e == libc::EBADF || e == libc::ESHUTDOWN {
+                luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::DrainAborted {
+                    errno: e,
+                });
+                break;
+            }
             continue;
         }
 
@@ -1016,6 +1072,10 @@ fn drain_unreaped(
             } else if slot.in_use && slot.generation < generation {
                 slot.in_use = false;
             }
+        } else {
+            luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::UnrecognizedReap {
+                ptr: reaped as usize,
+            });
         }
     }
 

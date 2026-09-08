@@ -74,6 +74,10 @@ impl<D: ReadAt> Btrfs<D> {
     /// `btrfs subvolume list` omits it: it is not something you can navigate
     /// *to*, it is where navigation starts.
     pub fn subvolumes(&self) -> Result<Vec<Subvolume>> {
+        if let Some(cached) = self.subvol_cache.lock().unwrap().as_ref() {
+            return Ok(cached.clone());
+        }
+
         let mut backrefs: HashMap<u64, Backref> = HashMap::new();
         let mut failure = None;
 
@@ -109,10 +113,18 @@ impl<D: ReadAt> Btrfs<D> {
         // a subvolume nested n deep costs n tree walks and a directory holding
         // 50 snapshots pays for its own path 50 times.
         let mut paths: HashMap<u64, Option<String>> = HashMap::new();
+        let mut parent_roots: HashMap<u64, TreeRoot> = HashMap::new();
+        let mut dir_paths: HashMap<(u64, u64), String> = HashMap::new();
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
             let root = self.tree_root(id)?;
-            let path = self.subvolume_path(id, &backrefs, &mut paths)?;
+            let path = self.subvolume_path(
+                id,
+                &backrefs,
+                &mut paths,
+                &mut parent_roots,
+                &mut dir_paths,
+            )?;
             let b = &backrefs[&id];
             out.push(Subvolume {
                 id,
@@ -123,6 +135,7 @@ impl<D: ReadAt> Btrfs<D> {
                 root,
             });
         }
+        *self.subvol_cache.lock().unwrap() = Some(out.clone());
         Ok(out)
     }
 
@@ -137,6 +150,8 @@ impl<D: ReadAt> Btrfs<D> {
         id: u64,
         backrefs: &HashMap<u64, Backref>,
         memo: &mut HashMap<u64, Option<String>>,
+        parent_roots: &mut HashMap<u64, TreeRoot>,
+        dir_paths: &mut HashMap<(u64, u64), String>,
     ) -> Result<String> {
         match memo.get(&id) {
             Some(Some(p)) => return Ok(p.clone()),
@@ -157,12 +172,30 @@ impl<D: ReadAt> Btrfs<D> {
         };
 
         memo.insert(id, None);
-        let parent_path = self.subvolume_path(b.parent_id, backrefs, memo)?;
-        let parent_root = self.tree_root(b.parent_id)?;
+        let parent_path = self.subvolume_path(
+            b.parent_id,
+            backrefs,
+            memo,
+            parent_roots,
+            dir_paths,
+        )?;
+        let parent_root = if let Some(r) = parent_roots.get(&b.parent_id) {
+            *r
+        } else {
+            let r = self.tree_root(b.parent_id)?;
+            parent_roots.insert(b.parent_id, r);
+            r
+        };
         // Where inside the parent tree the mount point sits. Empty when the
         // entry is directly in that tree's root directory, which is the common
         // case and the one that must not produce a doubled slash.
-        let dir = self.inode_path(&parent_root, b.dirid)?;
+        let dir = if let Some(d) = dir_paths.get(&(b.parent_id, b.dirid)) {
+            d.clone()
+        } else {
+            let d = self.inode_path(&parent_root, b.dirid)?;
+            dir_paths.insert((b.parent_id, b.dirid), d.clone());
+            d
+        };
 
         let mut path = parent_path;
         if !dir.is_empty() {

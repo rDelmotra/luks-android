@@ -107,10 +107,13 @@ pub struct Btrfs<D: ReadAt> {
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
     nodes: cache::NodeCache,
+    pub(crate) subvol_cache: std::sync::Mutex<Option<Vec<Subvolume>>>,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) active_batch: Option<write::Batch>,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) has_open_writer: bool,
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) statfs_cache: std::sync::Mutex<Option<crate::fs::StatFs>>,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -118,7 +121,12 @@ impl<D: ReadAt> Btrfs<D> {
     /// map without which nothing else on the filesystem can be read.
     pub fn mount(device: D) -> Result<Self> {
         let sb = Superblock::find(&device)?;
+        Self::mount_with_superblock(device, sb)
+    }
 
+    /// Mount Btrfs reusing an already found and verified superblock, cutting
+    /// redundant superblock search and CRC32c verification (C-5).
+    pub fn mount_with_superblock(device: D, sb: Superblock) -> Result<Self> {
         // A non-empty log tree means this filesystem was not unmounted
         // cleanly — a yanked drive, a crash, a phone that pulled the cable.
         // The newest writes live in that tree and **not** in the trees this
@@ -147,10 +155,13 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            subvol_cache: std::sync::Mutex::new(None),
             #[cfg(feature = "dangerous-write-support")]
             active_batch: None,
             #[cfg(feature = "dangerous-write-support")]
             has_open_writer: false,
+            #[cfg(feature = "dangerous-write-support")]
+            statfs_cache: std::sync::Mutex::new(None),
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
@@ -218,7 +229,20 @@ impl<D: ReadAt> Btrfs<D> {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {
             if let Some(raw) = batch.pending_blocks.get(&logical) {
-                return Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid);
+                let csum = if raw.len() >= 4 {
+                    u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4]))
+                } else {
+                    0
+                };
+                let mut cache = batch.pending_nodes.lock().unwrap();
+                if let Some((cached_csum, ref node)) = cache.get(&logical) {
+                    if *cached_csum == csum {
+                        return Ok(node.clone());
+                    }
+                }
+                let node = Node::parse(raw.clone(), logical, self.sb.csum_type, &self.sb.metadata_uuid)?;
+                cache.insert(logical, (csum, node.clone()));
+                return Ok(node);
             }
         }
         if let Some(node) = self.nodes.get(logical) {
@@ -390,13 +414,19 @@ impl<D: ReadAt> Btrfs<D> {
     }
 
     /// Update the in-memory mount state (superblock and root trees) after a committed transaction,
-    /// invalidating the node cache.
+    /// invalidating the node cache and cached statfs.
     #[cfg(feature = "dangerous-write-support")]
     pub fn update_mount_state(&mut self, sb: Superblock, fs_tree: TreeRoot) {
         self.sb = sb;
         self.fs_tree = fs_tree;
         self.nodes.clear();
         self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
+        if let Ok(mut guard) = self.statfs_cache.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = self.subvol_cache.lock() {
+            *guard = None;
+        }
     }
 
     /// Read all `DEV_EXTENT` items for `devid` from the `DEV_TREE`.
@@ -412,38 +442,57 @@ impl<D: ReadAt> Btrfs<D> {
 
         #[cfg(feature = "dangerous-write-support")]
         {
-            let detailed_stat = (|| -> Result<crate::fs::StatFs> {
-                let free_space_map = if let Some(ref batch) = self.active_batch {
-                    batch.allocator.clone()
-                } else {
-                    write::alloc::FreeSpaceMap::from_extent_tree_and_chunk_map(
-                        &write::extent_tree::ExtentTree::read(self)?,
-                        self.chunk_map(),
-                    )?
-                };
+            if self.active_batch.is_none() {
+                if let Ok(guard) = self.statfs_cache.lock() {
+                    if let Some(ref cached) = *guard {
+                        return Ok(cached.clone());
+                    }
+                }
+            }
 
+            let detailed_stat = (|| -> Result<crate::fs::StatFs> {
                 let mut free_data = 0u64;
                 let mut free_metadata = 0u64;
                 let mut free_system = 0u64;
 
-                for bg in &free_space_map.block_groups {
-                    let flags = bg.block_group.flags;
-                    if flags & 0x1 != 0 {
-                        // DATA
-                        free_data = free_data.saturating_add(bg.total_free_bytes);
+                if let Some(ref batch) = self.active_batch {
+                    for bg in &batch.allocator.block_groups {
+                        let flags = bg.block_group.flags;
+                        if flags & 0x1 != 0 {
+                            // DATA
+                            free_data = free_data.saturating_add(bg.total_free_bytes);
+                        }
+                        if flags & 0x4 != 0 {
+                            // METADATA
+                            free_metadata = free_metadata.saturating_add(bg.total_free_bytes);
+                        }
+                        if flags & 0x2 != 0 {
+                            // SYSTEM
+                            free_system = free_system.saturating_add(bg.total_free_bytes);
+                        }
                     }
-                    if flags & 0x4 != 0 {
-                        // METADATA
-                        free_metadata = free_metadata.saturating_add(bg.total_free_bytes);
-                    }
-                    if flags & 0x2 != 0 {
-                        // SYSTEM
-                        free_system = free_system.saturating_add(bg.total_free_bytes);
+                } else {
+                    let block_groups = write::extent_tree::read_block_groups(self)?;
+                    for bg in &block_groups {
+                        let total_free = bg.length.saturating_sub(bg.used);
+                        if bg.is_data() {
+                            // DATA
+                            free_data = free_data.saturating_add(total_free);
+                        }
+                        if bg.is_metadata() {
+                            // METADATA
+                            free_metadata = free_metadata.saturating_add(total_free);
+                        }
+                        if bg.is_system() {
+                            // SYSTEM
+                            free_system = free_system.saturating_add(total_free);
+                        }
                     }
                 }
 
                 // Unallocated device space
-                let dev_extents = write::chunk_alloc::read_dev_extents(self, self.sb.dev_id).unwrap_or_default();
+                // C-10: propagate errors directly; do not swallow with unwrap_or_default()
+                let dev_extents = write::chunk_alloc::read_dev_extents(self, self.sb.dev_id)?;
                 let allocated_dev_bytes: u64 = dev_extents.iter().map(|(_, len)| *len).sum();
                 let unalloc_dev_bytes = total_bytes
                     .saturating_sub(write::chunk_alloc::BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
@@ -484,19 +533,15 @@ impl<D: ReadAt> Btrfs<D> {
                 })
             })();
 
-            if let Ok(stat) = detailed_stat {
-                return Ok(stat);
+            let stat = detailed_stat?;
+
+            if self.active_batch.is_none() {
+                if let Ok(mut guard) = self.statfs_cache.lock() {
+                    *guard = Some(stat.clone());
+                }
             }
 
-            let free_bytes = total_bytes.saturating_sub(self.sb.bytes_used);
-            Ok(crate::fs::StatFs {
-                total_bytes,
-                free_bytes,
-                available_bytes: free_bytes,
-                total_inodes: 0,
-                free_inodes: 0,
-                block_size: sector_size,
-            })
+            Ok(stat)
         }
 
         #[cfg(not(feature = "dangerous-write-support"))]
