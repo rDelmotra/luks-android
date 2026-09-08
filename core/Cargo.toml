@@ -76,7 +76,83 @@ name = "space_probe"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_abandon_fail_closed"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_cross_file"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_double_alloc"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_equality"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_n_greater_1"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_resume_corruption"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_btree_permutations"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_chunk_alloc_controls"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_search"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_txn"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_commit_template_corruption"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_cow_fixup"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_crash_safety"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_create_file"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_data_write"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_delete"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_empty_leaf"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_extent_tree"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_finish_file_csum"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_large_file_chunk_alloc"
 required-features = ["dangerous-write-support"]
 
 [[test]]
@@ -84,7 +160,35 @@ name = "btrfs_mkdir"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_node_surgery"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_rename"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_root_split"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_b2_release"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_c_reservation"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_fg"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_chunk_alloc"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_crash_safety"
 required-features = ["dangerous-write-support"]
 
 [[test]]
@@ -92,7 +196,31 @@ name = "btrfs_streaming_unknown"
 required-features = ["dangerous-write-support"]
 
 [[test]]
-name = "btrfs_streaming_crash_safety"
+name = "btrfs_timestamp_write"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_valves"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_write_gate"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_alloc"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_delete"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_dirent"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_file"
 required-features = ["dangerous-write-support"]
 
 [[test]]
@@ -112,7 +240,38 @@ name = "ext4_streaming_unknown"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "ext4_write_gate"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "luks_ext4_write"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "luks_write"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "scsi_write"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "statfs"
 required-features = ["dangerous-write-support"]
 
+[[test]]
+name = "tree_import_oracle"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "write_cost"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "write_device"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "write_target"
+required-features = ["dangerous-write-support"]
 
