@@ -106,7 +106,10 @@ fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>
         Ok(Ok(value)) => value,
         Ok(Err(fail)) => {
             let (code, msg) = fail.parts();
+            #[cfg(debug_assertions)]
             log::e(&format!("guard failed [{}]: {}", code, msg));
+            #[cfg(not(debug_assertions))]
+            log::e(&format!("guard failed [{}]", code));
             throw(env, code, &msg);
             default
         }
