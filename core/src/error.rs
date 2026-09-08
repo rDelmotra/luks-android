@@ -314,6 +314,27 @@ impl LuksError {
                 | Self::WriteSessionFenced(_)
         )
     }
+
+    /// Returns true if this error indicates the physical USB device was disconnected
+    /// or its usbfs file descriptor was closed (e.g. ENODEV, EBADF, ESHUTDOWN, or Dead transport).
+    pub fn is_disconnected(&self) -> bool {
+        match self {
+            Self::UsbTransfer(msg) => {
+                msg.contains("No such device")
+                    || msg.contains("Bad file descriptor")
+                    || msg.contains("endpoint shutdown")
+                    || msg.contains("errno 108")
+                    || msg.contains("ESHUTDOWN")
+                    || msg.contains("dead")
+            }
+            Self::Io { source, .. } => {
+                source.raw_os_error() == Some(19) // ENODEV
+                    || source.raw_os_error() == Some(9) // EBADF
+                    || source.raw_os_error() == Some(108) // ESHUTDOWN
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, LuksError>;

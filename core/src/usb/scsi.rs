@@ -288,10 +288,29 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
 
         // Removable media commonly answer NOT READY once while spinning up.
         for _ in 0..3 {
-            if dev.test_unit_ready().is_ok() {
-                break;
+            match dev.test_unit_ready() {
+                Ok(()) => break,
+                Err(e) => {
+                    if e.is_disconnected() {
+                        return Err(e);
+                    }
+                    if let Ok(sense) = dev.request_sense() {
+                        let sense_key = sense[2] & 0x0F;
+                        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
+                            opcode: OP_TEST_UNIT_READY,
+                            status: "NOT READY",
+                            transferred: 0,
+                            sense_key: Some(sense_key),
+                        });
+                        if sense_key != 0x02 && sense_key != 0x06 {
+                            return Err(LuksError::ScsiCommandFailed {
+                                opcode: OP_TEST_UNIT_READY,
+                                sense: Some(Sense::parse(&sense)),
+                            });
+                        }
+                    }
+                }
             }
-            let _ = dev.request_sense();
         }
 
         dev.capacity = dev.read_capacity()?;
@@ -374,13 +393,19 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut got = 0usize;
         let mut cleared_halt = false;
         while got < CSW_LEN {
-            match self.transport.read(&mut csw_buf[got..]) {
+            let read_res = self.transport.read(&mut csw_buf[got..]);
+            match read_res {
+                Err(e) if e.is_disconnected() => {
+                    return Err(e);
+                }
                 Ok(0) | Err(_) if !cleared_halt => {
                     // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
                     // endpoint before/during CSW is standard; clear halt and retry once.
                     cleared_halt = true;
                     if let Err(e) = self.transport.clear_halt(true) {
-                        let _ = self.transport.reset();
+                        if !e.is_disconnected() {
+                            let _ = self.transport.reset();
+                        }
                         return Err(e);
                     }
                     continue;
@@ -393,7 +418,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     got += n;
                 }
                 Err(e) => {
-                    let _ = self.transport.reset();
+                    if !e.is_disconnected() {
+                        let _ = self.transport.reset();
+                    }
                     return Err(e);
                 }
             }
@@ -512,13 +539,19 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut got = 0usize;
         let mut cleared_halt = false;
         while got < CSW_LEN {
-            match self.transport.read(&mut csw_buf[got..]) {
+            let read_res = self.transport.read(&mut csw_buf[got..]);
+            match read_res {
+                Err(e) if e.is_disconnected() => {
+                    return Err(e);
+                }
                 Ok(0) | Err(_) if !cleared_halt => {
                     // BOT 5.3: An endpoint stall (EPIPE) or 0-byte read on the In
                     // endpoint before/during CSW is standard; clear halt and retry once.
                     cleared_halt = true;
                     if let Err(e) = self.transport.clear_halt(true) {
-                        let _ = self.transport.reset();
+                        if !e.is_disconnected() {
+                            let _ = self.transport.reset();
+                        }
                         return Err(e);
                     }
                     continue;
@@ -531,7 +564,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     got += n;
                 }
                 Err(e) => {
-                    let _ = self.transport.reset();
+                    if !e.is_disconnected() {
+                        let _ = self.transport.reset();
+                    }
                     return Err(e);
                 }
             }

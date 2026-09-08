@@ -36,6 +36,8 @@ pub enum UsbEvent {
     StateTransition { from: &'static str, to: &'static str },
     Reset { kind: &'static str, status: i32 },
     Drain { discarded_count: usize, remaining: usize },
+    DrainAborted { errno: i32 },
+    UnrecognizedReap { ptr: usize },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -253,6 +255,12 @@ pub fn dump_text() -> String {
                 }
                 UsbEvent::Drain { discarded_count, remaining } => {
                     out.push_str(&format!("USB drain discarded={discarded_count} remaining={remaining}\n"));
+                }
+                UsbEvent::DrainAborted { errno } => {
+                    out.push_str(&format!("USB drain aborted errno={errno}\n"));
+                }
+                UsbEvent::UnrecognizedReap { ptr } => {
+                    out.push_str(&format!("USB unrecognized reap ptr=0x{ptr:X}\n"));
                 }
             },
             ForensicEvent::Scsi(ref s) => match s {
