@@ -855,7 +855,9 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     // up to ~15 rounds of extent-tree CoW feedback before reaching 0 pending blocks.
     const MAX_CONVERGENCE_ROUNDS: u32 = 30;
     let mut converged = false;
-    for _iteration in 0..MAX_CONVERGENCE_ROUNDS {
+    let mut rounds_executed = 0;
+    for iteration in 0..MAX_CONVERGENCE_ROUNDS {
+        rounds_executed = iteration + 1;
         if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
             // Convergence achieved
             converged = true;
@@ -1142,6 +1144,10 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
              had blocks to record after the round limit",
         ));
     }
+
+    crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::ConvergeRounds {
+        rounds: rounds_executed,
+    });
 
     let final_bytes_used = allocator
         .block_groups

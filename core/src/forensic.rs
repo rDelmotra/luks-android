@@ -10,7 +10,7 @@
 //!    under load without unbounded memory growth.
 
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -61,6 +61,13 @@ pub enum BtrfsEvent {
     ChunkAlloc { logical: u64, length: u64, dev_offset: u64 },
     Commit { generation: u64, transid: u64, nodes_written: usize },
     Error { stage: &'static str, code: i32 },
+    LeafSplit { tree: u64, shape: u8, groups: u8, pos_class: u8 },
+    InteriorSplit { tree: u64, level: u8 },
+    HeightGrew { tree: u64, from: u8, to: u8 },
+    RootCollapsed { tree: u64, from: u8, to: u8 },
+    NodeRemoved { tree: u64, level: u8 },
+    BlockReused { tree: u64, level: u8 },
+    ConvergeRounds { rounds: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -160,9 +167,175 @@ pub fn record_scsi(event: ScsiEvent) {
     record(ForensicEvent::Scsi(event));
 }
 
+static STRUCTURAL_LEAF_SPLIT_SHAPE_1: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_LEAF_SPLIT_SHAPE_2: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_LEAF_SPLIT_SHAPE_3: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_LEAF_SPLIT_POS_0: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_LEAF_SPLIT_POS_LEN: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_LEAF_SPLIT_POS_MID: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_INTERIOR_SPLITS: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_HEIGHT_GREW: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_ROOT_COLLAPSED: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_NODE_REMOVED: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_BLOCK_REUSED: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_CONVERGE_CALLS: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_MAX_CONVERGE_ROUNDS: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct StructuralTransitionCounts {
+    pub leaf_split_shape_1: u64,
+    pub leaf_split_shape_2: u64,
+    pub leaf_split_shape_3: u64,
+    pub leaf_split_pos_0: u64,
+    pub leaf_split_pos_len: u64,
+    pub leaf_split_pos_mid: u64,
+    pub interior_splits: u64,
+    pub height_grew: u64,
+    pub root_collapsed: u64,
+    pub node_removed: u64,
+    pub block_reused: u64,
+    pub converge_total_calls: u64,
+    pub max_converge_rounds: u32,
+}
+
+static TRANSITION_LEDGER_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn transition_ledger_path() -> Option<&'static std::path::Path> {
+    TRANSITION_LEDGER_PATH
+        .get_or_init(|| std::env::var("LUKS_TRANSITION_LEDGER").ok().map(std::path::PathBuf::from))
+        .as_deref()
+}
+
+fn ledger_record_transition(line: &str) {
+    if let Some(path) = transition_ledger_path() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+fn update_structural_counts(event: &BtrfsEvent) {
+    match event {
+        BtrfsEvent::LeafSplit { tree, shape, groups, pos_class } => {
+            ledger_record_transition(&format!("LEAF_SPLIT tree={tree} shape={shape} groups={groups} pos={pos_class}"));
+            match shape {
+                1 => { STRUCTURAL_LEAF_SPLIT_SHAPE_1.fetch_add(1, Ordering::Relaxed); }
+                2 => { STRUCTURAL_LEAF_SPLIT_SHAPE_2.fetch_add(1, Ordering::Relaxed); }
+                3 => { STRUCTURAL_LEAF_SPLIT_SHAPE_3.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+            match pos_class {
+                0 => { STRUCTURAL_LEAF_SPLIT_POS_0.fetch_add(1, Ordering::Relaxed); }
+                1 => { STRUCTURAL_LEAF_SPLIT_POS_LEN.fetch_add(1, Ordering::Relaxed); }
+                2 => { STRUCTURAL_LEAF_SPLIT_POS_MID.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+        }
+        BtrfsEvent::InteriorSplit { tree, level } => {
+            ledger_record_transition(&format!("INTERIOR_SPLIT tree={tree} level={level}"));
+            STRUCTURAL_INTERIOR_SPLITS.fetch_add(1, Ordering::Relaxed);
+        }
+        BtrfsEvent::HeightGrew { tree, from, to } => {
+            ledger_record_transition(&format!("HEIGHT_GREW tree={tree} from={from} to={to}"));
+            STRUCTURAL_HEIGHT_GREW.fetch_add(1, Ordering::Relaxed);
+        }
+        BtrfsEvent::RootCollapsed { tree, from, to } => {
+            ledger_record_transition(&format!("ROOT_COLLAPSED tree={tree} from={from} to={to}"));
+            STRUCTURAL_ROOT_COLLAPSED.fetch_add(1, Ordering::Relaxed);
+        }
+        BtrfsEvent::NodeRemoved { tree, level } => {
+            ledger_record_transition(&format!("NODE_REMOVED tree={tree} level={level}"));
+            STRUCTURAL_NODE_REMOVED.fetch_add(1, Ordering::Relaxed);
+        }
+        BtrfsEvent::BlockReused { tree, level } => {
+            ledger_record_transition(&format!("BLOCK_REUSED tree={tree} level={level}"));
+            STRUCTURAL_BLOCK_REUSED.fetch_add(1, Ordering::Relaxed);
+        }
+        BtrfsEvent::ConvergeRounds { rounds } => {
+            ledger_record_transition(&format!("CONVERGE rounds={rounds}"));
+            STRUCTURAL_CONVERGE_CALLS.fetch_add(1, Ordering::Relaxed);
+            STRUCTURAL_MAX_CONVERGE_ROUNDS.fetch_max(*rounds, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 /// Helper to record a Btrfs event.
 pub fn record_btrfs(event: BtrfsEvent) {
+    update_structural_counts(&event);
     record(ForensicEvent::Btrfs(event));
+}
+
+/// Return cumulative structural transition counts since program start or last reset.
+pub fn get_structural_counts() -> StructuralTransitionCounts {
+    StructuralTransitionCounts {
+        leaf_split_shape_1: STRUCTURAL_LEAF_SPLIT_SHAPE_1.load(Ordering::Relaxed),
+        leaf_split_shape_2: STRUCTURAL_LEAF_SPLIT_SHAPE_2.load(Ordering::Relaxed),
+        leaf_split_shape_3: STRUCTURAL_LEAF_SPLIT_SHAPE_3.load(Ordering::Relaxed),
+        leaf_split_pos_0: STRUCTURAL_LEAF_SPLIT_POS_0.load(Ordering::Relaxed),
+        leaf_split_pos_len: STRUCTURAL_LEAF_SPLIT_POS_LEN.load(Ordering::Relaxed),
+        leaf_split_pos_mid: STRUCTURAL_LEAF_SPLIT_POS_MID.load(Ordering::Relaxed),
+        interior_splits: STRUCTURAL_INTERIOR_SPLITS.load(Ordering::Relaxed),
+        height_grew: STRUCTURAL_HEIGHT_GREW.load(Ordering::Relaxed),
+        root_collapsed: STRUCTURAL_ROOT_COLLAPSED.load(Ordering::Relaxed),
+        node_removed: STRUCTURAL_NODE_REMOVED.load(Ordering::Relaxed),
+        block_reused: STRUCTURAL_BLOCK_REUSED.load(Ordering::Relaxed),
+        converge_total_calls: STRUCTURAL_CONVERGE_CALLS.load(Ordering::Relaxed),
+        max_converge_rounds: STRUCTURAL_MAX_CONVERGE_ROUNDS.load(Ordering::Relaxed),
+    }
+}
+
+/// Reset structural transition counts (for test harness isolation).
+pub fn reset_structural_counts() {
+    STRUCTURAL_LEAF_SPLIT_SHAPE_1.store(0, Ordering::Relaxed);
+    STRUCTURAL_LEAF_SPLIT_SHAPE_2.store(0, Ordering::Relaxed);
+    STRUCTURAL_LEAF_SPLIT_SHAPE_3.store(0, Ordering::Relaxed);
+    STRUCTURAL_LEAF_SPLIT_POS_0.store(0, Ordering::Relaxed);
+    STRUCTURAL_LEAF_SPLIT_POS_LEN.store(0, Ordering::Relaxed);
+    STRUCTURAL_LEAF_SPLIT_POS_MID.store(0, Ordering::Relaxed);
+    STRUCTURAL_INTERIOR_SPLITS.store(0, Ordering::Relaxed);
+    STRUCTURAL_HEIGHT_GREW.store(0, Ordering::Relaxed);
+    STRUCTURAL_ROOT_COLLAPSED.store(0, Ordering::Relaxed);
+    STRUCTURAL_NODE_REMOVED.store(0, Ordering::Relaxed);
+    STRUCTURAL_BLOCK_REUSED.store(0, Ordering::Relaxed);
+    STRUCTURAL_CONVERGE_CALLS.store(0, Ordering::Relaxed);
+    STRUCTURAL_MAX_CONVERGE_ROUNDS.store(0, Ordering::Relaxed);
+}
+
+/// Format the cumulative structural transition counts as a readable markdown table.
+pub fn dump_structural_counts_summary() -> String {
+    let c = get_structural_counts();
+    format!(
+        "| Metric | Count |\n\
+         |---|---|\n\
+         | LeafSplit Shape 1 (item ends left) | {} |\n\
+         | LeafSplit Shape 2 (item starts right) | {} |\n\
+         | LeafSplit Shape 3 (item isolated) | {} |\n\
+         | LeafSplit Pos 0 (new minimum) | {} |\n\
+         | LeafSplit Pos len (new maximum) | {} |\n\
+         | LeafSplit Pos interior (middle insertion) | {} |\n\
+         | Interior Node Splits (>121 children) | {} |\n\
+         | Tree Height Grew (e.g. 0->1, 1->2) | {} |\n\
+         | Tree Root Collapsed (e.g. 2->1, 1->0) | {} |\n\
+         | Node Removed (emptied leaf/interior) | {} |\n\
+         | In-Txn Block Reused (is_already_new) | {} |\n\
+         | Convergence Loop Calls | {} |\n\
+         | Max Observed Convergence Rounds (GAP-3) | {} |\n",
+        c.leaf_split_shape_1,
+        c.leaf_split_shape_2,
+        c.leaf_split_shape_3,
+        c.leaf_split_pos_0,
+        c.leaf_split_pos_len,
+        c.leaf_split_pos_mid,
+        c.interior_splits,
+        c.height_grew,
+        c.root_collapsed,
+        c.node_removed,
+        c.block_reused,
+        c.converge_total_calls,
+        c.max_converge_rounds
+    )
 }
 
 /// Helper to record a panic event.
@@ -313,6 +486,27 @@ pub fn dump_text() -> String {
                 }
                 BtrfsEvent::Error { stage, code } => {
                     out.push_str(&format!("BTRFS error stage={stage} code={code}\n"));
+                }
+                BtrfsEvent::LeafSplit { tree, shape, groups, pos_class } => {
+                    out.push_str(&format!("BTRFS leaf_split tree={tree} shape={shape} groups={groups} pos={pos_class}\n"));
+                }
+                BtrfsEvent::InteriorSplit { tree, level } => {
+                    out.push_str(&format!("BTRFS interior_split tree={tree} level={level}\n"));
+                }
+                BtrfsEvent::HeightGrew { tree, from, to } => {
+                    out.push_str(&format!("BTRFS height_grew tree={tree} from={from} to={to}\n"));
+                }
+                BtrfsEvent::RootCollapsed { tree, from, to } => {
+                    out.push_str(&format!("BTRFS root_collapsed tree={tree} from={from} to={to}\n"));
+                }
+                BtrfsEvent::NodeRemoved { tree, level } => {
+                    out.push_str(&format!("BTRFS node_removed tree={tree} level={level}\n"));
+                }
+                BtrfsEvent::BlockReused { tree, level } => {
+                    out.push_str(&format!("BTRFS block_reused tree={tree} level={level}\n"));
+                }
+                BtrfsEvent::ConvergeRounds { rounds } => {
+                    out.push_str(&format!("BTRFS converge_rounds rounds={rounds}\n"));
                 }
             },
             ForensicEvent::Panic(ref p) => {

@@ -78,6 +78,11 @@ pub fn cow_tree_insert<D: ReadAt>(
         // The root itself split! We must create a new interior root node
         let sb = fs.superblock();
         let new_root_level = if root_node.nr_items == 0 { 1 } else { root_level + 1 };
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::HeightGrew {
+            tree: owner,
+            from: root_level,
+            to: new_root_level,
+        });
         let new_root_bytenr = allocator.allocate_metadata_for_owner(sb.node_size, owner)?;
         allocated.push((new_root_bytenr, new_root_level));
 
@@ -128,17 +133,21 @@ pub fn cow_tree_insert<D: ReadAt>(
     }
 }
 
-/// Would these items fit in one leaf of `node_size` bytes?
-fn leaf_fits(items: &[LeafItem], node_size: u32) -> bool {
+/// Compute the total byte size occupied by items in a leaf, including header and item overhead.
+fn leaf_payload_bytes(items: &[LeafItem]) -> usize {
     let data_bytes: usize = items.iter().map(|it| it.data.len()).sum();
     crate::fs::btrfs::tree::HEADER_SIZE
         + items.len() * crate::fs::btrfs::tree::ITEM_SIZE
         + data_bytes
-        <= node_size as usize
+}
+
+/// Would these items fit in one leaf of `node_size` bytes?
+fn leaf_fits(items: &[LeafItem], node_size: u32) -> bool {
+    leaf_payload_bytes(items) <= node_size as usize
 }
 
 /// Decide how to lay a new item into a leaf that has no room for it, returning
-/// one group of items per resulting leaf, left to right.
+/// the chosen shape (1, 2, or 3) and one group of items per resulting leaf, left to right.
 ///
 /// # Why this is not a midpoint split
 ///
@@ -171,32 +180,41 @@ fn plan_leaf_split(
     pos: usize,
     new_item: LeafItem,
     node_size: u32,
-) -> Vec<Vec<LeafItem>> {
+) -> (u8, Vec<Vec<LeafItem>>) {
     let left = &items[..pos];
     let right = &items[pos..];
 
     let mut shape_1: Vec<LeafItem> = left.to_vec();
     shape_1.push(new_item.clone());
     if leaf_fits(&shape_1, node_size) {
-        return vec![shape_1, right.to_vec()]
-            .into_iter()
-            .filter(|g| !g.is_empty())
-            .collect();
+        return (
+            1,
+            vec![shape_1, right.to_vec()]
+                .into_iter()
+                .filter(|g| !g.is_empty())
+                .collect(),
+        );
     }
 
     let mut shape_2: Vec<LeafItem> = vec![new_item.clone()];
     shape_2.extend_from_slice(right);
     if leaf_fits(&shape_2, node_size) {
-        return vec![left.to_vec(), shape_2]
-            .into_iter()
-            .filter(|g| !g.is_empty())
-            .collect();
+        return (
+            2,
+            vec![left.to_vec(), shape_2]
+                .into_iter()
+                .filter(|g| !g.is_empty())
+                .collect(),
+        );
     }
 
-    vec![left.to_vec(), vec![new_item], right.to_vec()]
-        .into_iter()
-        .filter(|g| !g.is_empty())
-        .collect()
+    (
+        3,
+        vec![left.to_vec(), vec![new_item], right.to_vec()]
+            .into_iter()
+            .filter(|g| !g.is_empty())
+            .collect(),
+    )
 }
 
 fn cow_descend_insert<D: ReadAt>(
@@ -218,6 +236,12 @@ fn cow_descend_insert<D: ReadAt>(
     let node = read_node(fs, pending, bytenr)?;
 
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
+    if is_already_new {
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BlockReused {
+            tree: owner,
+            level,
+        });
+    }
 
     if level == 0 || node.nr_items == 0 {
         // Leaf node (or recovering from an emptied interior root node)
@@ -280,7 +304,20 @@ fn cow_descend_insert<D: ReadAt>(
                 data: target_data,
             };
 
-            let groups = plan_leaf_split(&leaf.items, pos, new_item, node_size);
+            let pos_class = if pos == 0 {
+                0
+            } else if pos == leaf.items.len() {
+                1
+            } else {
+                2
+            };
+            let (shape, groups) = plan_leaf_split(&leaf.items, pos, new_item, node_size);
+            crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::LeafSplit {
+                tree: owner,
+                shape,
+                groups: groups.len() as u8,
+                pos_class,
+            });
 
             let mut extra_siblings = Vec::new();
             let mut emitted = Vec::new();
@@ -403,6 +440,10 @@ fn cow_descend_insert<D: ReadAt>(
                 allocated.push((right_int_bytenr, level));
 
                 let (mut left_int, mut right_int, pivot_key) = interior.split(right_int_bytenr)?;
+                crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::InteriorSplit {
+                    tree: owner,
+                    level,
+                });
 
                 let left_target_bytenr = if is_already_new {
                     bytenr
@@ -536,11 +577,28 @@ where
     let node = read_node(fs, pending, bytenr)?;
 
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
+    if is_already_new {
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BlockReused {
+            tree: owner,
+            level,
+        });
+    }
 
     if level == 0 {
         // Leaf node
         let mut leaf = Leaf::from_node(&node, csum_type)?;
+        let pre_bytes = leaf_payload_bytes(&leaf.items);
         mutate_fn(&mut leaf)?;
+        let post_bytes = leaf_payload_bytes(&leaf.items);
+        debug_assert!(
+            post_bytes <= pre_bytes,
+            "GAP-1 violation: cow_descend mutate_fn expanded leaf from {pre_bytes} to {post_bytes} without split capability"
+        );
+        if post_bytes > pre_bytes {
+            return Err(crate::error::LuksError::CorruptFs(
+                "btrfs mutation expanded leaf size without split capability",
+            ));
+        }
 
         // `mutate_fn` may have deleted the leaf's last item. Emitting it anyway
         // and letting the parent keep pointing at it is what corrupted the USB
@@ -565,6 +623,10 @@ where
         // items is a legal shape for it (that is what an empty csum tree is).
         if leaf.items.is_empty() && !is_root {
             freed.push((bytenr, 0));
+            crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::NodeRemoved {
+                tree: owner,
+                level: 0,
+            });
             return Ok((None, Vec::new()));
         }
 
@@ -639,6 +701,10 @@ where
         if interior.entries.is_empty() {
             if !is_root {
                 freed.push((bytenr, level));
+                crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::NodeRemoved {
+                    tree: owner,
+                    level,
+                });
                 return Ok((None, emitted_blocks));
             } else {
                 // The root interior node has completely emptied out!
@@ -660,6 +726,11 @@ where
                 };
                 let emitted = empty_leaf.emit(node_size)?;
                 emitted_blocks.push((target_bytenr, emitted));
+                crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::RootCollapsed {
+                    tree: owner,
+                    from: level,
+                    to: 0,
+                });
                 return Ok((Some((target_bytenr, *target_key, 0)), emitted_blocks));
             }
         }
@@ -675,6 +746,11 @@ where
             let child_key = child_entry.key;
             let child_level = level - 1;
             freed.push((bytenr, level));
+            crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::RootCollapsed {
+                tree: owner,
+                from: level,
+                to: child_level,
+            });
 
             // If the child already carries the current generation (it was
             // touched in this same transaction), no re-copy is needed.
@@ -756,7 +832,8 @@ mod tests {
         };
 
         // pos = 1 (inserted between item 0 and item 1)
-        let groups = plan_leaf_split(&items, 1, new_item, node_size);
+        let (shape, groups) = plan_leaf_split(&items, 1, new_item, node_size);
+        assert_eq!(shape, 1);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 2); // item 0 + new_item
         assert_eq!(groups[1].len(), 1); // item 1
@@ -797,7 +874,8 @@ mod tests {
                 data: vec![0u8; 50],
             },
         ];
-        let groups = plan_leaf_split(&large_left, 1, new_item.clone(), node_size);
+        let (shape, groups) = plan_leaf_split(&large_left, 1, new_item.clone(), node_size);
+        assert_eq!(shape, 2);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].len(), 1); // item 0 (850 bytes)
         assert_eq!(groups[1].len(), 2); // new_item (50) + item 1 (50)
@@ -830,7 +908,8 @@ mod tests {
         // shape 1: left (1500) + near_max (3500) = 5000 > 4096 (overflows)
         // shape 2: near_max (3500) + right (1500) = 5000 > 4096 (overflows)
         // shape 3: left (1500) | near_max (3500) | right (1500) -> 3 leaves!
-        let groups = plan_leaf_split(&items, 1, near_max_item, node_size);
+        let (shape, groups) = plan_leaf_split(&items, 1, near_max_item, node_size);
+        assert_eq!(shape, 3);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].len(), 1);
         assert_eq!(groups[1].len(), 1);
