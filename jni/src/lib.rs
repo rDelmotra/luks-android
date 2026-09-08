@@ -271,7 +271,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenDevice<'l>(
         let handle = unsafe {
             bridge::open_usb_device(fd, ep_in, ep_out, interface, max_transfer.max(0) as usize)
         }?;
-        log::i(&format!("nativeOpenDevice: opened fd={} ep_in={} ep_out={} interface={}", fd, ep_in, ep_out, interface));
+        static OPEN_DEVICE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let open_idx = OPEN_DEVICE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        log::i(&format!(
+            "nativeOpenDevice [open #{}]: opened fd={} ep_in={} ep_out={} interface={}",
+            open_idx, fd, ep_in, ep_out, interface
+        ));
         Ok(bridge::into_raw(bridge::Payload::Device(handle)))
     })
 }

@@ -390,10 +390,16 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         LuksNative.nativeRename(handle, oldParent, oldName, newParent, newName)
     }
 
+    private val statFsCounter = java.util.concurrent.atomic.AtomicLong(1)
+
     open fun statFs(): StatFsInfo {
         check(handle != 0L) { "volume is closed" }
+        val callId = statFsCounter.getAndIncrement()
+        Trace.i("LuksVolume.statFs [call #$callId]: start volume=$handle")
+        val start = System.currentTimeMillis()
         val o = JSONObject(LuksNative.nativeStatFs(handle))
-        return StatFsInfo(
+        val elapsed = System.currentTimeMillis() - start
+        val info = StatFsInfo(
             totalBytes = o.getLong("totalBytes"),
             freeBytes = o.getLong("freeBytes"),
             availableBytes = o.getLong("availableBytes"),
@@ -401,6 +407,8 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             freeInodes = o.getLong("freeInodes"),
             blockSize = o.getInt("blockSize"),
         )
+        Trace.i("LuksVolume.statFs [call #$callId]: done in ${elapsed}ms total=${info.totalBytes} avail=${info.availableBytes}")
+        return info
     }
 
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */

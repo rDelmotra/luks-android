@@ -12,12 +12,15 @@ object Trace {
     const val TAG = "luks"
     const val TAG_ERR = "luks_err"
 
+    @Suppress("DEPRECATION")
+    private fun currentThreadTag(): String = "tid=${Thread.currentThread().id}"
+
     fun i(msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.i(TAG, msg) }
+        if (BuildConfig.DEBUG) runCatching { Log.i(TAG, "[${currentThreadTag()}] $msg") }
     }
 
     fun i(tag: String, msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.i(tag, msg) }
+        if (BuildConfig.DEBUG) runCatching { Log.i(tag, "[${currentThreadTag()}] $msg") }
     }
 
     /**
@@ -29,11 +32,11 @@ object Trace {
      * and/or a `LuksException.code`, never `t` or `t.message`.
      */
     fun e(msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.e(TAG, msg) }
+        if (BuildConfig.DEBUG) runCatching { Log.e(TAG, "[${currentThreadTag()}] $msg") }
     }
 
     fun e(tag: String, msg: String) {
-        if (BuildConfig.DEBUG) runCatching { Log.e(tag, msg) }
+        if (BuildConfig.DEBUG) runCatching { Log.e(tag, "[${currentThreadTag()}] $msg") }
     }
 
     /**
@@ -67,7 +70,7 @@ object Trace {
      * path cannot be passed here even by mistake.
      */
     fun err(code: Int, operation: String, detail: ErrDetail = ErrDetail.None) {
-        runCatching { Log.e(TAG_ERR, formatErr(code, operation, detail)) }
+        runCatching { Log.e(TAG_ERR, "[${currentThreadTag()}] ${formatErr(code, operation, detail)}") }
     }
 
     /**
