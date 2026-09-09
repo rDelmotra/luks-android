@@ -58,7 +58,7 @@ echo "VERDICT: clean — check passed, the kernel mounted it, scrub found nothin
     );
 
     let output = Command::new("colima")
-        .args(&["ssh", "--", "sudo", "bash", "-c", &script])
+        .args(["ssh", "--", "sudo", "bash", "-c", &script])
         .output();
 
     match output {
@@ -86,7 +86,7 @@ fn reset_61g_sparse_image(path: &Path) {
 
     let remote_cmd = format!("mkfs.btrfs -f {}", path.display());
     let status = Command::new("colima")
-        .args(&["ssh", "--", "bash", "-c", &remote_cmd])
+        .args(["ssh", "--", "bash", "-c", &remote_cmd])
         .status()
         .expect("format 61G sparse image with colima mkfs.btrfs");
     assert!(status.success(), "colima mkfs.btrfs failed");
@@ -110,6 +110,11 @@ fn test_scale_61g_medium_accounting_and_convergence_headroom() {
 
     let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable 61G image");
     let mut fs = Btrfs::mount(dev).expect("mount writable 61G btrfs");
+
+    // Issue 45 is about the convergence loop's round count, so measure it.
+    // Counting starts here, after mount, so only this test's own workload is
+    // attributed to it.
+    luks_core::forensic::reset_structural_counts();
 
     // 1. Initial assert_clean on fresh 61 GiB mkfs image
     let initial_report = AccountingOracle::assert_clean(&fs);
@@ -171,6 +176,40 @@ fn test_scale_61g_medium_accounting_and_convergence_headroom() {
     assert_eq!(
         post_report.superblock_bytes_used,
         post_report.total_referenced_bytes
+    );
+
+    // 3b. The headroom this test is named for.
+    //
+    // `MAX_CONVERGENCE_ROUNDS = 30` (`write/extent_tree.rs`) fails the whole
+    // transaction closed when exceeded, so a workload that creeps toward it
+    // aborts a transfer mid-flight. Phase 0 measured a max of 9 on 64 MiB
+    // fixtures with a flat tail from 6 to 9, and traced that tail to deletion
+    // cascades rather than to filesystem size — which is why the workload above
+    // deletes 25 files before this check rather than only writing.
+    //
+    // Both bounds matter. The lower one is the vacuity control: a run that
+    // never entered the convergence loop would satisfy any upper bound.
+    let counts = luks_core::forensic::get_structural_counts();
+    println!(
+        "61 GiB convergence: {} invocations, max {} rounds (limit 30)",
+        counts.converge_total_calls, counts.max_converge_rounds
+    );
+    assert!(
+        counts.converge_total_calls > 0,
+        "convergence loop never ran — this test proves nothing about headroom"
+    );
+    assert!(
+        counts.max_converge_rounds > 0,
+        "convergence rounds recorded as 0 across {} invocations — instrumentation is not wired",
+        counts.converge_total_calls
+    );
+    assert!(
+        counts.max_converge_rounds <= 12,
+        "convergence reached {} rounds on a 61 GiB medium against a hard limit of 30. \
+         Phase 0's worst case on 64 MiB fixtures was 9. Anything above 12 means the \
+         round count scales with something this test's workload varies, and the limit \
+         is closer than assumed — measure before raising this bound.",
+        counts.max_converge_rounds
     );
 
     drop(fs);
