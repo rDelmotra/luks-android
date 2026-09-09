@@ -23,6 +23,7 @@ use luks_core::error::LuksError;
 use luks_core::fs::btrfs::tree::{Key, Node};
 use luks_core::fs::btrfs::write::node::Leaf;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -135,6 +136,7 @@ fn create_file_in_root_directory_on_plain_img() {
     assert_eq!(info.links, 1);
     assert!(info.file_type.is_file());
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // 3. Re-open read-only from disk to verify persistence across mounts
@@ -152,6 +154,7 @@ fn create_file_in_root_directory_on_plain_img() {
     assert_eq!(info_ro.links, 1);
     assert!(info_ro.file_type.is_file());
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // 4. Grade with kernel oracle (btrfs check, mount, scrub)
@@ -187,6 +190,7 @@ fn create_file_in_subdirectory_on_plain_img() {
     assert_eq!(info.size, 0);
     assert_eq!(info.links, 1);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let dev_ro = FileDevice::open(&temp_img).expect("open ro");
@@ -194,6 +198,7 @@ fn create_file_in_subdirectory_on_plain_img() {
     let entries_ro = fs_ro.list_dir("/docs").expect("list /docs on remount");
     assert!(entries_ro.iter().any(|e| e.name == "note.txt"));
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -219,6 +224,7 @@ fn create_file_on_compress_img() {
     assert!(entries.iter().any(|e| e.name == "extra.txt"));
     assert!(entries.iter().any(|e| e.name == "zstd.txt"));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -243,6 +249,7 @@ fn create_file_on_mixed_4k_img() {
     let entries = fs.list_dir("/").expect("list / on mixed-4k.img");
     assert!(entries.iter().any(|e| e.name == "mixed_new.txt"));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -273,6 +280,7 @@ fn duplicate_file_creation_is_refused() {
     // Superblock generation should be untouched
     assert_eq!(fs.superblock().generation, original_sb_gen);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     let _ = fs::remove_file(&temp_img);
 }
@@ -301,6 +309,7 @@ fn create_multiple_files_consecutively_and_verify() {
         assert!(entries.iter().any(|e| e.name == name));
     }
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -358,7 +367,7 @@ fn true_max_inode_excluding<D: ReadAt>(fs: &Btrfs<D>, exclude_bytenr: u64) -> u6
         let leaf = fs.read_node(bytenr).expect("read leaf");
         for j in 0..leaf.nr_items {
             let objectid = leaf.key(j).expect("key").objectid;
-            if objectid >= 256 && objectid < 0xFFFF_FFFF_FFFF_FF00 {
+            if (256..0xFFFF_FFFF_FFFF_FF00).contains(&objectid) {
                 max_ino = max_ino.max(objectid);
             }
         }
@@ -394,7 +403,7 @@ fn find_max_inode_survives_a_rightmost_leaf_full_of_orphan_items() {
     let real_items_in_leaf = (0..leaf_node.nr_items)
         .filter(|&i| {
             let o = leaf_node.key(i).unwrap().objectid;
-            o >= 256 && o < 0xFFFF_FFFF_FFFF_FF00
+            (256..0xFFFF_FFFF_FFFF_FF00).contains(&o)
         })
         .count();
     assert!(
@@ -485,6 +494,7 @@ fn create_file_with_data_in_root_directory_on_plain_img() {
     assert_eq!(info.size, payload.len() as u64);
     assert_eq!(info.links, 1);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Verify persistence across remount
@@ -493,6 +503,8 @@ fn create_file_with_data_in_root_directory_on_plain_img() {
     assert_eq!(fs_ro.superblock().generation, initial_gen + 1);
     let readback_ro = fs_ro.read_file("/atomic_root.txt").expect("read file ro");
     assert_eq!(readback_ro, payload);
+
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // Grade with kernel oracle
@@ -525,6 +537,7 @@ fn create_file_with_data_in_subdirectory_on_plain_img() {
     let readback = fs.read_file("/docs/atomic_sub.txt").expect("read file in /docs");
     assert_eq!(readback, payload);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -564,6 +577,7 @@ fn create_file_with_data_failure_leaves_no_orphan_file() {
     let readback = fs.read_file("/taken.txt").expect("read taken.txt");
     assert_eq!(readback, b"original content");
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);

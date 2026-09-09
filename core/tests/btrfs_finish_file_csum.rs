@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use luks_core::device::{FileDevice, ReadAt, WriteAt};
 use luks_core::error::Result;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -100,6 +101,7 @@ struct TrackingDevice<D> {
 }
 
 impl<D> TrackingDevice<D> {
+    #[allow(clippy::type_complexity)]
     fn new(inner: D) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<Mutex<Vec<(u64, usize)>>>) {
         let read_count = Arc::new(AtomicUsize::new(0));
         let bytes_read = Arc::new(AtomicUsize::new(0));
@@ -206,6 +208,7 @@ fn test_zero_data_read_io_during_finish_file() {
     let readback = fs.read_file("/zero_read_test.bin").expect("read file");
     assert_eq!(readback, payload);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Grade with kernel oracle
@@ -256,6 +259,7 @@ fn test_kernel_oracle_scrub_on_chunked_and_tail_padded_writes() {
     assert!(ino2 >= 256);
 
     fs.commit_active_batch().expect("commit");
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Verify persistence and correctness on remount
@@ -263,6 +267,7 @@ fn test_kernel_oracle_scrub_on_chunked_and_tail_padded_writes() {
     let fs_ro = Btrfs::mount(dev_ro).expect("remount btrfs");
     assert_eq!(fs_ro.read_file("/tail_padded.bin").expect("read 1"), data1);
     assert_eq!(fs_ro.read_file("/streamed_large.bin").expect("read 2"), data2);
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // Grade with kernel oracle: btrfs check, mount, and btrfs scrub
@@ -356,6 +361,7 @@ fn test_mixed_4k_multi_item_csum_live_checksums_oracle() {
     assert!(ino >= 256);
 
     fs.commit_active_batch().expect("commit");
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);

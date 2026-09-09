@@ -69,6 +69,7 @@ use luks_core::device::{FileDevice, ReadAt, WriteAt};
 use luks_core::error::{LuksError, Result};
 use luks_core::fs::btrfs::Btrfs;
 use sha2::{Digest, Sha256};
+use common::accounting::AccountingOracle;
 
 // ---------------------------------------------------------------------
 // Fixture plumbing — same convention as btrfs_crash_safety.rs.
@@ -168,8 +169,7 @@ impl FailAfterNWrites {
     fn simulated_failure() -> LuksError {
         LuksError::Io {
             path: "simulated-power-loss".to_string(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::Other,
+            source: std::io::Error::other(
                 "device vanished mid-streaming-write (simulated by FailAfterNWrites)",
             ),
         }
@@ -417,6 +417,7 @@ fn assert_preexisting_readable(image_path: &Path) {
         "pre-existing hello.txt read back empty after interrupted streaming write"
     );
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 }
 

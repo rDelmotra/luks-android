@@ -20,6 +20,7 @@ use std::process::Command;
 
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +112,7 @@ fn write_file_data_on_plain_img_and_verify() {
     let info = fs.file_info("/payload.txt").expect("file info");
     assert_eq!(info.size, test_data.len() as u64);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // 3. Reopen read-only from disk to verify persistence across mounts
@@ -120,6 +122,7 @@ fn write_file_data_on_plain_img_and_verify() {
     let readback_ro = fs_ro.read_file("/payload.txt").expect("read file on remount");
     assert_eq!(readback_ro, test_data);
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // 4. Grade with Linux kernel oracle (btrfs check, mount, scrub)
@@ -153,6 +156,7 @@ fn write_multi_sector_data_on_plain_img() {
     let readback = fs.read_file("/multi_sector.dat").expect("read multi sector");
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -179,6 +183,7 @@ fn write_file_data_on_compress_img() {
     let readback = fs.read_file("/uncompressed_write.txt").expect("readback on compress.img");
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -205,6 +210,7 @@ fn write_file_data_on_mixed_4k_img() {
     let readback = fs.read_file("/mixed_write.txt").expect("readback on mixed-4k.img");
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -231,6 +237,7 @@ fn write_file_in_subdirectory_on_plain_img() {
     let readback = fs.read_file("/docs/guide.txt").expect("readback from subdir");
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -264,6 +271,7 @@ fn write_4mb_file_data_on_plain_img() {
     assert_eq!(readback.len(), test_data.len());
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -300,6 +308,7 @@ fn write_multi_item_csum_on_mixed_4k_img() {
     assert_eq!(readback.len(), test_data.len());
     assert_eq!(readback, test_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -341,6 +350,7 @@ fn write_file_streamed_chunks_on_plain_img() {
     assert_eq!(readback, test_data);
 
     fs.commit_active_batch().expect("commit active batch");
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let dev_ro = FileDevice::open(&temp_img).expect("open ro");
@@ -349,6 +359,7 @@ fn write_file_streamed_chunks_on_plain_img() {
         .read_file("/streamed_file.bin")
         .expect("readback ro");
     assert_eq!(readback_ro, test_data);
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     let oracle_clean = run_verify_script(&temp_img);

@@ -20,6 +20,7 @@ use std::process::Command;
 
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -118,6 +119,7 @@ fn mutate_timestamp_on_plain_img_and_verify_with_kernel() {
     assert_eq!(located.inode.mtime, target_mtime_sec as i64);
 
     // Drop filesystem to flush/close
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // 3. Re-open read-only from disk to verify persistence across mounts
@@ -137,6 +139,7 @@ fn mutate_timestamp_on_plain_img_and_verify_with_kernel() {
     assert!(entries.iter().any(|e| e.name == "hello.txt"));
     assert!(entries.iter().any(|e| e.name == "docs"));
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // 4. Grade with kernel oracle (btrfs check, mount, scrub)
@@ -166,6 +169,7 @@ fn mutate_timestamp_on_compress_img_and_verify_with_kernel() {
         .expect("resolve zstd.txt");
     assert_eq!(located.inode.mtime, target_mtime_sec as i64);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let dev_ro = FileDevice::open(&temp_img).expect("open ro");
@@ -177,6 +181,7 @@ fn mutate_timestamp_on_compress_img_and_verify_with_kernel() {
         .expect("resolve zstd.txt on remount");
     assert_eq!(located_ro.inode.mtime, target_mtime_sec as i64);
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     let oracle_clean = run_verify_script(&temp_img);
@@ -208,6 +213,7 @@ fn mutate_timestamp_on_mixed_4k_img_and_verify_with_kernel() {
         .expect("resolve hello.txt");
     assert_eq!(located.inode.mtime, target_mtime_sec as i64);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     let dev_ro = FileDevice::open(&temp_img).expect("open ro");
@@ -219,6 +225,7 @@ fn mutate_timestamp_on_mixed_4k_img_and_verify_with_kernel() {
         .expect("resolve hello.txt on remount");
     assert_eq!(located_ro.inode.mtime, target_mtime_sec as i64);
 
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     let oracle_clean = run_verify_script(&temp_img);

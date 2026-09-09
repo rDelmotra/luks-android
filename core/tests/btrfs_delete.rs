@@ -21,6 +21,7 @@ use std::process::Command;
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -110,6 +111,7 @@ fn delete_empty_file_on_plain_img() {
     assert!(!entries_after.iter().any(|e| e.name == "empty_to_delete.txt"));
     assert!(matches!(fs.read_file("/empty_to_delete.txt"), Err(LuksError::NotFound(_))));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -137,6 +139,7 @@ fn delete_file_with_data_on_plain_img() {
     assert!(!entries.iter().any(|e| e.name == "data_to_delete.txt"));
     assert!(matches!(fs.read_file("/data_to_delete.txt"), Err(LuksError::NotFound(_))));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -158,6 +161,7 @@ fn delete_reclaims_space_and_allows_reallocation() {
 
     let used_after_create = fs.superblock().bytes_used;
     assert!(used_after_create > initial_used, "used space should have increased");
+    AccountingOracle::assert_clean(&fs);
 
     // Delete the file
     fs.delete_file("/reclaim_test.bin").expect("delete file");
@@ -167,6 +171,7 @@ fn delete_reclaims_space_and_allows_reallocation() {
         used_after_delete < used_after_create,
         "used space should have decreased after deletion: before={used_after_create}, after={used_after_delete}"
     );
+    AccountingOracle::assert_clean(&fs);
 
     // Create a new file allocating reclaimed space
     let new_data = vec![0x77u8; 64 * 1024];
@@ -176,6 +181,7 @@ fn delete_reclaims_space_and_allows_reallocation() {
     let read_back = fs.read_file("/reallocated.bin").expect("read back");
     assert_eq!(read_back, new_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -203,6 +209,7 @@ fn delete_multiple_files_sequentially() {
 
     assert_eq!(fs.read_file("/file2.txt").expect("read file2"), b"content 2");
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -225,6 +232,7 @@ fn delete_file_across_fixtures() {
         fs.delete_file("/fixture_del.txt").expect("delete file");
         assert!(matches!(fs.read_file("/fixture_del.txt"), Err(LuksError::NotFound(_))));
 
+        AccountingOracle::assert_clean(&fs);
         drop(fs);
         assert!(
             run_verify_script(&temp_img),
@@ -289,6 +297,9 @@ fn a_dot_component_is_refused_rather_than_silently_resolving_to_an_ancestor() {
     // And an ordinary dotfile deletes normally.
     fs.delete_file("/tree/.hidden").expect("delete .hidden");
     assert!(!fs.list_dir("/tree").unwrap().iter().any(|e| e.name == ".hidden"));
+
+    AccountingOracle::assert_clean(&fs);
+    drop(fs);
 }
 
 #[test]
@@ -305,6 +316,7 @@ fn deleting_an_empty_directory_succeeds() {
     fs.delete_file("/empty").expect("delete empty dir");
     assert!(!fs.list_dir("/").unwrap().iter().any(|e| e.name == "empty"));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -332,6 +344,7 @@ fn deleting_a_directory_recursively_removes_files_and_nested_subdirectories() {
     assert!(!fs.list_dir("/").unwrap().iter().any(|e| e.name == "tree"));
     assert!(matches!(fs.read_file("/tree/a.txt"), Err(LuksError::NotFound(_))));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
@@ -390,6 +403,7 @@ fn deleting_deep_tree_collapses_root_and_allows_subsequent_creation() {
     let read_back = fs.read_file("/after_delete.txt").expect("read back file");
     assert_eq!(read_back, new_file_data);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }

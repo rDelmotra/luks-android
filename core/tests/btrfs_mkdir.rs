@@ -20,6 +20,7 @@ use std::process::Command;
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -117,6 +118,8 @@ fn mkdir_in_root_directory_on_plain_img() {
             .list_dir_by_inode(fs.fs_tree().bytenr, fs.fs_tree().root_dirid)
             .expect("list root dir");
         assert!(entries.iter().any(|e| e.name == "test_folder" && e.file_type.is_dir()));
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount read-only and verify persistence
@@ -128,6 +131,8 @@ fn mkdir_in_root_directory_on_plain_img() {
             .expect("resolve ro");
         assert!(located.inode.file_type().is_dir());
         assert_eq!(located.inode.mode, 0o040755);
+
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     // Verify with Linux kernel oracle
@@ -169,6 +174,8 @@ fn mkdir_nested_and_create_file_inside() {
             .read_file("/documents/personal/secret.txt")
             .expect("read nested file");
         assert_eq!(readback, file_payload);
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount read-only and verify full path resolution and content
@@ -185,6 +192,8 @@ fn mkdir_nested_and_create_file_inside() {
             .list_dir_by_inode(fs_ro.fs_tree().bytenr, fs_ro.fs_tree().root_dirid)
             .expect("list /");
         assert!(entries.iter().any(|e| e.name == "documents" && e.file_type.is_dir()));
+
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     // Oracle verification
@@ -215,6 +224,7 @@ fn mkdir_duplicate_name_refused() {
         other => panic!("expected AlreadyExists, got: {other:?}"),
     }
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&img), "oracle check passed");
     let _ = fs::remove_file(&img);
@@ -261,6 +271,8 @@ fn mkdir_on_mixed_4k_img() {
         let file_payload = b"Hello from inside 4k mixed btrfs node!";
         fs.create_file_with_data("/dir_4k", "file_4k.txt", file_payload)
             .expect("create file inside 4k dir");
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     assert!(run_verify_script(&img), "oracle check passed for mixed-4k");
@@ -282,6 +294,8 @@ fn mkdir_on_compress_img() {
         let file_payload = b"Testing files inside new directories on compressed btrfs.";
         fs.create_file_with_data("/zstd_dir", "note.txt", file_payload)
             .expect("create file inside zstd_dir");
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     assert!(run_verify_script(&img), "oracle check passed for compress");

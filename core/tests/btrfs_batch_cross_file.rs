@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
 use sha2::{Digest, Sha256};
+use common::accounting::AccountingOracle;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -93,6 +94,7 @@ fn test_cross_file_batch_sequential_writes() {
 
         // Commit trailing active batch before in-session readbacks
         fs.commit_active_batch().expect("commit active batch");
+        AccountingOracle::assert_clean(&fs);
 
         // Readback within same mount session
         for (name, expected_sha) in &expected_shas {
@@ -115,6 +117,7 @@ fn test_cross_file_batch_sequential_writes() {
             let actual_sha = format!("{:x}", hasher.finalize());
             assert_eq!(&actual_sha, expected_sha, "cold readback mismatch for {}", name);
         }
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     let (ok, out) = run_verify_btrfs(&img);
@@ -159,6 +162,7 @@ fn test_cross_file_batch_interleaved_with_dir_and_delete() {
 
         // Commit active batch before verifying readbacks
         fs.commit_active_batch().expect("commit active batch");
+        AccountingOracle::assert_clean(&fs);
 
         // 7. Verify surviving files read back correctly
         let r2 = fs.read_file("/subfolder/file2.bin").expect("read f2");
@@ -206,12 +210,15 @@ fn test_cross_file_batch_allocator_stays_in_sync_with_disk() {
         fs.abandon_file(temp_writer).expect("abandon");
 
         fs.commit_active_batch().expect("commit");
-        let disk_extent_tree = ExtentTree::read(&mut fs).expect("read extent tree from disk");
+        AccountingOracle::assert_clean(&fs);
+        let disk_extent_tree = ExtentTree::read(&fs).expect("read extent tree from disk");
         let disk_allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(
             &disk_extent_tree,
             fs.chunk_map(),
         )
         .expect("build allocator from disk");
+        AccountingOracle::check_with_allocator(&fs, &disk_allocator)
+            .expect("disk allocator must be consistent with disk accounting");
 
         // Verify block group count and flags match exactly
         assert_eq!(

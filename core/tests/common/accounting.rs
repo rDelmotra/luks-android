@@ -429,14 +429,12 @@ impl AccountingOracle {
                         is_metadata: true,
                     });
                 }
-            } else if ext.is_data {
-                if !referenced_data.contains_key(&ext.bytenr) {
-                    return Err(AccountingError::UnreferencedExtentInExtentTree {
-                        bytenr: ext.bytenr,
-                        length: ext.length,
-                        is_metadata: false,
-                    });
-                }
+            } else if ext.is_data && !referenced_data.contains_key(&ext.bytenr) {
+                return Err(AccountingError::UnreferencedExtentInExtentTree {
+                    bytenr: ext.bytenr,
+                    length: ext.length,
+                    is_metadata: false,
+                });
             }
         }
 

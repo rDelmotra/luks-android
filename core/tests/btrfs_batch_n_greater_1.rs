@@ -18,6 +18,7 @@ use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
 use sha2::{Digest, Sha256};
+use common::accounting::AccountingOracle;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -102,6 +103,7 @@ fn test_n_greater_1_batched_commits_with_vacuity_control() {
 
         // Commit trailing batch
         fs.commit_active_batch().expect("commit active batch");
+        AccountingOracle::assert_clean(&fs);
         final_gen = fs.superblock().generation;
 
         // Vacuity control: Generation bump must be strictly less than the number of files written
@@ -135,6 +137,7 @@ fn test_n_greater_1_batched_commits_with_vacuity_control() {
             let actual_sha = format!("{:x}", hasher.finalize());
             assert_eq!(&actual_sha, expected_sha, "sha256 mismatch for {}", filename);
         }
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     let (ok, out) = run_verify_btrfs(&img);
@@ -176,6 +179,8 @@ fn test_error_injection_at_file_k_rolls_back_single_file_and_commits_preceding()
             }
             other => panic!("expected Err(AlreadyExists), got: {:?}", other),
         }
+        fs.commit_active_batch().expect("commit");
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount read-only and verify:
@@ -189,6 +194,7 @@ fn test_error_injection_at_file_k_rolls_back_single_file_and_commits_preceding()
             let readback = fs_ro.read_file(&format!("/{}", filename)).expect("read good file");
             assert_eq!(&readback, expected_bytes, "content must match for {}", filename);
         }
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     let (ok, out) = run_verify_btrfs(&img);
@@ -221,6 +227,8 @@ fn test_abandon_file_rolls_back_uncommitted_stream_and_commits_preceding() {
         let mut abandoned_writer = fs.begin_file_streaming().expect("begin streaming");
         fs.write_chunk(&mut abandoned_writer, &[0xDE, 0xAD, 0xBE, 0xEF]).expect("write partial");
         fs.abandon_file(abandoned_writer).expect("abandon");
+        fs.commit_active_batch().expect("commit");
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount read-only and verify surviving files
@@ -232,6 +240,7 @@ fn test_abandon_file_rolls_back_uncommitted_stream_and_commits_preceding() {
             let readback = fs_ro.read_file(&format!("/{}", filename)).expect("read file");
             assert_eq!(&readback, expected_bytes);
         }
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     let (ok, out) = run_verify_btrfs(&img);

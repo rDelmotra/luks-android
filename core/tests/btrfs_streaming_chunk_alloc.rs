@@ -34,6 +34,7 @@ use luks_core::fs::btrfs::chunk::BLOCK_GROUP_DATA;
 use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
 use luks_core::fs::btrfs::write::extent_tree::ExtentTree;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 use sha2::{Digest, Sha256};
 
 fn fixture(name: &str) -> PathBuf {
@@ -165,7 +166,7 @@ fn verify_kernel_readback_sha256(image_path: &PathBuf, files: &[(&str, &str)]) -
         .stdin(std::fs::File::open(image_path).unwrap())
         .stdout(std::process::Stdio::null())
         .status();
-    if !cp_status.map_or(false, |s| s.success()) {
+    if !cp_status.is_ok_and(|s| s.success()) {
         eprintln!("failed to copy test image to colima");
         return false;
     }
@@ -288,6 +289,7 @@ fn streaming_unknown_size_write_forces_chunk_allocation_and_kernel_verifies() {
 
     // Abandon file cleans up cleanly
     fs.abandon_file(writer).expect("abandon");
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Ground-truth oracle: btrfs check + kernel mount + scrub.
@@ -388,6 +390,7 @@ fn streaming_unknown_size_write_on_mixed_block_group_no_longer_corrupts_the_allo
                 .expect("finish streamed file");
             assert!(ino >= 256);
             fs.commit_active_batch().expect("commit");
+            AccountingOracle::assert_clean(&fs);
             drop(fs);
             assert!(run_verify_script(&img), "oracle check must pass clean");
             assert!(
@@ -398,6 +401,10 @@ fn streaming_unknown_size_write_on_mixed_block_group_no_longer_corrupts_the_allo
         Err(LuksError::FilesystemFull) => {
             // Expected on this fixture (see doc comment): the metadata
             // ceiling, not the corruption bug, is what stops this write.
+            fs.abandon_file(writer).expect("abandon");
+            AccountingOracle::assert_clean(&fs);
+            drop(fs);
+            assert!(run_verify_script(&img), "oracle check must pass clean");
         }
         Err(e) => panic!(
             "write_chunk must fail only with FilesystemFull (an honest \

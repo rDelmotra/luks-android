@@ -13,6 +13,7 @@ use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::write::batch::Batch;
 use luks_core::fs::btrfs::write::commit::commit_transaction;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -82,6 +83,9 @@ fn test_batch_n1_refactor_creates_clean_oracle_verified_file() {
     let ino = fs.finish_file(writer, "/", "batch_test.txt").expect("finish_file");
     assert!(ino >= 256);
 
+    fs.commit_active_batch().expect("commit");
+    AccountingOracle::assert_clean(&fs);
+
     let (clean, output) = run_verify_btrfs(&img);
     assert!(clean, "verify-btrfs.sh must pass clean. Output:\n{output}");
     let _ = fs::remove_file(&img);
@@ -108,6 +112,7 @@ fn test_batch_direct_invocation_matches_finish_file() {
     assert!(!txn.pending_blocks.is_empty());
 
     commit_transaction(&mut fs, txn).expect("commit_transaction");
+    AccountingOracle::assert_clean(&fs);
 
     let (clean, output) = run_verify_btrfs(&img);
     assert!(clean, "verify-btrfs.sh must pass clean for direct batch. Output:\n{output}");
@@ -168,6 +173,8 @@ fn test_batch_transaction_byte_identical_on_fixture() {
 
     commit_transaction(&mut fs1, txn1).expect("commit 1");
     commit_transaction(&mut fs2, txn2).expect("commit 2");
+    AccountingOracle::assert_clean(&fs1);
+    AccountingOracle::assert_clean(&fs2);
 
     let (clean1, out1) = run_verify_btrfs(&img1);
     assert!(clean1, "image 1 oracle clean. Output:\n{out1}");

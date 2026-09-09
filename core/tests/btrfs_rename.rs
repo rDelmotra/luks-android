@@ -20,6 +20,7 @@ use std::process::Command;
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -111,6 +112,8 @@ fn rename_file_in_same_directory() {
         // New path should have exact content
         let new_content = fs.read_file("/renamed.txt").expect("read renamed.txt");
         assert_eq!(new_content, orig_content);
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount read-only and verify persistence
@@ -121,6 +124,8 @@ fn rename_file_in_same_directory() {
         assert!(fs_ro.read_file("/hello.txt").is_err());
         let new_content = fs_ro.read_file("/renamed.txt").expect("read renamed.txt ro");
         assert_eq!(new_content, b"hello btrfs\n");
+
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     assert!(run_verify_script(&img), "oracle check passed");
@@ -148,6 +153,8 @@ fn rename_cross_directory_move() {
             .read_file("/target_dir/moved_hello.txt")
             .expect("read moved file");
         assert_eq!(moved, b"hello btrfs\n");
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     // Remount and check
@@ -160,6 +167,8 @@ fn rename_cross_directory_move() {
             .read_file("/target_dir/moved_hello.txt")
             .expect("read moved file ro");
         assert_eq!(moved, b"hello btrfs\n");
+
+        AccountingOracle::assert_clean(&fs_ro);
     }
 
     assert!(run_verify_script(&img), "oracle check passed");
@@ -186,6 +195,8 @@ fn rename_overwrites_existing_file() {
         assert!(fs.read_file("/hello.txt").is_err());
         let replaced_content = fs.read_file("/victim.txt").expect("read victim.txt");
         assert_eq!(replaced_content, b"hello btrfs\n");
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     assert!(run_verify_script(&img), "oracle check passed");
@@ -216,6 +227,8 @@ fn rename_move_directory() {
             .read_file("/dst_dir/nested_src/child.txt")
             .expect("read nested child");
         assert_eq!(nested_content, b"inside src_dir");
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     assert!(run_verify_script(&img), "oracle check passed");
@@ -253,6 +266,7 @@ fn rename_cycle_refusal() {
         other => panic!("expected UnsupportedFsFeature, got: {other:?}"),
     }
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
     assert!(run_verify_script(&img), "oracle check passed");
     let _ = fs::remove_file(&img);
@@ -276,6 +290,8 @@ fn rename_on_mixed_4k_img() {
 
         let readback = fs.read_file("/data_root.bin").expect("read data_root.bin");
         assert_eq!(readback, vec![0x42; 8192]);
+
+        AccountingOracle::assert_clean(&fs);
     }
 
     assert!(run_verify_script(&img), "oracle check passed for mixed-4k");

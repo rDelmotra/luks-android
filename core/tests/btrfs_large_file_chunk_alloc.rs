@@ -28,6 +28,7 @@ use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
 use luks_core::fs::btrfs::write::chunk_alloc::next_logical;
 use luks_core::fs::btrfs::write::extent_tree::ExtentTree;
 use luks_core::fs::btrfs::Btrfs;
+use common::accounting::AccountingOracle;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -140,7 +141,7 @@ fn verify_kernel_readback_sha256(image_path: &PathBuf, files: &[(&str, &str)]) -
         .stdin(std::fs::File::open(image_path).unwrap())
         .stdout(std::process::Stdio::null())
         .status();
-    if !cp_status.map_or(false, |s| s.success()) {
+    if !cp_status.is_ok_and(|s| s.success()) {
         eprintln!("failed to copy test image to colima");
         return false;
     }
@@ -275,6 +276,7 @@ fn test_streaming_large_file_triggers_chunk_allocation_and_oracle_clean() {
     assert_eq!(readback.len(), target_file_size);
     assert_eq!(sha256_hex(&readback), expected_sha256);
 
+    AccountingOracle::assert_clean(&fs);
     fs.commit_active_batch().expect("commit");
     drop(fs);
 
@@ -284,6 +286,7 @@ fn test_streaming_large_file_triggers_chunk_allocation_and_oracle_clean() {
     assert_eq!(fs_ro.chunk_map().len(), initial_chunk_count + 1);
     let readback_ro = fs_ro.read_file("/large_streaming.bin").expect("read_file ro");
     assert_eq!(sha256_hex(&readback_ro), expected_sha256);
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // 6. Oracle verification via tools/verify-btrfs.sh on Colima
@@ -334,6 +337,7 @@ fn test_atomic_create_file_with_data_large_file_triggers_chunk_allocation() {
     let readback = fs.read_file("/large_atomic.bin").expect("read_file");
     assert_eq!(sha256_hex(&readback), expected_sha256);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Remount read-only
@@ -341,6 +345,7 @@ fn test_atomic_create_file_with_data_large_file_triggers_chunk_allocation() {
     let fs_ro = Btrfs::mount(dev_ro).expect("mount ro");
     let readback_ro = fs_ro.read_file("/large_atomic.bin").expect("read_file ro");
     assert_eq!(sha256_hex(&readback_ro), expected_sha256);
+    AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);
 
     // Oracle check
@@ -399,6 +404,7 @@ fn test_multiple_files_crossing_chunk_boundary() {
     assert_eq!(sha256_hex(&fs.read_file("/file2_7mb.bin").unwrap()), f2_sha);
     assert_eq!(sha256_hex(&fs.read_file("/file3_4mb.bin").unwrap()), f3_sha);
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Oracle verification
@@ -437,6 +443,7 @@ fn test_file_larger_than_total_device_capacity_is_safely_refused() {
     let res = fs.begin_file(100 * 1024 * 1024);
     assert!(matches!(res, Err(LuksError::FilesystemFull)));
 
+    AccountingOracle::assert_clean(&fs);
     drop(fs);
 
     // Verify oracle still passes clean
@@ -502,6 +509,7 @@ fn test_large_file_chunk_alloc_across_all_fixtures() {
         let readback = fs.read_file("/fixture_large.bin").unwrap();
         assert_eq!(sha256_hex(&readback), expected_sha);
 
+        AccountingOracle::assert_clean(&fs);
         fs.commit_active_batch().expect("commit");
         drop(fs);
 
