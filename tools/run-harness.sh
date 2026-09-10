@@ -153,7 +153,8 @@ if [ "$RUN_STRESS" -eq 1 ]; then
 
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
         --test btrfs_conformance \
-        --test btrfs_interior_collapse
+        --test btrfs_interior_collapse \
+        --test btrfs_fst_collapse
 
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
         --test btrfs_btree_permutations -- \
@@ -220,6 +221,7 @@ if [ "$RUN_ORACLE" -eq 1 ]; then
         --test btrfs_rename \
         --test btrfs_mkdir \
         --test btrfs_crash_safety \
+        --test btrfs_fst_collapse \
         --test ext4_file \
         --test ext4_delete \
         --test ext4_rename \
@@ -292,7 +294,8 @@ if [ "$RUN_TRANSITIONS" -eq 1 ]; then
             --test btrfs_conformance \
             --test btrfs_interior_collapse \
             --test btrfs_btree_permutations \
-            --test btrfs_data_write
+            --test btrfs_data_write \
+            --test btrfs_fst_collapse
     fi
 
     set +e

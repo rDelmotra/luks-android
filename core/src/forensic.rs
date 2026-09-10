@@ -182,6 +182,10 @@ static STRUCTURAL_BLOCK_REUSED: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_BLOCK_COWED: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_CONVERGE_CALLS: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_MAX_CONVERGE_ROUNDS: AtomicU32 = AtomicU32::new(0);
+static STRUCTURAL_FST_LEAF_SPLIT: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_FST_HEIGHT_GREW: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_FST_ROOT_COLLAPSED: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_FST_NODE_REMOVED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
 pub struct StructuralTransitionCounts {
@@ -199,6 +203,10 @@ pub struct StructuralTransitionCounts {
     pub block_cowed: u64,
     pub converge_total_calls: u64,
     pub max_converge_rounds: u32,
+    pub fst_leaf_split: u64,
+    pub fst_height_grew: u64,
+    pub fst_root_collapsed: u64,
+    pub fst_node_removed: u64,
 }
 
 static TRANSITION_LEDGER_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
@@ -238,6 +246,9 @@ fn update_structural_counts(event: &BtrfsEvent) {
     match event {
         BtrfsEvent::LeafSplit { tree, shape, groups, pos_class } => {
             ledger_record_transition(&format!("LEAF_SPLIT tree={tree} shape={shape} groups={groups} pos={pos_class}"));
+            if *tree == 10 {
+                STRUCTURAL_FST_LEAF_SPLIT.fetch_add(1, Ordering::Relaxed);
+            }
             match shape {
                 1 => { STRUCTURAL_LEAF_SPLIT_SHAPE_1.fetch_add(1, Ordering::Relaxed); }
                 2 => { STRUCTURAL_LEAF_SPLIT_SHAPE_2.fetch_add(1, Ordering::Relaxed); }
@@ -258,14 +269,23 @@ fn update_structural_counts(event: &BtrfsEvent) {
         BtrfsEvent::HeightGrew { tree, from, to } => {
             ledger_record_transition(&format!("HEIGHT_GREW tree={tree} from={from} to={to}"));
             STRUCTURAL_HEIGHT_GREW.fetch_add(1, Ordering::Relaxed);
+            if *tree == 10 {
+                STRUCTURAL_FST_HEIGHT_GREW.fetch_add(1, Ordering::Relaxed);
+            }
         }
         BtrfsEvent::RootCollapsed { tree, from, to } => {
             ledger_record_transition(&format!("ROOT_COLLAPSED tree={tree} from={from} to={to}"));
             STRUCTURAL_ROOT_COLLAPSED.fetch_add(1, Ordering::Relaxed);
+            if *tree == 10 {
+                STRUCTURAL_FST_ROOT_COLLAPSED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         BtrfsEvent::NodeRemoved { tree, level } => {
             ledger_record_transition(&format!("NODE_REMOVED tree={tree} level={level}"));
             STRUCTURAL_NODE_REMOVED.fetch_add(1, Ordering::Relaxed);
+            if *tree == 10 {
+                STRUCTURAL_FST_NODE_REMOVED.fetch_add(1, Ordering::Relaxed);
+            }
         }
         BtrfsEvent::BlockReused { tree, level } => {
             ledger_record_transition(&format!("BLOCK_REUSED tree={tree} level={level}"));
@@ -307,6 +327,10 @@ pub fn get_structural_counts() -> StructuralTransitionCounts {
         block_cowed: STRUCTURAL_BLOCK_COWED.load(Ordering::Relaxed),
         converge_total_calls: STRUCTURAL_CONVERGE_CALLS.load(Ordering::Relaxed),
         max_converge_rounds: STRUCTURAL_MAX_CONVERGE_ROUNDS.load(Ordering::Relaxed),
+        fst_leaf_split: STRUCTURAL_FST_LEAF_SPLIT.load(Ordering::Relaxed),
+        fst_height_grew: STRUCTURAL_FST_HEIGHT_GREW.load(Ordering::Relaxed),
+        fst_root_collapsed: STRUCTURAL_FST_ROOT_COLLAPSED.load(Ordering::Relaxed),
+        fst_node_removed: STRUCTURAL_FST_NODE_REMOVED.load(Ordering::Relaxed),
     }
 }
 
@@ -326,6 +350,10 @@ pub fn reset_structural_counts() {
     STRUCTURAL_BLOCK_COWED.store(0, Ordering::Relaxed);
     STRUCTURAL_CONVERGE_CALLS.store(0, Ordering::Relaxed);
     STRUCTURAL_MAX_CONVERGE_ROUNDS.store(0, Ordering::Relaxed);
+    STRUCTURAL_FST_LEAF_SPLIT.store(0, Ordering::Relaxed);
+    STRUCTURAL_FST_HEIGHT_GREW.store(0, Ordering::Relaxed);
+    STRUCTURAL_FST_ROOT_COLLAPSED.store(0, Ordering::Relaxed);
+    STRUCTURAL_FST_NODE_REMOVED.store(0, Ordering::Relaxed);
 }
 
 /// Format the cumulative structural transition counts as a readable markdown table.
@@ -347,7 +375,11 @@ pub fn dump_structural_counts_summary() -> String {
          | In-Txn Block Reused (is_already_new) | {} |\n\
          | Block CoW'd (new allocation) | {} |\n\
          | Convergence Loop Calls | {} |\n\
-         | Max Observed Convergence Rounds (GAP-3) | {} |\n",
+         | Max Observed Convergence Rounds (GAP-3) | {} |\n\
+         | FreeSpaceTree Leaf Split | {} |\n\
+         | FreeSpaceTree Height Grew | {} |\n\
+         | FreeSpaceTree Root Collapsed | {} |\n\
+         | FreeSpaceTree Node Removed | {} |\n",
         c.leaf_split_shape_1,
         c.leaf_split_shape_2,
         c.leaf_split_shape_3,
@@ -361,7 +393,11 @@ pub fn dump_structural_counts_summary() -> String {
         c.block_reused,
         c.block_cowed,
         c.converge_total_calls,
-        c.max_converge_rounds
+        c.max_converge_rounds,
+        c.fst_leaf_split,
+        c.fst_height_grew,
+        c.fst_root_collapsed,
+        c.fst_node_removed
     )
 }
 

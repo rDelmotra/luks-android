@@ -25,7 +25,7 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol large nonmixed-4k sha256-4k}"
+TARGETS="${2:-plain compress mixed-4k subvol large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
@@ -33,6 +33,9 @@ UUID_SUBVOL="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
 UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
 UUID_SHA256="12121212-3434-5656-7878-909090909090"
+UUID_FST_AGED="77777777-6666-5555-4444-333333333333"
+UUID_FST_MULTILEAF="66666666-5555-4444-3333-222222222222"
+UUID_FST_BITMAP="55555555-4444-3333-2222-111111111111"
 
 want() { case " $TARGETS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -267,6 +270,81 @@ rm -f "$IMG"
 truncate -s 1G "$IMG"
 mkfs.btrfs -q -f -n 4096 --csum sha256 -L BTRFSSHA -U "$UUID_SHA256" "$IMG"
 echo "  -> sha256-4k.img"
+fi
+
+# --- fst-aged.img: ~500 free extents, ~80-90% of single-leaf ceiling (16 KiB nodes)
+if want fst-aged; then
+echo "Building fst-aged.img..."
+IMG="$OUT/fst-aged.img"
+rm -f "$IMG"
+truncate -s 4G "$IMG"
+mkfs.btrfs -q -L BTRFSFSTAGE -U "$UUID_FST_AGED" "$IMG"
+mount -o loop "$IMG" "$MNT"
+python3 -c "
+import os
+for round in range(3):
+    for i in range(400):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        with open(fn, \"wb\") as f:
+            f.write(b\"A\" * 262144)
+    os.sync()
+    for i in range(0, 400, 2):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        os.remove(fn)
+    os.sync()
+"
+umount "$MNT"
+echo "  -> fst-aged.img"
+fi
+
+# --- fst-multileaf.img: 4096-byte nodes, FST root level >= 1
+if want fst-multileaf; then
+echo "Building fst-multileaf.img..."
+IMG="$OUT/fst-multileaf.img"
+rm -f "$IMG"
+truncate -s 2G "$IMG"
+mkfs.btrfs -q -f -n 4096 -L BTRFSFSTMULTI -U "$UUID_FST_MULTILEAF" "$IMG"
+mount -o loop "$IMG" "$MNT"
+python3 -c "
+import os
+for round in range(6):
+    for i in range(200):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        with open(fn, \"wb\") as f:
+            f.write(b\"Y\" * 131072)
+    os.sync()
+    for i in range(0, 200, 2):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        os.remove(fn)
+    os.sync()
+"
+umount "$MNT"
+echo "  -> fst-multileaf.img"
+fi
+
+# --- fst-bitmap.img: at least one block group with flags 1 (USING_BITMAPS)
+if want fst-bitmap; then
+echo "Building fst-bitmap.img..."
+IMG="$OUT/fst-bitmap.img"
+rm -f "$IMG"
+truncate -s 4G "$IMG"
+mkfs.btrfs -q -L BTRFSFSTBMP -U "$UUID_FST_BITMAP" "$IMG"
+mount -o loop "$IMG" "$MNT"
+python3 -c "
+import os
+for round in range(4):
+    for i in range(400):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        with open(fn, \"wb\") as f:
+            f.write(b\"B\" * 262144)
+    os.sync()
+    for i in range(0, 400, 2):
+        fn = f\"$MNT/f_{round:02d}_{i:04d}.bin\"
+        os.remove(fn)
+    os.sync()
+"
+umount "$MNT"
+echo "  -> fst-bitmap.img"
 fi
 
 # --- ground truth -----------------------------------------------------------

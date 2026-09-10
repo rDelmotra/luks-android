@@ -49,6 +49,10 @@ node_removed=$(grep -c '^NODE_REMOVED' "$LEDGER" || true)
 block_reused=$(grep -c '^BLOCK_REUSED' "$LEDGER" || true)
 block_cowed=$(grep -c '^BLOCK_COWED' "$LEDGER" || true)
 converge_calls=$(grep -c '^CONVERGE' "$LEDGER" || true)
+fst_leaf_split=$(grep -c 'LEAF_SPLIT.*tree=10' "$LEDGER" || true)
+fst_height_grew=$(grep -c 'HEIGHT_GREW.*tree=10' "$LEDGER" || true)
+fst_root_collapsed=$(grep -c 'ROOT_COLLAPSED.*tree=10' "$LEDGER" || true)
+fst_node_removed=$(grep -c 'NODE_REMOVED.*tree=10' "$LEDGER" || true)
 
 kg_shape1=$(grep -c '^KERNEL_GRADED.*class=shape1' "$LEDGER" || true)
 kg_shape2=$(grep -c '^KERNEL_GRADED.*class=shape2' "$LEDGER" || true)
@@ -61,6 +65,10 @@ kg_node_removed=$(grep -c '^KERNEL_GRADED.*class=node_removed' "$LEDGER" || true
 kg_block_reused=$(grep -c '^KERNEL_GRADED.*class=block_reused' "$LEDGER" || true)
 kg_block_cowed=$(grep -c '^KERNEL_GRADED.*class=block_cowed' "$LEDGER" || true)
 kg_converge_calls=$(grep -c '^KERNEL_GRADED.*class=converge_calls' "$LEDGER" || true)
+kg_fst_leaf_split=$(grep -c '^KERNEL_GRADED.*class=fst_leaf_split' "$LEDGER" || true)
+kg_fst_height_grew=$(grep -c '^KERNEL_GRADED.*class=fst_height_grew' "$LEDGER" || true)
+kg_fst_root_collapsed=$(grep -c '^KERNEL_GRADED.*class=fst_root_collapsed' "$LEDGER" || true)
+kg_fst_node_removed=$(grep -c '^KERNEL_GRADED.*class=fst_node_removed' "$LEDGER" || true)
 
 max_rounds=0
 if [[ "$converge_calls" -gt 0 ]]; then
@@ -88,6 +96,10 @@ echo "| In-Txn Block Reused (is_already_new) | $block_reused | $kg_block_reused 
 echo "| Block CoW'd (new allocation) | $block_cowed | $kg_block_cowed | GAP-5 |"
 echo "| Convergence Loop Invocations | $converge_calls | $kg_converge_calls | X5 |"
 echo "| Max Convergence Rounds Observed | $max_rounds (limit 30) | - | X6 (GAP-3) |"
+echo "| FST Leaf Split | $fst_leaf_split | $kg_fst_leaf_split | FST-1 |"
+echo "| FST Height Grew (0->1, 1->2) | $fst_height_grew | $kg_fst_height_grew | FST-2 |"
+echo "| FST Root Collapsed (2->1, 1->0) | $fst_root_collapsed | $kg_fst_root_collapsed | FST-3 |"
+echo "| FST Node Removed | $fst_node_removed | $kg_fst_node_removed | FST-4 |"
 echo "================================================================="
 
 if [[ "$CHECK_GATE" -eq 1 ]]; then
@@ -114,6 +126,14 @@ if [[ "$CHECK_GATE" -eq 1 ]]; then
   [[ "$kg_block_cowed" -gt 0 ]] || MISSES+=("Block CoW'd (GAP-5) [ungraded]")
   [[ "$converge_calls" -gt 0 ]] || MISSES+=("Convergence Loop (X5) [unreached]")
   [[ "$kg_converge_calls" -gt 0 ]] || MISSES+=("Convergence Loop (X5) [ungraded]")
+  [[ "$fst_leaf_split" -gt 0 ]] || MISSES+=("FST Leaf Split (FST-1) [unreached]")
+  [[ "$kg_fst_leaf_split" -gt 0 ]] || MISSES+=("FST Leaf Split (FST-1) [ungraded]")
+  [[ "$fst_height_grew" -gt 0 ]] || MISSES+=("FST Height Grew (FST-2) [unreached]")
+  [[ "$kg_fst_height_grew" -gt 0 ]] || MISSES+=("FST Height Grew (FST-2) [ungraded]")
+  [[ "$fst_root_collapsed" -gt 0 ]] || MISSES+=("FST Root Collapsed (FST-3) [unreached]")
+  [[ "$kg_fst_root_collapsed" -gt 0 ]] || MISSES+=("FST Root Collapsed (FST-3) [ungraded]")
+  [[ "$fst_node_removed" -gt 0 ]] || MISSES+=("FST Node Removed (FST-4) [unreached]")
+  [[ "$kg_fst_node_removed" -gt 0 ]] || MISSES+=("FST Node Removed (FST-4) [ungraded]")
 
   if [[ ${#MISSES[@]} -gt 0 ]]; then
     echo "TRANSITION GATE FAILED: Missed ${#MISSES[@]} required structural transition criterion/criteria:" >&2

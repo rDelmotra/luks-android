@@ -666,3 +666,216 @@ fn test_negative_control_extent_length_mismatch() {
     }
 }
 
+// =========================================================================
+// NEGATIVE CONTROLS: Invariant A-7 (Free-Space Tree Parity) Fault Injections
+// =========================================================================
+
+#[test]
+fn test_negative_control_fst_extent_overlap() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_fst_overlap");
+    let dev = FileDevice::open(scratch.path()).expect("open plain.img");
+    let fs = Btrfs::mount(dev).expect("mount plain.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In plain.img, block group 13631488 has an allocated extent at 13631488 (len 2097152, end 15728640).
+    // The FST free extent is at 15728640 (len 6291456).
+    // Mutate the free extent to start at 15720000 (overlapping the allocated extent).
+    let fst_ext_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_EXTENT_KEY
+                && it.key.objectid == 15728640
+        })
+        .expect("find fst extent item at 15728640");
+    leaf.items[fst_ext_idx].key.objectid = 15720000;
+    leaf.items[fst_ext_idx].key.offset = 6291456;
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstExtentOverlap {
+            bytenr,
+            length,
+            fst_start,
+            fst_len,
+        }) => {
+            println!(
+                "Negative control passed: detected FstExtentOverlap: FST [{fst_start:#x}..{:#x}] overlaps with Extent Tree [{bytenr:#x}..{:#x}]",
+                fst_start + fst_len,
+                bytenr + length
+            );
+            assert_eq!(bytenr, 14680064);
+            assert_eq!(fst_start, 15720000);
+        }
+        other => panic!("expected Err(AccountingError::FstExtentOverlap), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_negative_control_fst_coverage_gap() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_fst_gap");
+    let dev = FileDevice::open(scratch.path()).expect("open plain.img");
+    let fs = Btrfs::mount(dev).expect("mount plain.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In plain.img, block group 13631488 has an FST free extent at 15728640 (len 6291456).
+    // Shrink its length by 4096 bytes to introduce a gap.
+    let fst_ext_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_EXTENT_KEY
+                && it.key.objectid == 15728640
+        })
+        .expect("find fst extent item at 15728640");
+    leaf.items[fst_ext_idx].key.offset -= 4096;
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstCoverageMismatch {
+            bg_start,
+            bg_len,
+            allocated_bytes,
+            fst_free_bytes,
+        }) => {
+            println!(
+                "Negative control passed: detected FstCoverageMismatch in BG {bg_start:#x}: alloc ({allocated_bytes}) + free ({fst_free_bytes}) != {bg_len}",
+            );
+            assert_eq!(bg_start, 13631488);
+            assert_eq!(bg_len, 8388608);
+            assert_eq!(allocated_bytes, 2097152);
+            assert_eq!(fst_free_bytes, 6291456 - 4096);
+        }
+        other => panic!("expected Err(AccountingError::FstCoverageMismatch), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_negative_control_fst_info_count_mismatch() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_fst_count");
+    let dev = FileDevice::open(scratch.path()).expect("open plain.img");
+    let fs = Btrfs::mount(dev).expect("mount plain.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In plain.img, block group 13631488 has FREE_SPACE_INFO with extent_count = 1.
+    // Corrupt extent count (+10).
+    let info_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_INFO_KEY
+                && it.key.objectid == 13631488
+        })
+        .expect("find fst info item for 13631488");
+    let count = u32::from_le_bytes(leaf.items[info_idx].data[0..4].try_into().unwrap());
+    leaf.items[info_idx].data[0..4].copy_from_slice(&(count + 10).to_le_bytes());
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstInfoCountMismatch {
+            bg_start,
+            recorded_count,
+            actual_count,
+        }) => {
+            println!(
+                "Negative control passed: detected FstInfoCountMismatch in BG {bg_start:#x}: recorded {recorded_count} vs actual {actual_count}",
+            );
+            assert_eq!(bg_start, 13631488);
+            assert_eq!(recorded_count, count + 10);
+            assert_eq!(actual_count, count as usize);
+        }
+        other => panic!("expected Err(AccountingError::FstInfoCountMismatch), got: {other:?}"),
+    }
+}
+
+

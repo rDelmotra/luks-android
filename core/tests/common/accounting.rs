@@ -34,7 +34,8 @@ use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
 use luks_core::fs::btrfs::extent::{ExtentKind, FileExtent};
 use luks_core::fs::btrfs::tree::{
-    CHUNK_TREE_OBJECTID, EXTENT_DATA_KEY, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
+    CHUNK_TREE_OBJECTID, EXTENT_DATA_KEY, FREE_SPACE_EXTENT_KEY, FREE_SPACE_INFO_KEY,
+    FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
 };
 use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
 use luks_core::fs::btrfs::write::extent_tree::ExtentTree;
@@ -103,6 +104,35 @@ pub enum AccountingError {
         range_start: u64,
         range_len: u64,
         is_pinned: bool,
+    },
+    /// Invariant A-7: Free Space Tree free extent overlaps with an Extent Tree allocation.
+    FstExtentOverlap {
+        bytenr: u64,
+        length: u64,
+        fst_start: u64,
+        fst_len: u64,
+    },
+    /// Invariant A-7: Two Free Space Tree free extents overlap each other.
+    FstSelfOverlap {
+        first_start: u64,
+        first_len: u64,
+        second_start: u64,
+        second_len: u64,
+    },
+    /// Invariant A-7: Free Space Tree free extents and Extent Tree allocations do not
+    /// seamlessly partition the block group (gap or coverage mismatch).
+    FstCoverageMismatch {
+        bg_start: u64,
+        bg_len: u64,
+        allocated_bytes: u64,
+        fst_free_bytes: u64,
+    },
+    /// Invariant A-7: FREE_SPACE_INFO recorded extent count does not match the actual
+    /// number of FREE_SPACE_EXTENT items in the Free Space Tree.
+    FstInfoCountMismatch {
+        bg_start: u64,
+        recorded_count: u32,
+        actual_count: usize,
     },
     /// Underlying filesystem read/corruption error.
     CorruptFs(String),
@@ -206,6 +236,46 @@ impl std::fmt::Display for AccountingError {
                 bytenr + length,
                 if *is_pinned { "pinned_freed" } else { "free" },
                 range_start + range_len
+            ),
+            Self::FstExtentOverlap {
+                bytenr,
+                length,
+                fst_start,
+                fst_len,
+            } => write!(
+                f,
+                "Invariant A-7: Free Space Tree range [{fst_start:#x}..{:#x}] (len {fst_len}) overlaps with Extent Tree allocation [{bytenr:#x}..{:#x}] (len {length})",
+                fst_start + fst_len,
+                bytenr + length
+            ),
+            Self::FstSelfOverlap {
+                first_start,
+                first_len,
+                second_start,
+                second_len,
+            } => write!(
+                f,
+                "Invariant A-7: Free Space Tree ranges overlap on disk: [{first_start:#x}..{:#x}] overlaps with [{second_start:#x}..{:#x}]",
+                first_start + first_len,
+                second_start + second_len
+            ),
+            Self::FstCoverageMismatch {
+                bg_start,
+                bg_len,
+                allocated_bytes,
+                fst_free_bytes,
+            } => write!(
+                f,
+                "Invariant A-7: Block group at [{bg_start:#x}..{:#x}] partition failure: allocated ({allocated_bytes}) + fst free ({fst_free_bytes}) != length ({bg_len})",
+                bg_start + bg_len
+            ),
+            Self::FstInfoCountMismatch {
+                bg_start,
+                recorded_count,
+                actual_count,
+            } => write!(
+                f,
+                "Invariant A-7: FREE_SPACE_INFO at {bg_start:#x} recorded count {recorded_count} does not match actual FST extent count {actual_count}",
             ),
             Self::CorruptFs(msg) => write!(f, "Filesystem corruption during accounting check: {msg}"),
         }
@@ -564,6 +634,138 @@ impl AccountingOracle {
                                 is_pinned: true,
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // 9. Invariant A-7: Free Space Tree Parity Check (if FST is present)
+        if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+            let mut fst_infos: HashMap<u64, (u32, u32)> = HashMap::new(); // bg_start -> (extent_count, flags)
+            let mut fst_extents: Vec<(u64, u64)> = Vec::new(); // (start, length)
+
+            fs.walk_tree(fst_root.bytenr, &mut |key, data| {
+                if key.item_type == FREE_SPACE_INFO_KEY && data.len() >= 8 {
+                    let count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    let flags = u32::from_le_bytes(data[4..8].try_into().unwrap());
+                    fst_infos.insert(key.objectid, (count, flags));
+                } else if key.item_type == FREE_SPACE_EXTENT_KEY {
+                    fst_extents.push((key.objectid, key.offset));
+                }
+                Ok(())
+            })?;
+
+            fst_extents.sort_by_key(|&(start, _)| start);
+
+            for bg in &extent_tree.block_groups {
+                let bg_end = bg.start + bg.length;
+                let (info_count, flags) = fst_infos.get(&bg.start).copied().unwrap_or((0, 0));
+
+                // If block group uses bitmaps (flags & 1 != 0), extent items are not emitted for it
+                if flags & 1 != 0 {
+                    continue;
+                }
+
+                let bg_fst_extents: Vec<(u64, u64)> = fst_extents
+                    .iter()
+                    .copied()
+                    .filter(|&(start, _)| start >= bg.start && start < bg_end)
+                    .collect();
+
+                // 9a. Check extent count matches FREE_SPACE_INFO
+                if bg_fst_extents.len() != info_count as usize {
+                    return Err(AccountingError::FstInfoCountMismatch {
+                        bg_start: bg.start,
+                        recorded_count: info_count,
+                        actual_count: bg_fst_extents.len(),
+                    });
+                }
+
+                // 9b. Check no two FST free ranges overlap
+                for i in 0..bg_fst_extents.len().saturating_sub(1) {
+                    let curr = bg_fst_extents[i];
+                    let next = bg_fst_extents[i + 1];
+                    if curr.0 + curr.1 > next.0 {
+                        return Err(AccountingError::FstSelfOverlap {
+                            first_start: curr.0,
+                            first_len: curr.1,
+                            second_start: next.0,
+                            second_len: next.1,
+                        });
+                    }
+                }
+
+                // 9c. Check no FST free range overlaps any Extent Tree allocation
+                let bg_alloc_extents: Vec<(u64, u64)> = extent_tree
+                    .extents
+                    .iter()
+                    .filter(|e| e.bytenr >= bg.start && e.bytenr < bg_end)
+                    .map(|e| (e.bytenr, e.length))
+                    .collect();
+
+                for &alloc in &bg_alloc_extents {
+                    let alloc_end = alloc.0 + alloc.1;
+                    for &free in &bg_fst_extents {
+                        let free_end = free.0 + free.1;
+                        if alloc.0 < free_end && alloc_end > free.0 {
+                            return Err(AccountingError::FstExtentOverlap {
+                                bytenr: alloc.0,
+                                length: alloc.1,
+                                fst_start: free.0,
+                                fst_len: free.1,
+                            });
+                        }
+                    }
+                }
+
+                // 9d. Check seamless partition (every byte in block group is either allocated or free)
+                let total_alloc_bytes: u64 = bg_alloc_extents.iter().map(|e| e.1).sum();
+                let total_free_bytes: u64 = bg_fst_extents.iter().map(|e| e.1).sum();
+
+                if total_alloc_bytes + total_free_bytes != bg.length {
+                    return Err(AccountingError::FstCoverageMismatch {
+                        bg_start: bg.start,
+                        bg_len: bg.length,
+                        allocated_bytes: total_alloc_bytes,
+                        fst_free_bytes: total_free_bytes,
+                    });
+                }
+
+                // Verify gapless contiguous tiling
+                let mut combined: Vec<(u64, u64)> =
+                    Vec::with_capacity(bg_alloc_extents.len() + bg_fst_extents.len());
+                combined.extend_from_slice(&bg_alloc_extents);
+                combined.extend_from_slice(&bg_fst_extents);
+                combined.sort_by_key(|&(start, _)| start);
+
+                if !combined.is_empty() {
+                    if combined[0].0 != bg.start {
+                        return Err(AccountingError::FstCoverageMismatch {
+                            bg_start: bg.start,
+                            bg_len: bg.length,
+                            allocated_bytes: total_alloc_bytes,
+                            fst_free_bytes: total_free_bytes,
+                        });
+                    }
+                    let mut cursor = bg.start;
+                    for &(start, len) in &combined {
+                        if start != cursor {
+                            return Err(AccountingError::FstCoverageMismatch {
+                                bg_start: bg.start,
+                                bg_len: bg.length,
+                                allocated_bytes: total_alloc_bytes,
+                                fst_free_bytes: total_free_bytes,
+                            });
+                        }
+                        cursor += len;
+                    }
+                    if cursor != bg_end {
+                        return Err(AccountingError::FstCoverageMismatch {
+                            bg_start: bg.start,
+                            bg_len: bg.length,
+                            allocated_bytes: total_alloc_bytes,
+                            fst_free_bytes: total_free_bytes,
+                        });
                     }
                 }
             }

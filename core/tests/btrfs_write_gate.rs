@@ -3,12 +3,13 @@
 //! ```text
 //! cargo test --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support --test btrfs_write_gate
 //! ```
-#![cfg(feature = "dangerous-write-support")]
+mod common;
 
+use common::scratch::ScratchFixture;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::superblock::Superblock;
 use luks_core::fs::btrfs::write::gate::{
-    check_free_space_tree_shape, check_sys_chunk_array_capacity, check_writeable_fs,
+    check_sys_chunk_array_capacity, check_writeable_fs,
     check_writeable_subvolume, BTRFS_SYSTEM_CHUNK_ARRAY_SIZE, BTRFS_SYSTEM_CHUNK_ENTRY_SIZE,
     SUPPORTED_WRITE_COMPAT_RO,
 };
@@ -106,34 +107,21 @@ fn read_only_subvolume_is_refused() {
     }
 }
 
-/// Fix 1 (D.1). Every commit rewrites the free-space tree as a single leaf,
-/// so a tree with an interior root must be refused rather than flattened —
-/// flattening it would strand the real child leaves, still charged to the
-/// extent tree but unreachable from it.
+/// Phase F4: Multi-leaf free-space trees are now fully supported by the incremental
+/// CoW engine, so check_free_space_tree_shape has been removed.
 #[test]
-fn multi_leaf_free_space_tree_is_refused() {
-    let mut fst_root = TreeRoot::default();
-    fst_root.level = 1;
-    match check_free_space_tree_shape(&fst_root).unwrap_err() {
-        LuksError::UnsupportedFsFeature(msg) => {
-            assert!(
-                msg.contains("free-space tree"),
-                "refusal must name the free-space tree, got: {msg}"
-            );
-        }
-        other => panic!("expected UnsupportedFsFeature, got {other:?}"),
-    }
-}
-
-/// The control for the test above. Without it, a gate that refused *every*
-/// free-space tree — including the single-leaf ones this writer handles
-/// correctly, i.e. all four fixtures — would look identically green.
-#[test]
-fn single_leaf_free_space_tree_is_allowed() {
-    let fst_root = TreeRoot::default();
-    assert_eq!(fst_root.level, 0, "default TreeRoot must be a leaf for this control to mean anything");
-    check_free_space_tree_shape(&fst_root)
-        .expect("a single-leaf free-space tree is exactly what this writer supports");
+fn multi_leaf_free_space_tree_is_supported() {
+    let path = fixture_path("fst-multileaf.img");
+    let dev = luks_core::device::FileDevice::open(&path).expect("open fst-multileaf");
+    let fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-multileaf");
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    assert!(
+        fst_root.level >= 1,
+        "fst-multileaf.img must have FST root level >= 1, got {}",
+        fst_root.level
+    );
 }
 
 #[test]
@@ -162,4 +150,58 @@ fn sys_chunk_array_capacity_gate_allows_room_and_refuses_exhaustion() {
     // Full 2048 bytes fails
     sb.sys_chunk_array = vec![0u8; BTRFS_SYSTEM_CHUNK_ARRAY_SIZE];
     assert!(check_sys_chunk_array_capacity(&sb).is_err());
+}
+
+fn fixture_path(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fixtures")
+        .join("btrfs")
+        .join(name)
+}
+
+
+
+#[test]
+fn fixture_fst_bitmap_is_refused_by_bitmap_gate() {
+    let path = fixture_path("fst-bitmap.img");
+    let dev = luks_core::device::FileDevice::open(&path).expect("open fst-bitmap");
+    let fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-bitmap");
+    let err = luks_core::fs::btrfs::write::gate::check_free_space_tree_no_bitmaps(&fs).unwrap_err();
+    match err {
+        LuksError::UnsupportedFsFeature(msg) => {
+            assert!(
+                msg.contains("btrfs free-space tree bitmap items (key type 200) not supported"),
+                "unexpected refusal message: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFsFeature, got {other:?}"),
+    }
+}
+
+#[test]
+fn fixture_fst_aged_has_high_extent_count_under_single_leaf() {
+    let path = fixture_path("fst-aged.img");
+    let dev = luks_core::device::FileDevice::open(&path).expect("open fst-aged");
+    let fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-aged");
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    assert_eq!(
+        fst_root.level, 0,
+        "fst-aged.img must have FST root level 0, got {}",
+        fst_root.level
+    );
+}
+
+#[test]
+fn fixture_fst_multileaf_write_succeeds() {
+    let scratch = ScratchFixture::new("btrfs/fst-multileaf.img", "fst_multileaf_write_succeeds");
+    let len = scratch.path().metadata().expect("metadata").len();
+    let dev = luks_core::device::FileDevice::open_writable(scratch.path(), len).expect("open writable");
+    let mut fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-multileaf");
+    let ino = fs
+        .create_file_with_data("/", "test.txt", b"hello btrfs multi-leaf")
+        .expect("write to multi-leaf FST succeeds");
+    assert!(ino > 0);
 }

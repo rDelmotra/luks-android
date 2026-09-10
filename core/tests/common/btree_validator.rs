@@ -39,6 +39,7 @@ use luks_core::error::Result;
 use luks_core::fs::btrfs::cursor::Cursor;
 use luks_core::fs::btrfs::tree::{
     Key, Node, CSUM_TREE_OBJECTID, DEV_TREE_OBJECTID, EXTENT_TREE_OBJECTID,
+    FREE_SPACE_TREE_OBJECTID,
 };
 use luks_core::fs::btrfs::Btrfs;
 
@@ -62,6 +63,7 @@ pub struct AllTreesValidationReport {
     pub extent_tree: TreeValidationReport,
     pub csum_tree: Option<TreeValidationReport>,
     pub dev_tree: TreeValidationReport,
+    pub free_space_tree: Option<TreeValidationReport>,
 }
 
 impl AllTreesValidationReport {
@@ -72,6 +74,9 @@ impl AllTreesValidationReport {
             + self.dev_tree.total_nodes;
         if let Some(ref csum) = self.csum_tree {
             total += csum.total_nodes;
+        }
+        if let Some(ref fst) = self.free_space_tree {
+            total += fst.total_nodes;
         }
         total
     }
@@ -84,6 +89,9 @@ impl AllTreesValidationReport {
         if let Some(ref csum) = self.csum_tree {
             total += csum.total_items;
         }
+        if let Some(ref fst) = self.free_space_tree {
+            total += fst.total_items;
+        }
         total
     }
 
@@ -95,6 +103,9 @@ impl AllTreesValidationReport {
         if let Some(ref csum) = self.csum_tree {
             total += csum.total_single_child_interior_nodes;
         }
+        if let Some(ref fst) = self.free_space_tree {
+            total += fst.total_single_child_interior_nodes;
+        }
         total
     }
 
@@ -102,6 +113,9 @@ impl AllTreesValidationReport {
         let mut reports = vec![&self.fs_tree, &self.root_tree, &self.extent_tree, &self.dev_tree];
         if let Some(ref csum) = self.csum_tree {
             reports.push(csum);
+        }
+        if let Some(ref fst) = self.free_space_tree {
+            reports.push(fst);
         }
         reports
     }
@@ -195,9 +209,9 @@ impl TreeValidator {
         })
     }
 
-    /// Validates all five standard Btrfs trees (FS_TREE, ROOT_TREE, EXTENT_TREE, CSUM_TREE, DEV_TREE)
-    /// across all structural invariants (I-1 through I-6), bidirectional cursor parity,
-    /// and search-vs-walk parity.
+    /// Validates all standard Btrfs trees (FS_TREE, ROOT_TREE, EXTENT_TREE, CSUM_TREE, DEV_TREE,
+    /// and FREE_SPACE_TREE if present) across all structural invariants (I-1 through I-6),
+    /// bidirectional cursor parity, and search-vs-walk parity.
     pub fn validate_all<D: ReadAt>(fs: &Btrfs<D>) -> Result<AllTreesValidationReport> {
         let sb = fs.superblock();
 
@@ -222,12 +236,19 @@ impl TreeValidator {
         let dev_root = fs.tree_root(DEV_TREE_OBJECTID)?;
         let dev_tree = Self::validate(fs, dev_root.bytenr, Some(dev_root.level))?;
 
+        // 6. FREE_SPACE_TREE (if present)
+        let free_space_tree = match fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+            Ok(fst_root) => Some(Self::validate(fs, fst_root.bytenr, Some(fst_root.level))?),
+            Err(_) => None,
+        };
+
         Ok(AllTreesValidationReport {
             fs_tree,
             root_tree,
             extent_tree,
             csum_tree,
             dev_tree,
+            free_space_tree,
         })
     }
 
