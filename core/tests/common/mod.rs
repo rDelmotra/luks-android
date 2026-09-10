@@ -16,6 +16,8 @@ pub mod mem_device;
 pub mod scratch;
 #[cfg(feature = "dangerous-write-support")]
 pub mod accounting;
+#[cfg(feature = "dangerous-write-support")]
+pub mod fs_model;
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};

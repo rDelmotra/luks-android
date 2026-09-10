@@ -275,3 +275,7 @@ required-features = ["dangerous-write-support"]
 name = "write_target"
 required-features = ["dangerous-write-support"]
 
+[[test]]
+name = "btrfs_conformance"
+required-features = ["dangerous-write-support"]
+
