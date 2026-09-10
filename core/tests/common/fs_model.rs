@@ -26,6 +26,8 @@
 #![cfg(feature = "dangerous-write-support")]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use luks_core::device::{ReadAt, WriteAt};
 use luks_core::error::{LuksError, Result};
@@ -33,6 +35,48 @@ use luks_core::fs::btrfs::Btrfs;
 
 use super::accounting::{AccountingOracle, AccountingReport};
 use super::btree_validator::{AllTreesValidationReport, TreeValidator};
+use super::oracle::{self, OracleVerdict};
+use super::scratch::ScratchFixture;
+
+struct ClassGradingTracker {
+    shape1: AtomicUsize,
+    shape2: AtomicUsize,
+    pos_len: AtomicUsize,
+    pos_mid: AtomicUsize,
+    interior_splits: AtomicUsize,
+    height_grew: AtomicUsize,
+    root_collapsed: AtomicUsize,
+    node_removed: AtomicUsize,
+    block_reused: AtomicUsize,
+    block_cowed: AtomicUsize,
+    converge_calls: AtomicUsize,
+}
+
+static KERNEL_GRADED_CLASSES: ClassGradingTracker = ClassGradingTracker {
+    shape1: AtomicUsize::new(0),
+    shape2: AtomicUsize::new(0),
+    pos_len: AtomicUsize::new(0),
+    pos_mid: AtomicUsize::new(0),
+    interior_splits: AtomicUsize::new(0),
+    height_grew: AtomicUsize::new(0),
+    root_collapsed: AtomicUsize::new(0),
+    node_removed: AtomicUsize::new(0),
+    block_reused: AtomicUsize::new(0),
+    block_cowed: AtomicUsize::new(0),
+    converge_calls: AtomicUsize::new(0),
+};
+
+static GRADING_MUTEX: Mutex<()> = Mutex::new(());
+
+fn dump_device_to_file<D: ReadAt>(dev: &D, path: &std::path::Path) -> std::io::Result<()> {
+    let len = dev.len().expect("device len must be known") as usize;
+    let mut buf = vec![0u8; len];
+    dev.read_at(0, &mut buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+    let mut file = std::fs::File::create(path)?;
+    std::io::Write::write_all(&mut file, &buf)?;
+    file.sync_all()
+}
 
 /// Normalize a path: strip leading and trailing slashes, resolve "." components.
 /// The root directory is represented by the empty string `""`.
@@ -937,6 +981,8 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
     let now_sec = 1_700_000_000 + step as u64;
     let now_nsec = ((step as u32).wrapping_mul(1_000_003)) % 1_000_000_000;
 
+    let counts_before = luks_core::forensic::get_structural_counts();
+
     let mut skipped_full = false;
     let mut is_remount = false;
 
@@ -1224,6 +1270,85 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
 
         // Re-assign remounted instance
         *fs = remounted;
+    }
+
+    // --- Phase 4b: Transition-Triggered Linux Kernel Grading ---
+    let counts_after = luks_core::forensic::get_structural_counts();
+    let mut fired_classes: Vec<(&'static str, &AtomicUsize)> = Vec::new();
+    if counts_after.leaf_split_shape_1 > counts_before.leaf_split_shape_1 {
+        fired_classes.push(("shape1", &KERNEL_GRADED_CLASSES.shape1));
+    }
+    if counts_after.leaf_split_shape_2 > counts_before.leaf_split_shape_2 {
+        fired_classes.push(("shape2", &KERNEL_GRADED_CLASSES.shape2));
+    }
+    if counts_after.leaf_split_pos_len > counts_before.leaf_split_pos_len {
+        fired_classes.push(("pos_len", &KERNEL_GRADED_CLASSES.pos_len));
+    }
+    if counts_after.leaf_split_pos_mid > counts_before.leaf_split_pos_mid {
+        fired_classes.push(("pos_mid", &KERNEL_GRADED_CLASSES.pos_mid));
+    }
+    if counts_after.interior_splits > counts_before.interior_splits {
+        fired_classes.push(("interior_splits", &KERNEL_GRADED_CLASSES.interior_splits));
+    }
+    if counts_after.height_grew > counts_before.height_grew {
+        fired_classes.push(("height_grew", &KERNEL_GRADED_CLASSES.height_grew));
+    }
+    if counts_after.root_collapsed > counts_before.root_collapsed {
+        fired_classes.push(("root_collapsed", &KERNEL_GRADED_CLASSES.root_collapsed));
+    }
+    if counts_after.node_removed > counts_before.node_removed {
+        fired_classes.push(("node_removed", &KERNEL_GRADED_CLASSES.node_removed));
+    }
+    if counts_after.block_reused > counts_before.block_reused {
+        fired_classes.push(("block_reused", &KERNEL_GRADED_CLASSES.block_reused));
+    }
+    if counts_after.block_cowed > counts_before.block_cowed {
+        fired_classes.push(("block_cowed", &KERNEL_GRADED_CLASSES.block_cowed));
+    }
+    if counts_after.converge_total_calls > counts_before.converge_total_calls {
+        fired_classes.push(("converge_calls", &KERNEL_GRADED_CLASSES.converge_calls));
+    }
+
+    const MAX_GRADINGS_PER_CLASS: usize = 2;
+    if fired_classes
+        .iter()
+        .any(|(_, c)| c.load(Ordering::Relaxed) < MAX_GRADINGS_PER_CLASS)
+    {
+        let _guard = GRADING_MUTEX.lock().unwrap();
+        let classes_to_grade: Vec<&'static str> = fired_classes
+            .iter()
+            .filter(|(_, c)| c.load(Ordering::Relaxed) < MAX_GRADINGS_PER_CLASS)
+            .map(|(name, _)| *name)
+            .collect();
+
+        if !classes_to_grade.is_empty() {
+            fs.commit_active_batch()?;
+            let dev_len = mem_device.len().expect("device len must be known");
+            let mut scratch = ScratchFixture::new_empty(
+                "conformance_transition.img",
+                dev_len,
+                &format!("step_{step}_{}", classes_to_grade[0]),
+            );
+            dump_device_to_file(mem_device, scratch.path())
+                .expect("dump mem_device to scratch for kernel grading");
+
+            let verdict = oracle::verify_btrfs_verdict(scratch.path());
+            if let OracleVerdict::Failed { ref stdout, ref stderr } = verdict {
+                scratch.preserve();
+                panic!(
+                    "[CONFORMANCE KERNEL ORACLE FAILURE] Step {step} op {op:?} failed kernel verification:\n\
+                     STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+                );
+            }
+            if verdict.was_graded() {
+                for &(class_name, counter) in &fired_classes {
+                    if counter.load(Ordering::Relaxed) < MAX_GRADINGS_PER_CLASS {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        luks_core::forensic::record_kernel_graded(class_name);
+                    }
+                }
+            }
+        }
     }
 
     Ok(StepReport {

@@ -248,3 +248,76 @@ pub fn gate() -> bool {
     ));
     false
 }
+
+/// Result of an oracle verification invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OracleVerdict {
+    /// The Linux kernel executed and accepted the filesystem.
+    Passed { stdout: String, stderr: String },
+    /// The Linux kernel executed and rejected the filesystem.
+    Failed { stdout: String, stderr: String },
+    /// Offline mode: skipped because oracle is unavailable and ALLOW_NO_ORACLE=1.
+    SkippedOffline,
+}
+
+impl OracleVerdict {
+    pub fn is_clean(&self) -> bool {
+        matches!(self, OracleVerdict::Passed { .. } | OracleVerdict::SkippedOffline)
+    }
+
+    pub fn was_graded(&self) -> bool {
+        matches!(self, OracleVerdict::Passed { .. })
+    }
+}
+
+/// Grade a raw Btrfs disk image using the kernel's own tools (`verify-btrfs.sh`).
+///
+/// Runs `btrfs check --readonly`, mounts read-only via loop device, and executes
+/// `btrfs scrub start -Bdr`.
+#[track_caller]
+pub fn verify_btrfs_verdict(image_path: &std::path::Path) -> OracleVerdict {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("tools")
+        .join("verify-btrfs.sh");
+
+    assert!(script.exists(), "verify-btrfs.sh not found at {:?}", script);
+
+    if !gate() {
+        return OracleVerdict::SkippedOffline;
+    }
+
+    let output = Command::new(&script).arg(image_path).output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            if out.status.success() {
+                println!(
+                    "ORACLE VERIFIED: verify-btrfs.sh passed for {}",
+                    image_path.display()
+                );
+                OracleVerdict::Passed { stdout, stderr }
+            } else {
+                OracleVerdict::Failed { stdout, stderr }
+            }
+        }
+        Err(e) => OracleVerdict::Failed {
+            stdout: String::new(),
+            stderr: format!("could not execute verify-btrfs.sh: {e}"),
+        },
+    }
+}
+
+/// Grade a raw Btrfs disk image using the kernel's own tools (`verify-btrfs.sh`).
+///
+/// Returns `(success, stdout, stderr)`.
+#[track_caller]
+pub fn verify_btrfs(image_path: &std::path::Path) -> (bool, String, String) {
+    match verify_btrfs_verdict(image_path) {
+        OracleVerdict::Passed { stdout, stderr } => (true, stdout, stderr),
+        OracleVerdict::Failed { stdout, stderr } => (false, stdout, stderr),
+        OracleVerdict::SkippedOffline => (true, String::new(), String::new()),
+    }
+}

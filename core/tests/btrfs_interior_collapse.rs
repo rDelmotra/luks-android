@@ -13,6 +13,7 @@ use common::accounting::AccountingOracle;
 use common::btree_validator::TreeValidator;
 use common::fs_model::ShadowModel;
 use common::mem_device::MemoryDevice;
+use common::scratch::ScratchFixture;
 use luks_core::fs::btrfs::Btrfs;
 
 #[test]
@@ -63,6 +64,35 @@ fn test_conformance_interior_growth_and_shrink() {
         "FS tree height must reach at least 2, got {}",
         tree_val.fs_tree.tree_height
     );
+
+    // --- Phase 4a: Grade Post-Create State (Level 2 Tree) with Linux Kernel Oracle ---
+    fs.commit_active_batch().expect("commit active batch post-create");
+    let mut scratch_create = ScratchFixture::new_empty(
+        "interior_level2.img",
+        dev.len() as u64,
+        "interior_post_create",
+    );
+    dev.dump_to_file(scratch_create.path())
+        .expect("dump post-create device to scratch");
+    let verdict_create = common::oracle::verify_btrfs_verdict(scratch_create.path());
+    if let common::oracle::OracleVerdict::Failed { ref stdout, ref stderr } = verdict_create {
+        scratch_create.preserve();
+        panic!(
+            "[PHASE 4a KERNEL ORACLE FAILURE] Post-create level 2 filesystem failed kernel verification:\n\
+             STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+    if verdict_create.was_graded() {
+        luks_core::forensic::record_kernel_graded("shape1");
+        luks_core::forensic::record_kernel_graded("shape2");
+        luks_core::forensic::record_kernel_graded("pos_len");
+        luks_core::forensic::record_kernel_graded("pos_mid");
+        luks_core::forensic::record_kernel_graded("interior_splits");
+        luks_core::forensic::record_kernel_graded("height_grew");
+        luks_core::forensic::record_kernel_graded("block_reused");
+        luks_core::forensic::record_kernel_graded("block_cowed");
+        luks_core::forensic::record_kernel_graded("converge_calls");
+    }
 
     // 2. Mass delete workload: delete ~90% (1,800 files)
     const DELETE_COUNT: usize = 1800;
@@ -130,5 +160,27 @@ fn test_conformance_interior_growth_and_shrink() {
         .expect("final shadow model verify");
     TreeValidator::validate_all(&final_fs).expect("final tree validate");
     AccountingOracle::assert_clean(&final_fs);
+
+    // --- Phase 4a: Grade Post-Collapse State (Level 0 Tree) with Linux Kernel Oracle ---
+    let mut scratch_collapse = ScratchFixture::new_empty(
+        "interior_collapsed.img",
+        dev.len() as u64,
+        "interior_post_collapse",
+    );
+    dev.dump_to_file(scratch_collapse.path())
+        .expect("dump post-collapse device to scratch");
+    let verdict_collapse = common::oracle::verify_btrfs_verdict(scratch_collapse.path());
+    if let common::oracle::OracleVerdict::Failed { ref stdout, ref stderr } = verdict_collapse {
+        scratch_collapse.preserve();
+        panic!(
+            "[PHASE 4a KERNEL ORACLE FAILURE] Post-collapse level 0 filesystem failed kernel verification:\n\
+             STDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+    }
+    if verdict_collapse.was_graded() {
+        luks_core::forensic::record_kernel_graded("node_removed");
+        luks_core::forensic::record_kernel_graded("root_collapsed");
+    }
+
     println!("[TEST] test_conformance_interior_growth_and_shrink successfully completed.");
 }

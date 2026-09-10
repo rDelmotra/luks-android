@@ -206,7 +206,16 @@ static TRANSITION_LEDGER_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> =
 fn transition_ledger_path() -> Option<&'static std::path::Path> {
     TRANSITION_LEDGER_PATH
         .get_or_init(|| {
-            let p = std::env::var("LUKS_TRANSITION_LEDGER").ok().map(std::path::PathBuf::from);
+            let p = std::env::var("LUKS_TRANSITION_LEDGER")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe().ok().and_then(|exe| {
+                        let target = exe.parent()?.parent()?.parent()?;
+                        Some(target.join("transition-ledger.log"))
+                    })
+                });
             if let Some(ref path) = p {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -224,6 +233,11 @@ fn ledger_record_transition(line: &str) {
             let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
+}
+
+/// Record that a transition class was verified clean by a real Linux kernel.
+pub fn record_kernel_graded(class: &str) {
+    ledger_record_transition(&format!("KERNEL_GRADED class={class}"));
 }
 
 fn update_structural_counts(event: &BtrfsEvent) {
