@@ -796,6 +796,99 @@ fn test_tree_validator_search_walk_parity_negative_control() {
 }
 
 #[test]
+fn test_tree_validator_search_walk_parity_parent_separator_corruption() {
+    let (fs, mut allocator, mut root_bytenr, mut root_level) = setup_in_memory_fixture();
+    let mem_dev = fs.device().clone();
+    let owner = fs.fs_tree().objectid;
+    let generation = fs.fs_tree().generation + 1;
+    let mut pending = HashMap::new();
+
+    // Insert 60 items with 100-byte payloads to force leaf split and root height increment to level 1
+    let num_items = 60usize;
+    let keys: Vec<Key> = (0..num_items)
+        .map(|i| Key::new(5000 + i as u64, 1, 0))
+        .collect();
+
+    for key in &keys {
+        let payload = vec![0xEEu8; 100];
+        let res = cow_tree_insert(
+            &fs,
+            &pending,
+            root_bytenr,
+            root_level,
+            owner,
+            *key,
+            payload,
+            generation,
+            &mut allocator,
+        )
+        .expect("insert item");
+        root_bytenr = res.new_root_bytenr;
+        root_level = res.new_root_level;
+        for (b, block) in res.emitted_blocks {
+            pending.insert(b, block);
+        }
+    }
+
+    assert!(root_level >= 1, "tree height must reach at least 1");
+
+    // Commit pending blocks to memory device
+    for (&bytenr, block) in &pending {
+        mem_dev.write_at(bytenr, block).expect("write block");
+    }
+
+    let fs_clean = Btrfs::mount(mem_dev.clone()).expect("mount clean fs");
+    // Verify baseline clean tree passes both TreeValidator::validate and verify_search_walk_parity
+    let rep = TreeValidator::validate(&fs_clean, root_bytenr, Some(root_level))
+        .expect("baseline validation must pass");
+    assert!(rep.total_items >= num_items, "expected at least {num_items} items, got {}", rep.total_items);
+    TreeValidator::verify_search_walk_parity(&fs_clean, root_bytenr, &keys)
+        .expect("baseline parity must pass");
+
+    // Read the root interior node
+    let root_node = fs_clean.read_node(root_bytenr).expect("read root node");
+    assert!(!root_node.is_leaf(), "root must be an interior node");
+    assert!(root_node.nr_items >= 2, "root interior must have at least 2 child entries");
+
+    // Corrupt the separator key of entry 1 (set to a key higher than any in child 1)
+    let mut interior = InteriorNode::from_node(&root_node, fs_clean.superblock().csum_type)
+        .expect("parse interior");
+    // Set separator key artificially high: Key(99999, 255, 99999)
+    interior.entries[1].key = Key::new(99999, 255, 99999);
+    let corrupted_bytes = interior
+        .emit(fs_clean.superblock().node_size)
+        .expect("emit corrupted interior node");
+    mem_dev
+        .write_at(root_bytenr, &corrupted_bytes)
+        .expect("write corrupted interior root");
+
+    let fs_corrupted = Btrfs::mount(mem_dev.clone()).expect("mount corrupted fs");
+
+    // Call verify_search_walk_parity directly (bypassing walk_node which would trip I-2 first)
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = TreeValidator::verify_search_walk_parity(&fs_corrupted, root_bytenr, &keys);
+    }));
+
+    assert!(
+        res.is_err(),
+        "verify_search_walk_parity must fail when an interior parent separator key is corrupted"
+    );
+    let err = res.expect_err("must fail");
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        String::new()
+    };
+    assert!(
+        msg.contains("Search-vs-walk parity violation"),
+        "Expected parity violation panic message, got: {msg}"
+    );
+    println!("[TEST] Parent separator corruption caught as expected by parity assertion:\n  {msg}");
+}
+
+#[test]
 fn test_tree_validator_validate_all_catches_extent_and_csum_corruption() {
     // 1. Corrupt EXTENT_TREE
     {

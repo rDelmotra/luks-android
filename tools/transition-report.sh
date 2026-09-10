@@ -3,11 +3,29 @@
 # Aggregates and reports structural B-tree transitions recorded in the transition ledger.
 #
 # Usage:
-#   tools/transition-report.sh [ledger-path]
+#   tools/transition-report.sh [--check] [ledger-path]
 #
 set -euo pipefail
 
-LEDGER="${1:-${LUKS_TRANSITION_LEDGER:-}}"
+CHECK_GATE=0
+LEDGER=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --check|--gate)
+      CHECK_GATE=1
+      ;;
+    *)
+      if [[ -z "$LEDGER" ]]; then
+        LEDGER="$arg"
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$LEDGER" ]]; then
+  LEDGER="${LUKS_TRANSITION_LEDGER:-}"
+fi
 if [[ -z "$LEDGER" ]]; then
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   LEDGER="$repo_root/target/transition-ledger.log"
@@ -29,6 +47,7 @@ height_grew=$(grep -c '^HEIGHT_GREW' "$LEDGER" || true)
 root_collapsed=$(grep -c '^ROOT_COLLAPSED' "$LEDGER" || true)
 node_removed=$(grep -c '^NODE_REMOVED' "$LEDGER" || true)
 block_reused=$(grep -c '^BLOCK_REUSED' "$LEDGER" || true)
+block_cowed=$(grep -c '^BLOCK_COWED' "$LEDGER" || true)
 converge_calls=$(grep -c '^CONVERGE' "$LEDGER" || true)
 
 max_rounds=0
@@ -54,6 +73,33 @@ echo "| Tree Height Grew (0->1, 1->2) | $height_grew | T14, T15 |"
 echo "| Tree Root Collapsed (2->1, 1->0) | $root_collapsed | T16, T17 |"
 echo "| Node Removed (emptied node pruned) | $node_removed | T10, T13 |"
 echo "| In-Txn Block Reused (is_already_new) | $block_reused | T19, T20 |"
+echo "| Block CoW'd (new allocation) | $block_cowed | GAP-5 |"
 echo "| Convergence Loop Invocations | $converge_calls | X5 |"
 echo "| Max Convergence Rounds Observed | $max_rounds (limit 30) | X6 (GAP-3) |"
 echo "================================================================="
+
+if [[ "$CHECK_GATE" -eq 1 ]]; then
+  MISSES=()
+  [[ "$shape1" -gt 0 ]] || MISSES+=("LeafSplit Shape 1 (T5)")
+  [[ "$shape2" -gt 0 ]] || MISSES+=("LeafSplit Shape 2 (T6)")
+  [[ "$pos_len" -gt 0 ]] || MISSES+=("LeafSplit Pos len (T9)")
+  [[ "$pos_mid" -gt 0 ]] || MISSES+=("LeafSplit Pos interior (T5/T6)")
+  [[ "$interior_splits" -gt 0 ]] || MISSES+=("Interior Node Splits (T12)")
+  [[ "$height_grew" -gt 0 ]] || MISSES+=("Tree Height Grew (T14/T15)")
+  [[ "$root_collapsed" -gt 0 ]] || MISSES+=("Tree Root Collapsed (T16/T17)")
+  [[ "$node_removed" -gt 0 ]] || MISSES+=("Node Removed (T10/T13)")
+  [[ "$block_reused" -gt 0 ]] || MISSES+=("In-Txn Block Reused (T19/T20)")
+  [[ "$block_cowed" -gt 0 ]] || MISSES+=("Block CoW'd (GAP-5)")
+  [[ "$converge_calls" -gt 0 ]] || MISSES+=("Convergence Loop (X5)")
+
+  if [[ ${#MISSES[@]} -gt 0 ]]; then
+    echo "TRANSITION GATE FAILED: Missed ${#MISSES[@]} required structural transition(s):" >&2
+    for m in "${MISSES[@]}"; do
+      echo "  - $m" >&2
+    done
+    exit 1
+  else
+    echo "TRANSITION GATE PASSED: All required structural transitions observed (0 misses)."
+  fi
+fi
+

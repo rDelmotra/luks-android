@@ -241,6 +241,11 @@ fn cow_descend_insert<D: ReadAt>(
             tree: owner,
             level,
         });
+    } else {
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BlockCowed {
+            tree: owner,
+            level,
+        });
     }
 
     if level == 0 || node.nr_items == 0 {
@@ -579,6 +584,11 @@ where
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
     if is_already_new {
         crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BlockReused {
+            tree: owner,
+            level,
+        });
+    } else {
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::BlockCowed {
             tree: owner,
             level,
         });

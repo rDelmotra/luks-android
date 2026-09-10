@@ -160,7 +160,7 @@ impl ShadowModel {
                 self.entries.insert(
                     child_norm.clone(),
                     EntryState::Directory {
-                        mtime_sec: entry.mtime.max(0) as u64,
+                        mtime_sec: 0,
                         mtime_nsec: 0,
                     },
                 );
@@ -268,8 +268,15 @@ impl ShadowModel {
         mtime_nsec: u32,
     ) -> Result<()> {
         let parent = normalize_path(parent);
-        match self.entries.get(&parent) {
-            Some(EntryState::Directory { .. }) => {}
+        match self.entries.get_mut(&parent) {
+            Some(EntryState::Directory {
+                mtime_sec: sec,
+                mtime_nsec: nsec,
+            }) => {
+                // In Btrfs, adding a child to a directory bumps its mtime
+                *sec = 0;
+                *nsec = 0;
+            }
             Some(_) => return Err(LuksError::NotADirectory(to_btrfs_path(&parent))),
             None => return Err(LuksError::NotFound(to_btrfs_path(&parent))),
         }
@@ -304,8 +311,15 @@ impl ShadowModel {
         mtime_nsec: u32,
     ) -> Result<()> {
         let parent = normalize_path(parent);
-        match self.entries.get(&parent) {
-            Some(EntryState::Directory { .. }) => {}
+        match self.entries.get_mut(&parent) {
+            Some(EntryState::Directory {
+                mtime_sec: sec,
+                mtime_nsec: nsec,
+            }) => {
+                // In Btrfs, adding a child to a directory bumps its mtime
+                *sec = 0;
+                *nsec = 0;
+            }
             Some(_) => return Err(LuksError::NotADirectory(to_btrfs_path(&parent))),
             None => return Err(LuksError::NotFound(to_btrfs_path(&parent))),
         }
@@ -367,8 +381,8 @@ impl ShadowModel {
         old_name: &str,
         new_parent: &str,
         new_name: &str,
-        mtime_sec: u64,
-        mtime_nsec: u32,
+        _mtime_sec: u64,
+        _mtime_nsec: u32,
     ) -> Result<()> {
         let old_parent = normalize_path(old_parent);
         let new_parent = normalize_path(new_parent);
@@ -396,34 +410,63 @@ impl ShadowModel {
             return Err(LuksError::AlreadyExists(new_path));
         }
 
+        // Btrfs bumps both old and new parent directories' mtimes on rename
+        if let Some(EntryState::Directory {
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+        }) = self.entries.get_mut(&old_parent)
+        {
+            *sec = 0;
+            *nsec = 0;
+        }
+        if let Some(EntryState::Directory {
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+        }) = self.entries.get_mut(&new_parent)
+        {
+            *sec = 0;
+            *nsec = 0;
+        }
+
         let entry = self.entries.remove(&old_path).expect("checked");
         match entry {
-            EntryState::File { data, .. } => {
+            EntryState::File {
+                data,
+                mtime_sec: orig_sec,
+                mtime_nsec: orig_nsec,
+            } => {
                 self.entries.insert(
                     new_path,
                     EntryState::File {
                         data,
-                        mtime_sec,
-                        mtime_nsec,
+                        mtime_sec: orig_sec,
+                        mtime_nsec: orig_nsec,
                     },
                 );
             }
-            EntryState::Symlink { target, .. } => {
+            EntryState::Symlink {
+                target,
+                mtime_sec: orig_sec,
+                mtime_nsec: orig_nsec,
+            } => {
                 self.entries.insert(
                     new_path,
                     EntryState::Symlink {
                         target,
-                        mtime_sec,
-                        mtime_nsec,
+                        mtime_sec: orig_sec,
+                        mtime_nsec: orig_nsec,
                     },
                 );
             }
-            EntryState::Directory { .. } => {
+            EntryState::Directory {
+                mtime_sec: orig_sec,
+                mtime_nsec: orig_nsec,
+            } => {
                 self.entries.insert(
                     new_path.clone(),
                     EntryState::Directory {
-                        mtime_sec,
-                        mtime_nsec,
+                        mtime_sec: orig_sec,
+                        mtime_nsec: orig_nsec,
                     },
                 );
                 // Move all descendants
@@ -459,6 +502,18 @@ impl ShadowModel {
         }
         if !self.entries.contains_key(&path) {
             return Err(LuksError::NotFound(to_btrfs_path(&path)));
+        }
+
+        // Btrfs bumps parent directory mtime on deletion
+        let (parent, _) = split_parent_name(&path);
+        let parent_norm = normalize_path(parent);
+        if let Some(EntryState::Directory {
+            mtime_sec: sec,
+            mtime_nsec: nsec,
+        }) = self.entries.get_mut(&parent_norm)
+        {
+            *sec = 0;
+            *nsec = 0;
         }
 
         let is_dir = self.entries.get(&path).is_some_and(|e| e.is_dir());
@@ -552,6 +607,17 @@ impl ShadowModel {
                         "symlink target mismatch for '{norm_path}'"
                     );
                 }
+            }
+
+            // Verify modification timestamp (mtime) if recorded in model
+            let (mtime_sec, _) = entry.mtime();
+            if mtime_sec != 0 {
+                let info = fs.file_info(&btrfs_path)?;
+                assert_eq!(
+                    info.mtime, mtime_sec as i64,
+                    "mtime mismatch for '{norm_path}': model has {mtime_sec}, fs has {}",
+                    info.mtime
+                );
             }
         }
 
@@ -900,11 +966,8 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
     model: &mut ShadowModel,
     mem_device: &D,
 ) -> Result<StepReport> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let now_sec = now.as_secs();
-    let now_nsec = now.subsec_nanos();
+    let now_sec = 1_700_000_000 + step as u64;
+    let now_nsec = ((step as u32).wrapping_mul(1_000_003)) % 1_000_000_000;
 
     let mut skipped_full = false;
     let mut is_remount = false;
@@ -914,6 +977,12 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
             let btrfs_parent = to_btrfs_path(parent);
             match fs.create_file_with_data(&btrfs_parent, name, data) {
                 Ok(_) => {
+                    let child_path = if parent.is_empty() {
+                        format!("/{name}")
+                    } else {
+                        format!("/{parent}/{name}")
+                    };
+                    fs.set_mtime(&child_path, now_sec, now_nsec)?;
                     model.create_file(parent, name, data.clone(), now_sec, now_nsec)?;
                 }
                 Err(LuksError::FilesystemFull) => {
@@ -947,6 +1016,12 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
 
             match stream_res() {
                 Ok(()) => {
+                    let child_path = if parent.is_empty() {
+                        format!("/{name}")
+                    } else {
+                        format!("/{parent}/{name}")
+                    };
+                    fs.set_mtime(&child_path, now_sec, now_nsec)?;
                     model.create_file(parent, name, data.clone(), now_sec, now_nsec)?;
                 }
                 Err(LuksError::FilesystemFull) => {
@@ -959,7 +1034,7 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
             let btrfs_parent = to_btrfs_path(parent);
             match fs.create_directory(&btrfs_parent, name) {
                 Ok(_) => {
-                    model.create_directory(parent, name, now_sec, now_nsec)?;
+                    model.create_directory(parent, name, 0, 0)?;
                 }
                 Err(LuksError::FilesystemFull) => {
                     skipped_full = true;
@@ -1027,6 +1102,107 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
     let all_trees = TreeValidator::validate_all(fs).unwrap_or_else(|e| {
         panic!("[CONFORMANCE TIER A FAILURE] Step {step} op {op:?} violated tree invariants: {e}");
     });
+
+    // Immediate touched-path verification against model
+    if !skipped_full {
+        match op {
+            DriverOp::CreateFileWithData { parent, name, data }
+            | DriverOp::StreamFile {
+                parent, name, data, ..
+            } => {
+                let norm = if parent.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{parent}/{name}")
+                };
+                let btrfs_p = to_btrfs_path(&norm);
+                let read_back = fs.read_file(&btrfs_p).unwrap_or_else(|e| {
+                    panic!("[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' read failed: {e}");
+                });
+                assert_eq!(
+                    &read_back, data,
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' content mismatch"
+                );
+                let info = fs.file_info(&btrfs_p).unwrap_or_else(|e| {
+                    panic!("[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' file_info failed: {e}");
+                });
+                assert_eq!(
+                    info.mtime, now_sec as i64,
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' mtime mismatch"
+                );
+            }
+            DriverOp::CreateDirectory { parent, name } => {
+                let norm = if parent.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{parent}/{name}")
+                };
+                let btrfs_p = to_btrfs_path(&norm);
+                let info = fs.file_info(&btrfs_p).unwrap_or_else(|e| {
+                    panic!("[CONFORMANCE TIER A FAILURE] Step {step}: directory '{norm}' file_info failed: {e}");
+                });
+                assert!(
+                    info.file_type.is_dir(),
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: '{norm}' is not a directory"
+                );
+            }
+            DriverOp::Rename {
+                old_parent,
+                old_name,
+                new_parent,
+                new_name,
+            } => {
+                let old_norm = if old_parent.is_empty() {
+                    old_name.clone()
+                } else {
+                    format!("{old_parent}/{old_name}")
+                };
+                let new_norm = if new_parent.is_empty() {
+                    new_name.clone()
+                } else {
+                    format!("{new_parent}/{new_name}")
+                };
+                let btrfs_old = to_btrfs_path(&old_norm);
+                let btrfs_new = to_btrfs_path(&new_norm);
+                assert!(
+                    fs.file_info(&btrfs_old).is_err(),
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: old renamed path '{old_norm}' still exists"
+                );
+                let info = fs.file_info(&btrfs_new).unwrap_or_else(|e| {
+                    panic!("[CONFORMANCE TIER A FAILURE] Step {step}: new renamed path '{new_norm}' file_info failed: {e}");
+                });
+                if let Some(entry) = model.get_entry(&new_norm) {
+                    let (msec, _) = entry.mtime();
+                    if msec != 0 {
+                        assert_eq!(
+                            info.mtime, msec as i64,
+                            "[CONFORMANCE TIER A FAILURE] Step {step}: renamed '{new_norm}' mtime mismatch"
+                        );
+                    }
+                }
+            }
+            DriverOp::Delete { path } => {
+                let btrfs_p = to_btrfs_path(path);
+                assert!(
+                    fs.file_info(&btrfs_p).is_err(),
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: deleted path '{path}' still exists"
+                );
+            }
+            DriverOp::SetMtime {
+                path, mtime_sec, ..
+            } => {
+                let btrfs_p = to_btrfs_path(path);
+                let info = fs.file_info(&btrfs_p).unwrap_or_else(|e| {
+                    panic!("[CONFORMANCE TIER A FAILURE] Step {step}: file_info for '{path}' failed: {e}");
+                });
+                assert_eq!(
+                    info.mtime, *mtime_sec as i64,
+                    "[CONFORMANCE TIER A FAILURE] Step {step}: '{path}' mtime was not updated to {mtime_sec}"
+                );
+            }
+            DriverOp::CommitAndRemount => {}
+        }
+    }
 
     let mut acct_report = None;
 

@@ -67,6 +67,7 @@ pub enum BtrfsEvent {
     RootCollapsed { tree: u64, from: u8, to: u8 },
     NodeRemoved { tree: u64, level: u8 },
     BlockReused { tree: u64, level: u8 },
+    BlockCowed { tree: u64, level: u8 },
     ConvergeRounds { rounds: u32 },
 }
 
@@ -178,6 +179,7 @@ static STRUCTURAL_HEIGHT_GREW: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_ROOT_COLLAPSED: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_NODE_REMOVED: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_BLOCK_REUSED: AtomicU64 = AtomicU64::new(0);
+static STRUCTURAL_BLOCK_COWED: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_CONVERGE_CALLS: AtomicU64 = AtomicU64::new(0);
 static STRUCTURAL_MAX_CONVERGE_ROUNDS: AtomicU32 = AtomicU32::new(0);
 
@@ -194,6 +196,7 @@ pub struct StructuralTransitionCounts {
     pub root_collapsed: u64,
     pub node_removed: u64,
     pub block_reused: u64,
+    pub block_cowed: u64,
     pub converge_total_calls: u64,
     pub max_converge_rounds: u32,
 }
@@ -209,6 +212,9 @@ fn transition_ledger_path() -> Option<&'static std::path::Path> {
 fn ledger_record_transition(line: &str) {
     if let Some(path) = transition_ledger_path() {
         use std::io::Write;
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = f.write_all(format!("{line}\n").as_bytes());
         }
@@ -252,6 +258,10 @@ fn update_structural_counts(event: &BtrfsEvent) {
             ledger_record_transition(&format!("BLOCK_REUSED tree={tree} level={level}"));
             STRUCTURAL_BLOCK_REUSED.fetch_add(1, Ordering::Relaxed);
         }
+        BtrfsEvent::BlockCowed { tree, level } => {
+            ledger_record_transition(&format!("BLOCK_COWED tree={tree} level={level}"));
+            STRUCTURAL_BLOCK_COWED.fetch_add(1, Ordering::Relaxed);
+        }
         BtrfsEvent::ConvergeRounds { rounds } => {
             ledger_record_transition(&format!("CONVERGE rounds={rounds}"));
             STRUCTURAL_CONVERGE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -281,6 +291,7 @@ pub fn get_structural_counts() -> StructuralTransitionCounts {
         root_collapsed: STRUCTURAL_ROOT_COLLAPSED.load(Ordering::Relaxed),
         node_removed: STRUCTURAL_NODE_REMOVED.load(Ordering::Relaxed),
         block_reused: STRUCTURAL_BLOCK_REUSED.load(Ordering::Relaxed),
+        block_cowed: STRUCTURAL_BLOCK_COWED.load(Ordering::Relaxed),
         converge_total_calls: STRUCTURAL_CONVERGE_CALLS.load(Ordering::Relaxed),
         max_converge_rounds: STRUCTURAL_MAX_CONVERGE_ROUNDS.load(Ordering::Relaxed),
     }
@@ -299,6 +310,7 @@ pub fn reset_structural_counts() {
     STRUCTURAL_ROOT_COLLAPSED.store(0, Ordering::Relaxed);
     STRUCTURAL_NODE_REMOVED.store(0, Ordering::Relaxed);
     STRUCTURAL_BLOCK_REUSED.store(0, Ordering::Relaxed);
+    STRUCTURAL_BLOCK_COWED.store(0, Ordering::Relaxed);
     STRUCTURAL_CONVERGE_CALLS.store(0, Ordering::Relaxed);
     STRUCTURAL_MAX_CONVERGE_ROUNDS.store(0, Ordering::Relaxed);
 }
@@ -320,6 +332,7 @@ pub fn dump_structural_counts_summary() -> String {
          | Tree Root Collapsed (e.g. 2->1, 1->0) | {} |\n\
          | Node Removed (emptied leaf/interior) | {} |\n\
          | In-Txn Block Reused (is_already_new) | {} |\n\
+         | Block CoW'd (new allocation) | {} |\n\
          | Convergence Loop Calls | {} |\n\
          | Max Observed Convergence Rounds (GAP-3) | {} |\n",
         c.leaf_split_shape_1,
@@ -333,6 +346,7 @@ pub fn dump_structural_counts_summary() -> String {
         c.root_collapsed,
         c.node_removed,
         c.block_reused,
+        c.block_cowed,
         c.converge_total_calls,
         c.max_converge_rounds
     )
@@ -504,6 +518,9 @@ pub fn dump_text() -> String {
                 }
                 BtrfsEvent::BlockReused { tree, level } => {
                     out.push_str(&format!("BTRFS block_reused tree={tree} level={level}\n"));
+                }
+                BtrfsEvent::BlockCowed { tree, level } => {
+                    out.push_str(&format!("BTRFS block_cowed tree={tree} level={level}\n"));
                 }
                 BtrfsEvent::ConvergeRounds { rounds } => {
                     out.push_str(&format!("BTRFS converge_rounds rounds={rounds}\n"));
