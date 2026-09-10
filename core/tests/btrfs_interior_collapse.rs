@@ -83,15 +83,15 @@ fn test_conformance_interior_growth_and_shrink() {
         );
     }
     if verdict_create.was_graded() {
-        luks_core::forensic::record_kernel_graded("shape1");
-        luks_core::forensic::record_kernel_graded("shape2");
-        luks_core::forensic::record_kernel_graded("pos_len");
-        luks_core::forensic::record_kernel_graded("pos_mid");
-        luks_core::forensic::record_kernel_graded("interior_splits");
-        luks_core::forensic::record_kernel_graded("height_grew");
-        luks_core::forensic::record_kernel_graded("block_reused");
-        luks_core::forensic::record_kernel_graded("block_cowed");
-        luks_core::forensic::record_kernel_graded("converge_calls");
+        if counts_after_create.leaf_split_shape_1 > 0 { luks_core::forensic::record_kernel_graded("shape1"); }
+        if counts_after_create.leaf_split_shape_2 > 0 { luks_core::forensic::record_kernel_graded("shape2"); }
+        if counts_after_create.leaf_split_pos_len > 0 { luks_core::forensic::record_kernel_graded("pos_len"); }
+        if counts_after_create.leaf_split_pos_mid > 0 { luks_core::forensic::record_kernel_graded("pos_mid"); }
+        if counts_after_create.interior_splits > 0 { luks_core::forensic::record_kernel_graded("interior_splits"); }
+        if counts_after_create.height_grew > 0 { luks_core::forensic::record_kernel_graded("height_grew"); }
+        if counts_after_create.block_reused > 0 { luks_core::forensic::record_kernel_graded("block_reused"); }
+        if counts_after_create.block_cowed > 0 { luks_core::forensic::record_kernel_graded("block_cowed"); }
+        if counts_after_create.converge_total_calls > 0 { luks_core::forensic::record_kernel_graded("converge_calls"); }
     }
 
     // 2. Mass delete workload: delete ~90% (1,800 files)
@@ -178,8 +178,12 @@ fn test_conformance_interior_growth_and_shrink() {
         );
     }
     if verdict_collapse.was_graded() {
-        luks_core::forensic::record_kernel_graded("node_removed");
-        luks_core::forensic::record_kernel_graded("root_collapsed");
+        if final_counts.node_removed > counts_after_create.node_removed {
+            luks_core::forensic::record_kernel_graded("node_removed");
+        }
+        if final_counts.root_collapsed > counts_after_create.root_collapsed {
+            luks_core::forensic::record_kernel_graded("root_collapsed");
+        }
     }
 
     println!("[TEST] test_conformance_interior_growth_and_shrink successfully completed.");

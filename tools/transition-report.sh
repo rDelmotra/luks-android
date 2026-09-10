@@ -27,12 +27,12 @@ if [[ -z "$LEDGER" ]]; then
   LEDGER="${LUKS_TRANSITION_LEDGER:-}"
 fi
 if [[ -z "$LEDGER" ]]; then
-  repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  LEDGER="$repo_root/target/transition-ledger.log"
+  echo "TRANSITION REPORT: no transition ledger specified. Pass a ledger path or set LUKS_TRANSITION_LEDGER." >&2
+  exit 1
 fi
 
 if [[ ! -f "$LEDGER" ]]; then
-  echo "TRANSITION REPORT: no transition ledger found at $LEDGER"
+  echo "TRANSITION REPORT: no transition ledger found at $LEDGER" >&2
   exit 1
 fi
 

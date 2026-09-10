@@ -209,13 +209,7 @@ fn transition_ledger_path() -> Option<&'static std::path::Path> {
             let p = std::env::var("LUKS_TRANSITION_LEDGER")
                 .ok()
                 .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::current_exe().ok().and_then(|exe| {
-                        let target = exe.parent()?.parent()?.parent()?;
-                        Some(target.join("transition-ledger.log"))
-                    })
-                });
+                .map(std::path::PathBuf::from);
             if let Some(ref path) = p {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);
