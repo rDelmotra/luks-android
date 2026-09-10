@@ -69,11 +69,6 @@ for arg in "$@"; do
     esac
 done
 
-if [ "$RUN_FAST" -eq 0 ] && [ "$RUN_STRESS" -eq 0 ] && [ "$RUN_INTEGRATION" -eq 0 ] && \
-   [ "$RUN_ORACLE" -eq 0 ] && [ "$RUN_STRICT" -eq 0 ] && [ "$RUN_ANDROID" -eq 0 ] && \
-   [ "$RUN_TRANSITIONS" -eq 1 ]; then
-    RUN_TRANS_ONLY=1
-fi
 
 if [ "$RUN_STRICT" -eq 1 ]; then
     # Strict mode implies running all core tiers under strict oracle controls
@@ -109,6 +104,7 @@ JSON_REPORT="$REPORTS_DIR/summary.json"
 TIER_RESULTS=()
 TIER_DURATIONS=()
 OVERALL_STATUS=0
+TIER_2_RAN=0
 
 log_tier() {
     local name="$1"
@@ -153,9 +149,11 @@ if [ "$RUN_STRESS" -eq 1 ]; then
     echo "==> TIER 2: B-Tree Permutations & Property Stress Suite"
     echo "================================================================="
     t_start=$(date +%s)
+    TIER_2_RAN=1
 
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
-        --test btrfs_conformance
+        --test btrfs_conformance \
+        --test btrfs_interior_collapse
 
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
         --test btrfs_btree_permutations -- \
@@ -289,9 +287,10 @@ if [ "$RUN_TRANSITIONS" -eq 1 ]; then
     echo "================================================================="
     t_start=$(date +%s)
 
-    if [ "${RUN_TRANS_ONLY:-0}" -eq 1 ]; then
+    if [ "$TIER_2_RAN" -eq 0 ]; then
         cargo test --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support \
             --test btrfs_conformance \
+            --test btrfs_interior_collapse \
             --test btrfs_btree_permutations \
             --test btrfs_data_write
     fi
@@ -324,7 +323,11 @@ echo "================================================================="
 echo "==> AUTONOMOUS TEST HARNESS SUMMARY ($RUN_ID)"
 echo "================================================================="
 for result in "${TIER_RESULTS[@]}"; do
-    echo "  [✓] $result"
+    if [[ "$result" == *"FAIL"* ]]; then
+        echo "  [✗] $result"
+    else
+        echo "  [✓] $result"
+    fi
 done
 
 # Write JSON report

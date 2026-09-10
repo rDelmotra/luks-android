@@ -24,8 +24,10 @@
 //!    yields the exact reverse sequence of traversal backward with
 //!    `Cursor::retreat`, and both match the keys collected from leaf inspection.
 //! 8. **Search-vs-Walk Parity**: Every key discovered during the recursive
-//!    structural walk is asserted to be findable via `Cursor::search`, proving
-//!    parent separator routing and `fixup_low_keys` accuracy.
+//!    structural walk is asserted to be findable via `Cursor::search`, catching
+//!    gross misrouting and exercising `child_for` / `lower_bound`. (Note: I-2
+//!    remains the only guard on exact parent-key accuracy, as `advance_leaf`
+//!    can mask a separator key too high by one key).
 //!
 //! Multi-tree validation across all five standard trees (`FS_TREE`, `ROOT_TREE`,
 //! `EXTENT_TREE`, `CSUM_TREE`, and `DEV_TREE`) is provided by `TreeValidator::validate_all`.
@@ -435,7 +437,9 @@ impl TreeValidator {
     ///
     /// This proves search-vs-walk parity: every item reachable via pointer-following
     /// traversal is also correctly indexable and reachable via logarithmic binary-search
-    /// routing from the root, guaranteeing parent separator key (`fixup_low_keys`) integrity.
+    /// routing from the root, catching gross misrouting and exercising `child_for` / `lower_bound`.
+    /// Note: I-2 remains the only guard on exact parent-key accuracy, since `Cursor::search`
+    /// calls `advance_leaf` when landing past a leaf's end which masks a parent key too high by 1.
     pub fn verify_search_walk_parity<D: ReadAt>(
         fs: &Btrfs<D>,
         root_bytenr: u64,

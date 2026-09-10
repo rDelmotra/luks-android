@@ -205,16 +205,21 @@ static TRANSITION_LEDGER_PATH: std::sync::OnceLock<Option<std::path::PathBuf>> =
 
 fn transition_ledger_path() -> Option<&'static std::path::Path> {
     TRANSITION_LEDGER_PATH
-        .get_or_init(|| std::env::var("LUKS_TRANSITION_LEDGER").ok().map(std::path::PathBuf::from))
+        .get_or_init(|| {
+            let p = std::env::var("LUKS_TRANSITION_LEDGER").ok().map(std::path::PathBuf::from);
+            if let Some(ref path) = p {
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            p
+        })
         .as_deref()
 }
 
 fn ledger_record_transition(line: &str) {
     if let Some(path) = transition_ledger_path() {
         use std::io::Write;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = f.write_all(format!("{line}\n").as_bytes());
         }

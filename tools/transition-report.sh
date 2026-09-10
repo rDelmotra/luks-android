@@ -99,6 +99,16 @@ if [[ "$CHECK_GATE" -eq 1 ]]; then
     done
     exit 1
   else
+    echo "EXCLUDED (measured unreachable, see notes/plan-structural-conformance-2026-09-08.md):"
+    echo "  - LeafSplit Shape 3 (T7) — driver cannot produce; only EXTENT_CSUM items are large"
+    echo "    enough, and large csum items require large contiguous extents the allocator appends"
+    echo "  - LeafSplit Pos 0 (T8) — never observed since Phase 0"
+    if [[ "$shape3" -gt 0 ]]; then
+      echo "NOTE: LeafSplit Shape 3 (T7) was observed ($shape3 times)!"
+    fi
+    if [[ "$pos0" -gt 0 ]]; then
+      echo "NOTE: LeafSplit Pos 0 (T8) was observed ($pos0 times)!"
+    fi
     echo "TRANSITION GATE PASSED: All required structural transitions observed (0 misses)."
   fi
 fi

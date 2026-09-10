@@ -51,11 +51,24 @@ fn test_shadow_model_basic_lifecycle() {
 
     // b. Create file with data
     let test_data = b"Hello Conformance World! 1234567890".to_vec();
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     fs.create_file_with_data("/conf_dir", "hello.txt", &test_data)
         .expect("create file");
-    fs.set_mtime("/conf_dir/hello.txt", 1_700_000_001, 0).expect("set mtime");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let info = fs.file_info("/conf_dir/hello.txt").expect("file info hello.txt");
+    assert!(
+        info.mtime >= before - 2 && info.mtime <= after + 2,
+        "create_file_with_data wrote bogus mtime: {}, expected [{}, {}]",
+        info.mtime, before - 2, after + 2
+    );
     model
-        .create_file("conf_dir", "hello.txt", test_data.clone(), 1_700_000_001, 0)
+        .create_file("conf_dir", "hello.txt", test_data.clone(), info.mtime as u64, 0)
         .expect("model create file");
     model.verify_against_fs(&fs).expect("verify after create file");
 
@@ -372,120 +385,3 @@ fn test_conformance_long_names_and_csum_split() {
     );
 }
 
-#[test]
-fn test_conformance_interior_growth_and_shrink() {
-    let dev = MemoryDevice::from_fixture("btrfs/nonmixed-4k.img");
-    let mut fs = Btrfs::mount(dev.clone()).expect("mount nonmixed-4k");
-    let mut model = ShadowModel::from_fs(&fs).expect("init model from nonmixed-4k");
-
-    // 1. High fanout workload: create one directory and 2,000 files with 180-byte names
-    fs.create_directory("/", "scale_dir").expect("create scale_dir");
-    model
-        .create_directory("", "scale_dir", 0, 0)
-        .expect("model create scale_dir");
-
-    luks_core::forensic::reset_structural_counts();
-
-    const TOTAL_FILES: usize = 2000;
-    println!("[TEST] Creating {TOTAL_FILES} files with 180-byte names in /scale_dir...");
-    for i in 0..TOTAL_FILES {
-        let name = format!("file_{i:04}_{}", "a".repeat(170));
-        fs.create_file("/scale_dir", &name)
-            .unwrap_or_else(|e| panic!("create_file failed at #{i}: {e:?}"));
-        model
-            .create_file("scale_dir", &name, Vec::new(), 0, 0)
-            .expect("model create file");
-    }
-
-    let counts_after_create = luks_core::forensic::get_structural_counts();
-    println!(
-        "[5a] Counts after {TOTAL_FILES} creates:\n{}",
-        luks_core::forensic::dump_structural_counts_summary()
-    );
-
-    assert!(
-        counts_after_create.interior_splits > 0,
-        "expected interior splits > 0, got {}",
-        counts_after_create.interior_splits
-    );
-    assert!(
-        counts_after_create.height_grew >= 2,
-        "expected height grew >= 2, got {}",
-        counts_after_create.height_grew
-    );
-
-    let tree_val = TreeValidator::validate_all(&fs).expect("validate all trees after 2000 creates");
-    assert!(
-        tree_val.fs_tree.tree_height >= 2,
-        "FS tree height must reach at least 2, got {}",
-        tree_val.fs_tree.tree_height
-    );
-
-    // 2. Mass delete workload: delete ~90% (1,800 files)
-    const DELETE_COUNT: usize = 1800;
-    println!("[TEST] Deleting {DELETE_COUNT} files from /scale_dir...");
-    for i in 0..DELETE_COUNT {
-        let name = format!("file_{i:04}_{}", "a".repeat(170));
-        let path = format!("/scale_dir/{name}");
-        fs.delete_file(&path)
-            .unwrap_or_else(|e| panic!("delete_file failed at #{i}: {e:?}"));
-        model
-            .delete(&format!("scale_dir/{name}"))
-            .expect("model delete file");
-    }
-
-    let counts_after_delete = luks_core::forensic::get_structural_counts();
-    println!(
-        "[5a] Counts after {DELETE_COUNT} deletes (fs_tree level={}):\n{}",
-        fs.fs_tree().level,
-        luks_core::forensic::dump_structural_counts_summary()
-    );
-    assert!(
-        counts_after_delete.node_removed > 0,
-        "expected node removed > 0 after 1800 deletes, got {}",
-        counts_after_delete.node_removed
-    );
-
-    println!("[TEST] Continuing delete of all remaining files from {DELETE_COUNT} to {TOTAL_FILES}...");
-    for i in DELETE_COUNT..TOTAL_FILES {
-        let name = format!("file_{i:04}_{}", "a".repeat(170));
-        let path = format!("/scale_dir/{name}");
-        fs.delete_file(&path)
-            .unwrap_or_else(|e| panic!("delete_file failed at #{i}: {e:?}"));
-        model
-            .delete(&format!("scale_dir/{name}"))
-            .expect("model delete file");
-    }
-
-    // Delete the empty scale_dir directory itself
-    fs.delete_file("/scale_dir").expect("delete /scale_dir");
-    model.delete("scale_dir").expect("model delete scale_dir");
-
-    let final_counts = luks_core::forensic::get_structural_counts();
-    println!(
-        "[5a] Counts after all deletes (fs_tree level={}):\n{}",
-        fs.fs_tree().level,
-        luks_core::forensic::dump_structural_counts_summary()
-    );
-
-    assert!(
-        final_counts.node_removed > 0,
-        "expected node removed > 0, got {}",
-        final_counts.node_removed
-    );
-    assert!(
-        final_counts.root_collapsed > 0,
-        "expected root collapsed > 0, got {}",
-        final_counts.root_collapsed
-    );
-
-    // 3. Remount and verify model, trees, and accounting
-    fs.commit_active_batch().expect("commit active batch");
-    let final_fs = Btrfs::mount(dev.clone()).expect("remount fs");
-    model
-        .verify_against_fs(&final_fs)
-        .expect("final shadow model verify");
-    TreeValidator::validate_all(&final_fs).expect("final tree validate");
-    AccountingOracle::assert_clean(&final_fs);
-    println!("[TEST] test_conformance_interior_growth_and_shrink successfully completed.");
-}

@@ -121,7 +121,15 @@ fn create_file_in_root_directory_on_plain_img() {
     let original_sb_gen = fs.superblock().generation;
 
     // 2. Create a new empty file in root directory
+    let before_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     fs.create_file("/", "newfile.txt").expect("create newfile.txt in /");
+    let after_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
 
     assert_eq!(fs.superblock().generation, original_sb_gen + 1);
 
@@ -135,6 +143,11 @@ fn create_file_in_root_directory_on_plain_img() {
     assert_eq!(info.size, 0);
     assert_eq!(info.links, 1);
     assert!(info.file_type.is_file());
+    assert!(
+        info.mtime >= before_sec - 1 && info.mtime <= after_sec + 1,
+        "create_file wrote bogus mtime: {}, expected [{}, {}]",
+        info.mtime, before_sec - 1, after_sec + 1
+    );
 
     AccountingOracle::assert_clean(&fs);
     drop(fs);
@@ -153,6 +166,11 @@ fn create_file_in_root_directory_on_plain_img() {
     assert_eq!(info_ro.size, 0);
     assert_eq!(info_ro.links, 1);
     assert!(info_ro.file_type.is_file());
+    assert_eq!(
+        info_ro.mtime, info.mtime,
+        "mtime not preserved across remount: before remount {}, after remount {}",
+        info.mtime, info_ro.mtime
+    );
 
     AccountingOracle::assert_clean(&fs_ro);
     drop(fs_ro);

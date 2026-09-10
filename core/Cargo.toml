@@ -152,6 +152,10 @@ name = "btrfs_finish_file_csum"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_interior_collapse"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_large_file_chunk_alloc"
 required-features = ["dangerous-write-support"]
 

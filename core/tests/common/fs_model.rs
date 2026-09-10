@@ -8,6 +8,19 @@
 //! 3. `DriverOp`: High-level filesystem operations issued through public driver APIs.
 //! 4. `OpGenerator`: Weighted grammar-based operation sequence generator stressing
 //!    B-tree leaf splits, `DIR_ITEM` capacity, and checksum item boundaries.
+//!
+//! # Modification Timestamp (mtime) Verification Semantics
+//!
+//! File modification timestamps (`mtime`) are modelled via read-back modelling:
+//! - Upon file creation or write, the driver's own assigned timestamp is read back
+//!   via `file_info` and stored in the `ShadowModel`.
+//! - File mtimes are asserted to remain stable across subsequent unrelated mutations,
+//!   preserved across file renames, and preserved across unmount/remount cycles.
+//! - Direct `SetMtime` operations are checked against the requested values.
+//! - Directory mtimes are explicitly **unverified** by the shadow model: in Btrfs,
+//!   any child creation, rename, or deletion bumps the parent directory's mtime.
+//!   The shadow model does not track directory timestamp progression.
+//!
 
 #![allow(dead_code)]
 #![cfg(feature = "dangerous-write-support")]
@@ -268,15 +281,8 @@ impl ShadowModel {
         mtime_nsec: u32,
     ) -> Result<()> {
         let parent = normalize_path(parent);
-        match self.entries.get_mut(&parent) {
-            Some(EntryState::Directory {
-                mtime_sec: sec,
-                mtime_nsec: nsec,
-            }) => {
-                // In Btrfs, adding a child to a directory bumps its mtime
-                *sec = 0;
-                *nsec = 0;
-            }
+        match self.entries.get(&parent) {
+            Some(EntryState::Directory { .. }) => {}
             Some(_) => return Err(LuksError::NotADirectory(to_btrfs_path(&parent))),
             None => return Err(LuksError::NotFound(to_btrfs_path(&parent))),
         }
@@ -311,15 +317,8 @@ impl ShadowModel {
         mtime_nsec: u32,
     ) -> Result<()> {
         let parent = normalize_path(parent);
-        match self.entries.get_mut(&parent) {
-            Some(EntryState::Directory {
-                mtime_sec: sec,
-                mtime_nsec: nsec,
-            }) => {
-                // In Btrfs, adding a child to a directory bumps its mtime
-                *sec = 0;
-                *nsec = 0;
-            }
+        match self.entries.get(&parent) {
+            Some(EntryState::Directory { .. }) => {}
             Some(_) => return Err(LuksError::NotADirectory(to_btrfs_path(&parent))),
             None => return Err(LuksError::NotFound(to_btrfs_path(&parent))),
         }
@@ -410,24 +409,6 @@ impl ShadowModel {
             return Err(LuksError::AlreadyExists(new_path));
         }
 
-        // Btrfs bumps both old and new parent directories' mtimes on rename
-        if let Some(EntryState::Directory {
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-        }) = self.entries.get_mut(&old_parent)
-        {
-            *sec = 0;
-            *nsec = 0;
-        }
-        if let Some(EntryState::Directory {
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-        }) = self.entries.get_mut(&new_parent)
-        {
-            *sec = 0;
-            *nsec = 0;
-        }
-
         let entry = self.entries.remove(&old_path).expect("checked");
         match entry {
             EntryState::File {
@@ -502,18 +483,6 @@ impl ShadowModel {
         }
         if !self.entries.contains_key(&path) {
             return Err(LuksError::NotFound(to_btrfs_path(&path)));
-        }
-
-        // Btrfs bumps parent directory mtime on deletion
-        let (parent, _) = split_parent_name(&path);
-        let parent_norm = normalize_path(parent);
-        if let Some(EntryState::Directory {
-            mtime_sec: sec,
-            mtime_nsec: nsec,
-        }) = self.entries.get_mut(&parent_norm)
-        {
-            *sec = 0;
-            *nsec = 0;
         }
 
         let is_dir = self.entries.get(&path).is_some_and(|e| e.is_dir());
@@ -609,13 +578,12 @@ impl ShadowModel {
                 }
             }
 
-            // Verify modification timestamp (mtime) if recorded in model
-            let (mtime_sec, _) = entry.mtime();
-            if mtime_sec != 0 {
+            // Verify modification timestamp (mtime) for files
+            if let EntryState::File { mtime_sec, .. } = entry {
                 let info = fs.file_info(&btrfs_path)?;
                 assert_eq!(
-                    info.mtime, mtime_sec as i64,
-                    "mtime mismatch for '{norm_path}': model has {mtime_sec}, fs has {}",
+                    info.mtime, *mtime_sec as i64,
+                    "mtime mismatch for file '{norm_path}': model has {mtime_sec}, fs has {}",
                     info.mtime
                 );
             }
@@ -873,14 +841,14 @@ impl OpGenerator {
             DriverOp::Delete {
                 path: entries[idx].clone(),
             }
-        } else if roll <= 95 && !model.all_entries().is_empty() {
+        } else if roll <= 95 && !model.all_files().is_empty() {
             // SetMtime
-            let entries = model.all_entries();
-            let idx = self.rng.gen_range(0, entries.len() - 1);
+            let files = model.all_files();
+            let idx = self.rng.gen_range(0, files.len() - 1);
             let mtime_sec = 1_700_000_000 + self.rng.gen_range(1, 1_000_000) as u64;
             let mtime_nsec = self.rng.gen_range(0, 999_999_999) as u32;
             DriverOp::SetMtime {
-                path: entries[idx].clone(),
+                path: files[idx].clone(),
                 mtime_sec,
                 mtime_nsec,
             }
@@ -975,6 +943,10 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
     match op {
         DriverOp::CreateFileWithData { parent, name, data } => {
             let btrfs_parent = to_btrfs_path(parent);
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             match fs.create_file_with_data(&btrfs_parent, name, data) {
                 Ok(_) => {
                     let child_path = if parent.is_empty() {
@@ -982,8 +954,17 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                     } else {
                         format!("/{parent}/{name}")
                     };
-                    fs.set_mtime(&child_path, now_sec, now_nsec)?;
-                    model.create_file(parent, name, data.clone(), now_sec, now_nsec)?;
+                    let after = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let info = fs.file_info(&child_path)?;
+                    assert!(
+                        info.mtime >= before - 2 && info.mtime <= after + 2,
+                        "create_file_with_data wrote bogus mtime: {}, expected [{}, {}]",
+                        info.mtime, before - 2, after + 2
+                    );
+                    model.create_file(parent, name, data.clone(), info.mtime as u64, 0)?;
                 }
                 Err(LuksError::FilesystemFull) => {
                     skipped_full = true;
@@ -1014,6 +995,10 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                 Ok(())
             };
 
+            let before = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
             match stream_res() {
                 Ok(()) => {
                     let child_path = if parent.is_empty() {
@@ -1021,8 +1006,17 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                     } else {
                         format!("/{parent}/{name}")
                     };
-                    fs.set_mtime(&child_path, now_sec, now_nsec)?;
-                    model.create_file(parent, name, data.clone(), now_sec, now_nsec)?;
+                    let after = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let info = fs.file_info(&child_path)?;
+                    assert!(
+                        info.mtime >= before - 2 && info.mtime <= after + 2,
+                        "stream file wrote bogus mtime: {}, expected [{}, {}]",
+                        info.mtime, before - 2, after + 2
+                    );
+                    model.create_file(parent, name, data.clone(), info.mtime as u64, 0)?;
                 }
                 Err(LuksError::FilesystemFull) => {
                     skipped_full = true;
@@ -1126,8 +1120,15 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                 let info = fs.file_info(&btrfs_p).unwrap_or_else(|e| {
                     panic!("[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' file_info failed: {e}");
                 });
+                let expected_mtime = model
+                    .get_entry(&norm)
+                    .and_then(|e| match e {
+                        EntryState::File { mtime_sec, .. } => Some(*mtime_sec as i64),
+                        _ => None,
+                    })
+                    .expect("model file entry must exist");
                 assert_eq!(
-                    info.mtime, now_sec as i64,
+                    info.mtime, expected_mtime,
                     "[CONFORMANCE TIER A FAILURE] Step {step}: file '{norm}' mtime mismatch"
                 );
             }
@@ -1172,10 +1173,9 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                     panic!("[CONFORMANCE TIER A FAILURE] Step {step}: new renamed path '{new_norm}' file_info failed: {e}");
                 });
                 if let Some(entry) = model.get_entry(&new_norm) {
-                    let (msec, _) = entry.mtime();
-                    if msec != 0 {
+                    if let EntryState::File { mtime_sec, .. } = entry {
                         assert_eq!(
-                            info.mtime, msec as i64,
+                            info.mtime, *mtime_sec as i64,
                             "[CONFORMANCE TIER A FAILURE] Step {step}: renamed '{new_norm}' mtime mismatch"
                         );
                     }
