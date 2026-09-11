@@ -180,6 +180,24 @@ fn test_accounting_oracle_sha256_fixture() {
     assert_eq!(report.superblock_bytes_used, report.total_referenced_bytes);
 }
 
+#[test]
+fn test_accounting_oracle_fst_bitmap_fixture() {
+    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("fixtures")
+        .join("btrfs")
+        .join("fst-bitmap.img");
+
+    let dev = FileDevice::open(&fixture_path).expect("open fst-bitmap.img");
+    let fs = Btrfs::mount(dev).expect("mount fst-bitmap.img");
+
+    let report = AccountingOracle::assert_clean(&fs);
+    println!("fst-bitmap.img report: {report:#?}");
+
+    assert_eq!(report.superblock_bytes_used, report.total_block_group_used);
+    assert_eq!(report.superblock_bytes_used, report.total_referenced_bytes);
+}
+
 // =========================================================================
 // POSITIVE CONTROL: Live Driver Operations + Kernel Oracle Cross-Check
 // =========================================================================
@@ -877,5 +895,159 @@ fn test_negative_control_fst_info_count_mismatch() {
         other => panic!("expected Err(AccountingError::FstInfoCountMismatch), got: {other:?}"),
     }
 }
+
+#[test]
+fn test_negative_control_fst_bitmap_info_count_mismatch() {
+    let scratch = ScratchFixture::new("btrfs/fst-bitmap.img", "neg_fst_bm_count");
+    let dev = FileDevice::open(scratch.path()).expect("open fst-bitmap.img");
+    let fs = Btrfs::mount(dev).expect("mount fst-bitmap.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In fst-bitmap.img, block group 13631488 is a bitmap block group (flags=1) with extent_count = 2.
+    // Deliberately corrupt its recorded extent count (+10).
+    let info_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_INFO_KEY
+                && it.key.objectid == 13631488
+        })
+        .expect("find fst info item for 13631488");
+    let original_count = u32::from_le_bytes(leaf.items[info_idx].data[0..4].try_into().unwrap());
+    let corrupted_count = original_count + 10;
+    leaf.items[info_idx].data[0..4].copy_from_slice(&corrupted_count.to_le_bytes());
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstInfoCountMismatch {
+            bg_start,
+            recorded_count,
+            actual_count,
+        }) => {
+            println!(
+                "Negative control passed: detected FstInfoCountMismatch on bitmap BG {bg_start:#x}: recorded {recorded_count} vs actual {actual_count}",
+            );
+            assert_eq!(bg_start, 13631488);
+            assert_eq!(recorded_count, corrupted_count);
+            assert_eq!(actual_count, original_count as usize);
+        }
+        other => panic!("expected Err(AccountingError::FstInfoCountMismatch), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_negative_control_fst_bitmap_coverage_gap() {
+    let scratch = ScratchFixture::new("btrfs/fst-bitmap.img", "neg_fst_bm_gap");
+    let dev = FileDevice::open(scratch.path()).expect("open fst-bitmap.img");
+    let fs = Btrfs::mount(dev).expect("mount fst-bitmap.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In fst-bitmap.img, block group 13631488 has a FREE_SPACE_BITMAP item covering 8 MiB.
+    // Find the first byte that has a set bit (free sector) and clear it (turn 1 to 0).
+    let bm_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_BITMAP_KEY
+                && it.key.objectid == 13631488
+        })
+        .expect("find fst bitmap item for 13631488");
+
+    let byte_pos = leaf.items[bm_idx]
+        .data
+        .iter()
+        .position(|&b| b != 0)
+        .expect("find non-zero byte in bitmap");
+    // Clear the non-zero byte to introduce a coverage gap
+    leaf.items[bm_idx].data[byte_pos] = 0;
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstCoverageMismatch {
+            bg_start,
+            bg_len,
+            allocated_bytes,
+            fst_free_bytes,
+        }) => {
+            println!(
+                "Negative control passed: detected FstCoverageMismatch on bitmap BG {bg_start:#x} (len {bg_len}): alloc {allocated_bytes} + free {fst_free_bytes} != {bg_len}",
+            );
+            assert_eq!(bg_start, 13631488);
+            assert_eq!(bg_len, 8388608);
+        }
+        Err(AccountingError::FstInfoCountMismatch {
+            bg_start,
+            recorded_count,
+            actual_count,
+        }) => {
+            println!(
+                "Negative control passed: detected FstInfoCountMismatch on bitmap BG {bg_start:#x}: recorded {recorded_count} vs actual {actual_count}",
+            );
+            assert_eq!(bg_start, 13631488);
+        }
+        other => panic!("expected Err(AccountingError::FstCoverageMismatch or FstInfoCountMismatch), got: {other:?}"),
+    }
+}
+
 
 

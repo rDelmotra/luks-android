@@ -890,10 +890,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     let mut rounds_executed = 0;
     for iteration in 0..MAX_CONVERGENCE_ROUNDS {
         rounds_executed = iteration + 1;
-        if blocks_to_add.is_empty()
-            && blocks_to_remove.is_empty()
-            && (iteration > 0 || fst_root_opt.is_none())
-        {
+        if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
             // Convergence achieved
             converged = true;
             break;
@@ -1019,127 +1016,132 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 j += 1;
             }
 
-            for del_key in to_delete {
-                let fst_res = cow_tree_mutate(
-                    fs,
-                    &pending_blocks,
-                    *fst_bytenr,
-                    *fst_level,
-                    FREE_SPACE_TREE_OBJECTID,
-                    &del_key,
-                    new_generation,
-                    &mut allocator,
-                    |leaf| {
-                        let _ = leaf.delete_item(&del_key)?;
-                        Ok(())
-                    },
-                )?;
-                record_cow_result(
-                    &fst_res,
-                    &mut blocks_to_add,
-                    &mut blocks_to_remove,
-                    &mut allocator,
-                    &mut pending_blocks,
-                    sb.node_size,
-                    FREE_SPACE_TREE_OBJECTID,
-                )?;
-                *fst_bytenr = fst_res.new_root_bytenr;
-                *fst_level = fst_res.new_root_level;
-            }
+            let fst_modified =
+                !to_delete.is_empty() || !to_insert.is_empty() || !to_mutate.is_empty();
 
-            for (mut_key, mut_data) in to_mutate {
-                let fst_res = cow_tree_mutate(
+            if fst_modified {
+                for del_key in to_delete {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &del_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let _ = leaf.delete_item(&del_key)?;
+                            Ok(())
+                        },
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for (mut_key, mut_data) in to_mutate {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &mut_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let idx = leaf.find_item(&mut_key).ok_or_else(|| {
+                                LuksError::NotFound("fst item to mutate not found in leaf".into())
+                            })?;
+                            leaf.items[idx].data = mut_data;
+                            Ok(())
+                        },
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for (ins_key, ins_data) in to_insert {
+                    let fst_res = cow_tree_insert(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        ins_key,
+                        ins_data,
+                        new_generation,
+                        &mut allocator,
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                // Update ROOT_ITEM for FREE_SPACE_TREE in ROOT_TREE
+                let fst_root_key = Key::new(FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+                let root_res = cow_tree_mutate(
                     fs,
                     &pending_blocks,
-                    *fst_bytenr,
-                    *fst_level,
-                    FREE_SPACE_TREE_OBJECTID,
-                    &mut_key,
+                    root_tree_bytenr,
+                    root_tree_level,
+                    ROOT_TREE_OBJECTID,
+                    &fst_root_key,
                     new_generation,
                     &mut allocator,
                     |leaf| {
-                        let idx = leaf.find_item(&mut_key).ok_or_else(|| {
-                            LuksError::NotFound("fst item to mutate not found in leaf".into())
+                        let idx = leaf.find_item(&fst_root_key).ok_or_else(|| {
+                            LuksError::NotFound("fst root item not found in root tree".into())
                         })?;
-                        leaf.items[idx].data = mut_data;
+                        let data = &mut leaf.items[idx].data;
+                        if data.len() < 239 {
+                            return Err(LuksError::CorruptFs("root item truncated"));
+                        }
+                        data[160..168].copy_from_slice(&new_generation.to_le_bytes());
+                        data[176..184].copy_from_slice(&fst_bytenr.to_le_bytes());
+                        data[238] = *fst_level;
                         Ok(())
                     },
                 )?;
+
                 record_cow_result(
-                    &fst_res,
+                    &root_res,
                     &mut blocks_to_add,
                     &mut blocks_to_remove,
                     &mut allocator,
                     &mut pending_blocks,
                     sb.node_size,
-                    FREE_SPACE_TREE_OBJECTID,
+                    ROOT_TREE_OBJECTID,
                 )?;
-                *fst_bytenr = fst_res.new_root_bytenr;
-                *fst_level = fst_res.new_root_level;
+                root_tree_bytenr = root_res.new_root_bytenr;
+                root_tree_level = root_res.new_root_level;
             }
-
-            for (ins_key, ins_data) in to_insert {
-                let fst_res = cow_tree_insert(
-                    fs,
-                    &pending_blocks,
-                    *fst_bytenr,
-                    *fst_level,
-                    FREE_SPACE_TREE_OBJECTID,
-                    ins_key,
-                    ins_data,
-                    new_generation,
-                    &mut allocator,
-                )?;
-                record_cow_result(
-                    &fst_res,
-                    &mut blocks_to_add,
-                    &mut blocks_to_remove,
-                    &mut allocator,
-                    &mut pending_blocks,
-                    sb.node_size,
-                    FREE_SPACE_TREE_OBJECTID,
-                )?;
-                *fst_bytenr = fst_res.new_root_bytenr;
-                *fst_level = fst_res.new_root_level;
-            }
-
-            // Update ROOT_ITEM for FREE_SPACE_TREE in ROOT_TREE
-            let fst_root_key = Key::new(FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
-            let root_res = cow_tree_mutate(
-                fs,
-                &pending_blocks,
-                root_tree_bytenr,
-                root_tree_level,
-                ROOT_TREE_OBJECTID,
-                &fst_root_key,
-                new_generation,
-                &mut allocator,
-                |leaf| {
-                    let idx = leaf.find_item(&fst_root_key).ok_or_else(|| {
-                        LuksError::NotFound("fst root item not found in root tree".into())
-                    })?;
-                    let data = &mut leaf.items[idx].data;
-                    if data.len() < 239 {
-                        return Err(LuksError::CorruptFs("root item truncated"));
-                    }
-                    data[160..168].copy_from_slice(&new_generation.to_le_bytes());
-                    data[176..184].copy_from_slice(&fst_bytenr.to_le_bytes());
-                    data[238] = *fst_level;
-                    Ok(())
-                },
-            )?;
-
-            record_cow_result(
-                &root_res,
-                &mut blocks_to_add,
-                &mut blocks_to_remove,
-                &mut allocator,
-                &mut pending_blocks,
-                sb.node_size,
-                ROOT_TREE_OBJECTID,
-            )?;
-            root_tree_bytenr = root_res.new_root_bytenr;
-            root_tree_level = root_res.new_root_level;
         }
 
         // Update BLOCK_GROUP_ITEM in EXTENT_TREE for each block group

@@ -110,17 +110,23 @@ fn read_only_subvolume_is_refused() {
 /// Phase F4: Multi-leaf free-space trees are now fully supported by the incremental
 /// CoW engine, so check_free_space_tree_shape has been removed.
 #[test]
-fn multi_leaf_free_space_tree_is_supported() {
+fn fixture_fst_multileaf_has_root_level_1() {
     let path = fixture_path("fst-multileaf.img");
     let dev = luks_core::device::FileDevice::open(&path).expect("open fst-multileaf");
     let fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-multileaf");
     let fst_root = fs
         .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
         .expect("fst root");
-    assert!(
-        fst_root.level >= 1,
-        "fst-multileaf.img must have FST root level >= 1, got {}",
+    assert_eq!(
+        fst_root.level, 1,
+        "fst-multileaf.img must have FST root level 1, got {}",
         fst_root.level
+    );
+    let node = fs.read_node(fst_root.bytenr).expect("read fst root node");
+    assert!(
+        node.nr_items >= 2,
+        "fst-multileaf root must have >= 2 children, got {}",
+        node.nr_items
     );
 }
 
@@ -163,6 +169,37 @@ fn fixture_path(name: &str) -> std::path::PathBuf {
 
 
 #[test]
+fn fixture_fst_bitmap_has_bitmaps() {
+    let path = fixture_path("fst-bitmap.img");
+    let dev = luks_core::device::FileDevice::open(&path).expect("open fst-bitmap");
+    let fs = luks_core::fs::btrfs::Btrfs::mount(dev).expect("mount fst-bitmap");
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+
+    let mut bitmap_count = 0;
+    let mut extent_count = 0;
+    fs.walk_tree(fst_root.bytenr, &mut |key, _| {
+        if key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_BITMAP_KEY {
+            bitmap_count += 1;
+        } else if key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_EXTENT_KEY {
+            extent_count += 1;
+        }
+        Ok(())
+    })
+    .expect("walk fst");
+
+    assert!(
+        bitmap_count >= 50,
+        "fst-bitmap.img must have >= 50 bitmaps, got {bitmap_count}"
+    );
+    assert!(
+        extent_count >= 40,
+        "fst-bitmap.img must have >= 40 extents, got {extent_count}"
+    );
+}
+
+#[test]
 fn fixture_fst_bitmap_is_refused_by_bitmap_gate() {
     let path = fixture_path("fst-bitmap.img");
     let dev = luks_core::device::FileDevice::open(&path).expect("open fst-bitmap");
@@ -191,6 +228,20 @@ fn fixture_fst_aged_has_high_extent_count_under_single_leaf() {
         fst_root.level, 0,
         "fst-aged.img must have FST root level 0, got {}",
         fst_root.level
+    );
+
+    let mut extent_count = 0;
+    fs.walk_tree(fst_root.bytenr, &mut |key, _| {
+        if key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_EXTENT_KEY {
+            extent_count += 1;
+        }
+        Ok(())
+    })
+    .expect("walk fst");
+
+    assert!(
+        extent_count >= 500,
+        "fst-aged.img must have >= 500 free extents, got {extent_count}"
     );
 }
 

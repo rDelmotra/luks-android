@@ -34,8 +34,8 @@ use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
 use luks_core::fs::btrfs::extent::{ExtentKind, FileExtent};
 use luks_core::fs::btrfs::tree::{
-    CHUNK_TREE_OBJECTID, EXTENT_DATA_KEY, FREE_SPACE_EXTENT_KEY, FREE_SPACE_INFO_KEY,
-    FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
+    CHUNK_TREE_OBJECTID, EXTENT_DATA_KEY, FREE_SPACE_BITMAP_KEY, FREE_SPACE_EXTENT_KEY,
+    FREE_SPACE_INFO_KEY, FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
 };
 use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
 use luks_core::fs::btrfs::write::extent_tree::ExtentTree;
@@ -643,6 +643,7 @@ impl AccountingOracle {
         if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
             let mut fst_infos: HashMap<u64, (u32, u32)> = HashMap::new(); // bg_start -> (extent_count, flags)
             let mut fst_extents: Vec<(u64, u64)> = Vec::new(); // (start, length)
+            let mut fst_bitmaps: Vec<(u64, u64, Vec<u8>)> = Vec::new(); // (start, length, data)
 
             fs.walk_tree(fst_root.bytenr, &mut |key, data| {
                 if key.item_type == FREE_SPACE_INFO_KEY && data.len() >= 8 {
@@ -651,26 +652,65 @@ impl AccountingOracle {
                     fst_infos.insert(key.objectid, (count, flags));
                 } else if key.item_type == FREE_SPACE_EXTENT_KEY {
                     fst_extents.push((key.objectid, key.offset));
+                } else if key.item_type == FREE_SPACE_BITMAP_KEY {
+                    fst_bitmaps.push((key.objectid, key.offset, data.to_vec()));
                 }
                 Ok(())
             })?;
 
             fst_extents.sort_by_key(|&(start, _)| start);
 
+            let sectorsize = fs.superblock().sector_size as u64;
+
             for bg in &extent_tree.block_groups {
                 let bg_end = bg.start + bg.length;
                 let (info_count, flags) = fst_infos.get(&bg.start).copied().unwrap_or((0, 0));
 
-                // If block group uses bitmaps (flags & 1 != 0), extent items are not emitted for it
-                if flags & 1 != 0 {
-                    continue;
-                }
+                let bg_fst_extents: Vec<(u64, u64)> = if flags & 1 != 0 {
+                    // Block group uses bitmaps: decode FREE_SPACE_BITMAP items into free ranges.
+                    let mut bg_bitmaps: Vec<_> = fst_bitmaps
+                        .iter()
+                        .filter(|(start, _, _)| *start >= bg.start && *start < bg_end)
+                        .collect();
+                    bg_bitmaps.sort_by_key(|&(start, _, _)| start);
 
-                let bg_fst_extents: Vec<(u64, u64)> = fst_extents
-                    .iter()
-                    .copied()
-                    .filter(|&(start, _)| start >= bg.start && start < bg_end)
-                    .collect();
+                    let mut extents = Vec::new();
+                    let mut prev_bit_set = false;
+                    let mut extent_start = 0u64;
+
+                    for &&(bm_start, bm_len, ref bm_data) in &bg_bitmaps {
+                        let mut offset = bm_start;
+                        let bm_end = bm_start + bm_len;
+                        while offset < bm_end {
+                            let bit_idx = ((offset - bm_start) / sectorsize) as usize;
+                            let byte_idx = bit_idx / 8;
+                            let bit_pos = bit_idx % 8;
+                            let bit_set = if byte_idx < bm_data.len() {
+                                (bm_data[byte_idx] & (1 << bit_pos)) != 0
+                            } else {
+                                false
+                            };
+
+                            if !prev_bit_set && bit_set {
+                                extent_start = offset;
+                            } else if prev_bit_set && !bit_set {
+                                extents.push((extent_start, offset - extent_start));
+                            }
+                            prev_bit_set = bit_set;
+                            offset += sectorsize;
+                        }
+                    }
+                    if prev_bit_set {
+                        extents.push((extent_start, bg_end - extent_start));
+                    }
+                    extents
+                } else {
+                    fst_extents
+                        .iter()
+                        .copied()
+                        .filter(|&(start, _)| start >= bg.start && start < bg_end)
+                        .collect()
+                };
 
                 // 9a. Check extent count matches FREE_SPACE_INFO
                 if bg_fst_extents.len() != info_count as usize {
