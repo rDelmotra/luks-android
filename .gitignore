@@ -37,6 +37,9 @@
 !tools/*.sh
 !tools/*.c
 
+# ---- CI ----
+!.github/workflows/*.yml
+
 # ---- docs & license (public facing) ----
 !README.md
 !LICENSE-APACHE

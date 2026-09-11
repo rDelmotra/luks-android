@@ -126,7 +126,7 @@ fn coalesce_extents(extents: &[Extent]) -> Vec<Extent> {
 /// These two figures are an arithmetic derivation, not directly measured, but audited
 /// 2026-08-17 (`notes/feature-remediation.md`) and found to be a distinct ceiling from the
 /// measured *directory*-entry ceiling of 203 (4 KiB) / 49 (1 KiB) entries recorded in
-/// `core/tests/statfs.rs::measure_ext4_directory_capacity_ceiling` — do not conflate the two
+/// `core/tests/integration/statfs.rs::measure_ext4_directory_capacity_ceiling` — do not conflate the two
 /// when updating either.
 ///
 /// If fragmentation or size requires more runs than fit in a single leaf block, depth 2

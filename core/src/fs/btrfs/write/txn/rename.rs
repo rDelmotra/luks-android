@@ -804,90 +804,60 @@ fn rename_swap_dirent<D: ReadAt>(
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
 
-    // 4. Update child INODE_REF
+    // 4. Update child INODE_REF: always delete old ref then insert new ref with cow_tree_insert.
+    // This eliminates in-place expansion under cow_tree_mutate (GAP-1) and guarantees that
+    // a longer filename can trigger a clean leaf split if necessary.
     let new_inode_ref_data = crate::fs::btrfs::write::node::build_inode_ref(new_dir_index, new_name);
-    if old_parent_ino == new_parent_ino {
-        let child_ref_key = Key::new(child_ino, INODE_REF_KEY, old_parent_ino);
-        let res = cow_tree_mutate(
-            fs,
-            pending_blocks,
-            fs_root_bytenr,
-            fs_root_level,
-            FS_TREE_OBJECTID,
-            &child_ref_key,
-            new_generation,
-            allocator,
-            |leaf| {
-                let idx = leaf
-                    .find_item(&child_ref_key)
-                    .ok_or_else(|| LuksError::NotFound("child inode ref not found".into()))?;
-                leaf.items[idx].data = new_inode_ref_data.clone();
-                Ok(())
-            },
-        )?;
-        record_cow_result(
-            &res,
-            blocks_to_add,
-            blocks_to_remove,
-            allocator,
-            pending_blocks,
-            node_size,
-            FS_TREE_OBJECTID,
-        )?;
-        fs_root_bytenr = res.new_root_bytenr;
-        fs_root_level = res.new_root_level;
-    } else {
-        let old_child_ref_key = Key::new(child_ino, INODE_REF_KEY, old_parent_ino);
-        let res = cow_tree_mutate(
-            fs,
-            pending_blocks,
-            fs_root_bytenr,
-            fs_root_level,
-            FS_TREE_OBJECTID,
-            &old_child_ref_key,
-            new_generation,
-            allocator,
-            |leaf| {
-                leaf.delete_item(&old_child_ref_key)?;
-                Ok(())
-            },
-        )?;
-        record_cow_result(
-            &res,
-            blocks_to_add,
-            blocks_to_remove,
-            allocator,
-            pending_blocks,
-            node_size,
-            FS_TREE_OBJECTID,
-        )?;
-        fs_root_bytenr = res.new_root_bytenr;
-        fs_root_level = res.new_root_level;
+    let old_child_ref_key = Key::new(child_ino, INODE_REF_KEY, old_parent_ino);
+    let res = cow_tree_mutate(
+        fs,
+        pending_blocks,
+        fs_root_bytenr,
+        fs_root_level,
+        FS_TREE_OBJECTID,
+        &old_child_ref_key,
+        new_generation,
+        allocator,
+        |leaf| {
+            leaf.delete_item(&old_child_ref_key)?;
+            Ok(())
+        },
+    )?;
+    record_cow_result(
+        &res,
+        blocks_to_add,
+        blocks_to_remove,
+        allocator,
+        pending_blocks,
+        node_size,
+        FS_TREE_OBJECTID,
+    )?;
+    fs_root_bytenr = res.new_root_bytenr;
+    fs_root_level = res.new_root_level;
 
-        let new_child_ref_key = Key::new(child_ino, INODE_REF_KEY, new_parent_ino);
-        let res = cow_tree_insert(
-            fs,
-            pending_blocks,
-            fs_root_bytenr,
-            fs_root_level,
-            FS_TREE_OBJECTID,
-            new_child_ref_key,
-            new_inode_ref_data,
-            new_generation,
-            allocator,
-        )?;
-        record_cow_result(
-            &res,
-            blocks_to_add,
-            blocks_to_remove,
-            allocator,
-            pending_blocks,
-            node_size,
-            FS_TREE_OBJECTID,
-        )?;
-        fs_root_bytenr = res.new_root_bytenr;
-        fs_root_level = res.new_root_level;
-    }
+    let new_child_ref_key = Key::new(child_ino, INODE_REF_KEY, new_parent_ino);
+    let res = cow_tree_insert(
+        fs,
+        pending_blocks,
+        fs_root_bytenr,
+        fs_root_level,
+        FS_TREE_OBJECTID,
+        new_child_ref_key,
+        new_inode_ref_data,
+        new_generation,
+        allocator,
+    )?;
+    record_cow_result(
+        &res,
+        blocks_to_add,
+        blocks_to_remove,
+        allocator,
+        pending_blocks,
+        node_size,
+        FS_TREE_OBJECTID,
+    )?;
+    fs_root_bytenr = res.new_root_bytenr;
+    fs_root_level = res.new_root_level;
 
     Ok((fs_root_bytenr, fs_root_level))
 }

@@ -1,0 +1,74 @@
+# For most projects, this workflow file will not need changing; you simply need
+# to commit it to your repository.
+#
+# java-kotlin uses build-mode: manual rather than the generated default
+# (autobuild). Autobuild runs a full Gradle build, which hits checkNativeLibs
+# and checkNoWriteCodeInRelease — Gradle tasks that require a prebuilt
+# app/src/main/jniLibs/arm64-v8a/libluks_jni.so. That .so is built by Cargo
+# outside Gradle (tools/build-android-libs.sh) and isn't present in a clean
+# CodeQL checkout, so autobuild fails before analysis ever runs.
+#
+# Static analysis of the Kotlin/Java sources doesn't need the real .so — it
+# only needs to exist to be packaged, not to be compiled against. The two
+# guard tasks exist to stop a release APK from shipping without (or with a
+# write-enabled) native library; neither question applies here, since this
+# job never produces an APK. The exclusion is scoped to this one job/workflow
+# rather than as a branch inside build.gradle.kts, so it can't be tripped by
+# an environment variable during a real release build.
+name: "CodeQL Advanced"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '38 21 * * 5'
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - language: c-cpp
+          build-mode: none
+        - language: java-kotlin
+          build-mode: manual
+        - language: rust
+          build-mode: none
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v7
+
+    - name: Set up JDK
+      if: matrix.language == 'java-kotlin'
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "17"
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+        build-mode: ${{ matrix.build-mode }}
+
+    - name: Build (Kotlin/Java only, native lib guards excluded)
+      if: matrix.language == 'java-kotlin'
+      working-directory: android
+      run: ./gradlew :app:compileDebugKotlin -x checkNativeLibs -x checkNoWriteCodeInRelease
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4
+      with:
+        category: "/language:${{matrix.language}}"

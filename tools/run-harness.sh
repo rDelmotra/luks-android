@@ -9,6 +9,7 @@
 #   --integration  Run Tiers 1-3 filesystem disk mutation tests (<60s)
 #   --oracle       Run Tier 4 Linux kernel oracle graded tests (requires Colima or Linux)
 #   --strict       Run Tiers 1-5 with 100% oracle grading (fails closed on any skip)
+#   --transitions  Run transition coverage suite & enforce structural transition gate
 #   --android      Run Android JVM unit tests & privacy checks
 #   --provision    Audit and synthesize missing test fixtures
 #   --keep-failed  Retain failed scratch images in target/scratch/ for debugging
@@ -25,6 +26,7 @@ RUN_STRESS=0
 RUN_INTEGRATION=0
 RUN_ORACLE=0
 RUN_STRICT=0
+RUN_TRANSITIONS=0
 RUN_ANDROID=0
 RUN_PROVISION=0
 KEEP_FAILED=0
@@ -42,6 +44,7 @@ for arg in "$@"; do
         --integration) RUN_INTEGRATION=1 ;;
         --oracle) RUN_ORACLE=1 ;;
         --strict) RUN_STRICT=1 ;;
+        --transitions) RUN_TRANSITIONS=1 ;;
         --android) RUN_ANDROID=1 ;;
         --provision) RUN_PROVISION=1 ;;
         --keep-failed) KEEP_FAILED=1 ;;
@@ -51,10 +54,11 @@ for arg in "$@"; do
             RUN_INTEGRATION=1
             RUN_ORACLE=1
             RUN_STRICT=1
+            RUN_TRANSITIONS=1
             RUN_ANDROID=1
             ;;
         -h|--help)
-            sed -n '2,17p' "$0" | sed 's/^# //'
+            sed -n '2,18p' "$0" | sed 's/^# //'
             exit 0
             ;;
         *)
@@ -64,6 +68,7 @@ for arg in "$@"; do
             ;;
     esac
 done
+
 
 if [ "$RUN_STRICT" -eq 1 ]; then
     # Strict mode implies running all core tiers under strict oracle controls
@@ -88,11 +93,18 @@ LEDGER="$REPORTS_DIR/ledger-$RUN_ID.log"
 export LUKS_ORACLE_LEDGER="$LEDGER"
 : > "$LEDGER"
 
+if [ "$RUN_TRANSITIONS" -eq 1 ]; then
+    TRANS_LEDGER="$REPORTS_DIR/transitions-$RUN_ID.log"
+    export LUKS_TRANSITION_LEDGER="$TRANS_LEDGER"
+    : > "$TRANS_LEDGER"
+fi
+
 # Reporting structures
 JSON_REPORT="$REPORTS_DIR/summary.json"
 TIER_RESULTS=()
 TIER_DURATIONS=()
 OVERALL_STATUS=0
+TIER_2_RAN=0
 
 log_tier() {
     local name="$1"
@@ -137,6 +149,12 @@ if [ "$RUN_STRESS" -eq 1 ]; then
     echo "==> TIER 2: B-Tree Permutations & Property Stress Suite"
     echo "================================================================="
     t_start=$(date +%s)
+    TIER_2_RAN=1
+
+    ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
+        --test btrfs_conformance \
+        --test btrfs_interior_collapse \
+        --test btrfs_fst_collapse
 
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
         --test btrfs_btree_permutations -- \
@@ -144,7 +162,8 @@ if [ "$RUN_STRESS" -eq 1 ]; then
         test_btree_variable_item_sizes_and_3way_split_shapes \
         test_btree_height_scaling_and_root_collapse \
         test_btree_stateful_fuzz_property_cycle \
-        test_tree_validator_negative_controls
+        test_tree_validator_negative_controls \
+        test_tree_validator_search_walk_parity_parent_separator_corruption
     
     ALLOW_NO_ORACLE=1 cargo test -p luks_core --features dangerous-write-support \
         --test btrfs_node_surgery --test btrfs_chunk_alloc_search
@@ -202,6 +221,7 @@ if [ "$RUN_ORACLE" -eq 1 ]; then
         --test btrfs_rename \
         --test btrfs_mkdir \
         --test btrfs_crash_safety \
+        --test btrfs_fst_collapse \
         --test ext4_file \
         --test ext4_delete \
         --test ext4_rename \
@@ -262,6 +282,40 @@ if [ "$RUN_ANDROID" -eq 1 ]; then
     echo
 fi
 
+# 8. Structural Transitions Coverage Gate
+if [ "$RUN_TRANSITIONS" -eq 1 ]; then
+    echo "================================================================="
+    echo "==> TRANSITIONS: Structural Transition Coverage Gate"
+    echo "================================================================="
+    t_start=$(date +%s)
+
+    if [ "$TIER_2_RAN" -eq 0 ]; then
+        cargo test --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support \
+            --test btrfs_conformance \
+            --test btrfs_interior_collapse \
+            --test btrfs_btree_permutations \
+            --test btrfs_data_write \
+            --test btrfs_fst_collapse
+    fi
+
+    set +e
+    bash "$repo_root/tools/transition-report.sh" --check "$TRANS_LEDGER"
+    trans_status=$?
+    set -e
+
+    t_end=$(date +%s)
+    dur=$((t_end - t_start))
+
+    if [ "$trans_status" -ne 0 ]; then
+        log_tier "Transition Gate" "FAIL" "$dur"
+        OVERALL_STATUS=1
+    else
+        log_tier "Transition Gate" "PASS" "$dur"
+        echo "--> Transition Gate finished clean in ${dur}s."
+    fi
+    echo
+fi
+
 # Clean up temporary scratch directory if all passed and keep-failed is false
 if [ "$OVERALL_STATUS" -eq 0 ] && [ "$KEEP_FAILED" -eq 0 ]; then
     rm -rf "$SCRATCH_DIR"
@@ -272,7 +326,11 @@ echo "================================================================="
 echo "==> AUTONOMOUS TEST HARNESS SUMMARY ($RUN_ID)"
 echo "================================================================="
 for result in "${TIER_RESULTS[@]}"; do
-    echo "  [✓] $result"
+    if [[ "$result" == *"FAIL"* ]]; then
+        echo "  [✗] $result"
+    else
+        echo "  [✓] $result"
+    fi
 done
 
 # Write JSON report

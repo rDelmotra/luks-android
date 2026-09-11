@@ -13,7 +13,7 @@ import org.junit.Test
 /**
  * Records the exact sequence of volume operations [TreeImporter] emits, so a
  * Rust test can replay that sequence through the real write path and let the
- * kernel grade the result (`core/tests/tree_import_oracle.rs`).
+ * kernel grade the result (`core/tests/integration/tree_import_oracle.rs`).
  *
  * # Why a trace instead of just running the importer against a real image
  *
@@ -182,7 +182,7 @@ class TreeImportTraceTest {
         PlanEntry("id:$path", path, isDir = false, sizeBytes = size, mtime = 0)
 
     /**
-     * `core/tests/tree_import_oracle.rs` reads these, so they belong to the
+     * `core/tests/integration/tree_import_oracle.rs` reads these, so they belong to the
      * repo-root `fixtures/`, not anywhere under `android/`.
      *
      * Found by ascending for a marker rather than by counting `..` levels:

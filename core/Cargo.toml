@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "luks_core"
 version = "0.1.0"
 edition = "2021"
@@ -75,203 +76,364 @@ required-features = ["dangerous-write-support"]
 name = "space_probe"
 required-features = ["dangerous-write-support"]
 
+
+# --- crypto_luks (7 tests) ---
 [[test]]
-name = "btrfs_abandon_fail_closed"
-required-features = ["dangerous-write-support"]
+name = "aes_backend"
+path = "tests/crypto_luks/aes_backend.rs"
 
 [[test]]
-name = "btrfs_batch_cross_file"
-required-features = ["dangerous-write-support"]
+name = "secret_zeroize"
+path = "tests/crypto_luks/secret_zeroize.rs"
 
 [[test]]
-name = "btrfs_batch_double_alloc"
-required-features = ["dangerous-write-support"]
+name = "luks2_header"
+path = "tests/crypto_luks/luks2_header.rs"
 
 [[test]]
-name = "btrfs_batch_equality"
-required-features = ["dangerous-write-support"]
+name = "luks2_unlock"
+path = "tests/crypto_luks/luks2_unlock.rs"
 
 [[test]]
-name = "btrfs_batch_n_greater_1"
-required-features = ["dangerous-write-support"]
+name = "luks2_real_fixtures"
+path = "tests/crypto_luks/luks2_real_fixtures.rs"
 
 [[test]]
-name = "btrfs_batch_resume_corruption"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_btree_permutations"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_chunk_alloc_controls"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_chunk_alloc_search"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_chunk_alloc_txn"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_commit_template_corruption"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_cow_fixup"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_crash_safety"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_create_file"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_data_write"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_delete"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_empty_leaf"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_extent_tree"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_finish_file_csum"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_large_file_chunk_alloc"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_mkdir"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_node_surgery"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_rename"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_root_split"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_stage_b2_release"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_stage_c_reservation"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_stage_fg"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_streaming_chunk_alloc"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_streaming_crash_safety"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_streaming_unknown"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_timestamp_write"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_valves"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_write_gate"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_alloc"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_delete"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_dirent"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_file"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_inode_patch"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_mkdir"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_rename"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_streaming_unknown"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "ext4_write_gate"
+name = "luks_write"
+path = "tests/crypto_luks/luks_write.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
 name = "luks_ext4_write"
+path = "tests/crypto_luks/luks_ext4_write.rs"
 required-features = ["dangerous-write-support"]
 
+
+# --- device_scsi (6 tests) ---
 [[test]]
-name = "luks_write"
-required-features = ["dangerous-write-support"]
+name = "raw_device"
+path = "tests/device_scsi/raw_device.rs"
 
 [[test]]
-name = "scsi_write"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "statfs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "tree_import_oracle"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "write_cost"
-required-features = ["dangerous-write-support"]
+name = "usb_scsi"
+path = "tests/device_scsi/usb_scsi.rs"
 
 [[test]]
 name = "write_device"
+path = "tests/device_scsi/write_device.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
 name = "write_target"
+path = "tests/device_scsi/write_target.rs"
 required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "write_cost"
+path = "tests/device_scsi/write_cost.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "scsi_write"
+path = "tests/device_scsi/scsi_write.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- ext4 (11 tests) ---
+[[test]]
+name = "ext4_read"
+path = "tests/ext4/ext4_read.rs"
+
+[[test]]
+name = "ext4_csum"
+path = "tests/ext4/ext4_csum.rs"
+
+[[test]]
+name = "ext4_write_gate"
+path = "tests/ext4/ext4_write_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_alloc"
+path = "tests/ext4/ext4_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_inode_patch"
+path = "tests/ext4/ext4_inode_patch.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_file"
+path = "tests/ext4/ext4_file.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_mkdir"
+path = "tests/ext4/ext4_mkdir.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_delete"
+path = "tests/ext4/ext4_delete.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_rename"
+path = "tests/ext4/ext4_rename.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_dirent"
+path = "tests/ext4/ext4_dirent.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_streaming_unknown"
+path = "tests/ext4/ext4_streaming_unknown.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- fs_permutation (11 tests) ---
+[[test]]
+name = "btrfs_btree_permutations"
+path = "tests/fs_permutation/btrfs_btree_permutations.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_conformance"
+path = "tests/fs_permutation/btrfs_conformance.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_structural_transitions"
+path = "tests/fs_permutation/btrfs_structural_transitions.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_interior_collapse"
+path = "tests/fs_permutation/btrfs_interior_collapse.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_fst_collapse"
+path = "tests/fs_permutation/btrfs_fst_collapse.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_root_split"
+path = "tests/fs_permutation/btrfs_root_split.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_node_surgery"
+path = "tests/fs_permutation/btrfs_node_surgery.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_cow_fixup"
+path = "tests/fs_permutation/btrfs_cow_fixup.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_empty_leaf"
+path = "tests/fs_permutation/btrfs_empty_leaf.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_scale_convergence"
+path = "tests/fs_permutation/btrfs_scale_convergence.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_accounting_oracle"
+path = "tests/fs_permutation/btrfs_accounting_oracle.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- txn_batch (10 tests) ---
+[[test]]
+name = "btrfs_batch_cross_file"
+path = "tests/txn_batch/btrfs_batch_cross_file.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_double_alloc"
+path = "tests/txn_batch/btrfs_batch_double_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_equality"
+path = "tests/txn_batch/btrfs_batch_equality.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_n_greater_1"
+path = "tests/txn_batch/btrfs_batch_n_greater_1.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_resume_corruption"
+path = "tests/txn_batch/btrfs_batch_resume_corruption.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_commit_template_corruption"
+path = "tests/txn_batch/btrfs_commit_template_corruption.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_abandon_fail_closed"
+path = "tests/txn_batch/btrfs_abandon_fail_closed.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_b2_release"
+path = "tests/txn_batch/btrfs_stage_b2_release.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_c_reservation"
+path = "tests/txn_batch/btrfs_stage_c_reservation.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_stage_fg"
+path = "tests/txn_batch/btrfs_stage_fg.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- alloc_chunk (8 tests) ---
+[[test]]
+name = "btrfs_chunk_alloc_controls"
+path = "tests/alloc_chunk/btrfs_chunk_alloc_controls.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_search"
+path = "tests/alloc_chunk/btrfs_chunk_alloc_search.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_alloc_txn"
+path = "tests/alloc_chunk/btrfs_chunk_alloc_txn.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_chunk_roundtrip"
+path = "tests/alloc_chunk/btrfs_chunk_roundtrip.rs"
+
+[[test]]
+name = "btrfs_large_file_chunk_alloc"
+path = "tests/alloc_chunk/btrfs_large_file_chunk_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_chunk_alloc"
+path = "tests/alloc_chunk/btrfs_streaming_chunk_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_valves"
+path = "tests/alloc_chunk/btrfs_valves.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_extent_tree"
+path = "tests/alloc_chunk/btrfs_extent_tree.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- btrfs_ops (13 tests) ---
+[[test]]
+name = "btrfs_read"
+path = "tests/btrfs_ops/btrfs_read.rs"
+
+[[test]]
+name = "btrfs_create_file"
+path = "tests/btrfs_ops/btrfs_create_file.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_data_write"
+path = "tests/btrfs_ops/btrfs_data_write.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_delete"
+path = "tests/btrfs_ops/btrfs_delete.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_mkdir"
+path = "tests/btrfs_ops/btrfs_mkdir.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_rename"
+path = "tests/btrfs_ops/btrfs_rename.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_finish_file_csum"
+path = "tests/btrfs_ops/btrfs_finish_file_csum.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_timestamp_write"
+path = "tests/btrfs_ops/btrfs_timestamp_write.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_unknown"
+path = "tests/btrfs_ops/btrfs_streaming_unknown.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_streaming_crash_safety"
+path = "tests/btrfs_ops/btrfs_streaming_crash_safety.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_crash_safety"
+path = "tests/btrfs_ops/btrfs_crash_safety.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_write_gate"
+path = "tests/btrfs_ops/btrfs_write_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_csum_type_gate"
+path = "tests/btrfs_ops/btrfs_csum_type_gate.rs"
+required-features = ["dangerous-write-support"]
+
+
+# --- integration (6 tests) ---
+[[test]]
+name = "end_to_end"
+path = "tests/integration/end_to_end.rs"
+
+[[test]]
+name = "full_stack"
+path = "tests/integration/full_stack.rs"
+
+[[test]]
+name = "statfs"
+path = "tests/integration/statfs.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "tree_import_oracle"
+path = "tests/integration/tree_import_oracle.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "forensic_log"
+path = "tests/integration/forensic_log.rs"
+
+[[test]]
+name = "oracle_ledger"
+path = "tests/integration/oracle_ledger.rs"
 

@@ -47,6 +47,11 @@ REQUIRED_BTRFS=(
     "compress.img"
     "mixed-4k.img"
     "subvol.img"
+    "nonmixed-4k.img"
+    "sha256-4k.img"
+    "fst-aged.img"
+    "fst-multileaf.img"
+    "fst-bitmap.img"
 )
 
 REQUIRED_EXT4=(

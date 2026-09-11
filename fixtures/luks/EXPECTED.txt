@@ -1,5 +1,5 @@
 # Ground truth from real cryptsetup. Compared against our parser in
-# core/tests/luks2_real_fixtures.rs
+# core/tests/crypto_luks/luks2_real_fixtures.rs
 # cryptsetup 2.7.0 flags: UDEV BLKID KEYRING FIPS KERNEL_CAPI HW_OPAL 
 # password: test
 

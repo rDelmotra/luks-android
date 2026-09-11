@@ -26,7 +26,7 @@
 //!
 //! Getting any of these wrong produces a checksum that is stable, plausible,
 //! and wrong — which is why every function here is graded against `mke2fs`'s
-//! own output in `tests/ext4_csum.rs` rather than against itself.
+//! own output in `core/tests/ext4/ext4_csum.rs` rather than against itself.
 //!
 //! The kernel's `crc32c(crc, data, len)` is the raw accumulator with no
 //! inversion at either end, which is exactly [`crc32c_seed`].

@@ -27,8 +27,6 @@ use crate::fs::btrfs::tree::{
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate, read_node, CowResult};
-use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::write::node::Leaf;
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::{Btrfs, TreeRoot};
 
@@ -586,6 +584,33 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
     Ok(None)
 }
 
+/// Collect all (Key, data) items present in the tree rooted at `bytenr`, consulting `pending`.
+///
+/// Traverses interior nodes in key order, yielding items in strictly ascending key order.
+pub(crate) fn collect_tree_items<D: ReadAt>(
+    fs: &Btrfs<D>,
+    pending: &HashMap<u64, Vec<u8>>,
+    bytenr: u64,
+    items: &mut Vec<(Key, Vec<u8>)>,
+) -> Result<()> {
+    if bytenr == 0 {
+        return Ok(());
+    }
+    let node = read_node(fs, pending, bytenr)?;
+    if node.is_leaf() {
+        for i in 0..node.nr_items {
+            items.push((node.key(i)?, node.item_data(i)?.to_vec()));
+        }
+    } else {
+        for i in 0..node.nr_items {
+            let child_ptr = node.key_ptr(i)?.blockptr;
+            collect_tree_items(fs, pending, child_ptr, items)?;
+        }
+    }
+    Ok(())
+}
+
+
 /// Highest real inode number present in the FS tree, or `256` if there are
 /// none (the lowest inode objectid btrfs hands out; `1..255` are reserved).
 ///
@@ -664,6 +689,15 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
             (extent_root.bytenr, extent_root.level)
         }
     };
+    let mut fst_root_opt: Option<(u64, u8)> =
+        if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
+            match fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
+                Ok(r) => Some((r.bytenr, r.level)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
 
     // 1. Update FS_TREE root item in ROOT_TREE if modified.
     if new_fs_tree.bytenr != fs.fs_tree().bytenr {
@@ -848,14 +882,14 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         extent_root_level = ext_res.new_root_level;
     }
 
-    let mut fst_bytenr_opt: Option<u64> = None;
-
     // 4. Fixed-point loop to record allocations and update root pointers until convergence.
     // High-fragmentation 4K-node filesystems or multi-extent transfers can take
     // up to ~15 rounds of extent-tree CoW feedback before reaching 0 pending blocks.
     const MAX_CONVERGENCE_ROUNDS: u32 = 30;
     let mut converged = false;
-    for _iteration in 0..MAX_CONVERGENCE_ROUNDS {
+    let mut rounds_executed = 0;
+    for iteration in 0..MAX_CONVERGENCE_ROUNDS {
+        rounds_executed = iteration + 1;
         if blocks_to_add.is_empty() && blocks_to_remove.is_empty() {
             // Convergence achieved
             converged = true;
@@ -944,60 +978,131 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
             extent_root_level = ext_res.new_root_level;
         }
 
-        // Update Free Space Tree if present on this filesystem.
-        //
-        // Rewritten wholesale from the allocator's own view rather than
-        // edited in place, and therefore emitted as a single leaf — which is
-        // only correct for a single-leaf tree, so that shape is refused up
-        // front rather than silently mangled. Leaving the tree stale instead
-        // is not an option: `btrfs check` cross-checks its contents against
-        // the extent tree even with FREE_SPACE_TREE_VALID cleared (measured
-        // 2026-08-14; see the §2 correction in feature-btrfs-write.md).
-        if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
-            if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
-                gate::check_free_space_tree_shape(&fst_root)?;
+        // Reconcile Free Space Tree if present on this filesystem.
+        if let Some((ref mut fst_bytenr, ref mut fst_level)) = fst_root_opt {
+            let mut current_items = Vec::new();
+            collect_tree_items(fs, &pending_blocks, *fst_bytenr, &mut current_items)?;
+            let desired_items = allocator.emit_free_space_tree_items();
 
-                let fst_target = match fst_bytenr_opt {
-                    Some(b) => b,
-                    None => {
-                        let b = allocator.allocate_metadata(sb.node_size)?;
-                        blocks_to_add.push((b, 0, FREE_SPACE_TREE_OBJECTID));
-                        blocks_to_remove.push((fst_root.bytenr, 0));
-                        allocator.free_metadata(fst_root.bytenr, sb.node_size)?;
-                        fst_bytenr_opt = Some(b);
-                        b
+            let mut to_delete = Vec::new();
+            let mut to_insert = Vec::new();
+            let mut to_mutate = Vec::new();
+
+            let mut i = 0;
+            let mut j = 0;
+            while i < current_items.len() && j < desired_items.len() {
+                let (cur_k, cur_d) = &current_items[i];
+                let des_item = &desired_items[j];
+                if *cur_k < des_item.key {
+                    to_delete.push(*cur_k);
+                    i += 1;
+                } else if *cur_k > des_item.key {
+                    to_insert.push((des_item.key, des_item.data.clone()));
+                    j += 1;
+                } else {
+                    if *cur_d != des_item.data {
+                        to_mutate.push((des_item.key, des_item.data.clone()));
                     }
-                };
-
-                let old_fst_node =
-                    read_node(fs, &pending_blocks, fst_root.bytenr)?;
-                let chunk_tree_uuid = old_fst_node.chunk_tree_uuid();
-                let flags = old_fst_node.flags();
-
-                let fst_leaf = Leaf {
-                    bytenr: fst_target,
-                    flags,
-                    metadata_uuid: sb.metadata_uuid,
-                    chunk_tree_uuid,
-                    generation: new_generation,
-                    owner: FREE_SPACE_TREE_OBJECTID,
-                    csum_type: sb.csum_type,
-                    items: allocator.emit_free_space_tree_items(),
-                };
-                // The same single-leaf limit, caught from the other side: the
-                // tree can start as one leaf and still not fit in one once
-                // this write fragments free space. `emit` would report this
-                // as a bare FilesystemFull, which reads as "the drive is
-                // full" — a different and much more alarming claim than the
-                // true one, and `RULES.md` requires an error to name its own
-                // operation.
-                if fst_leaf.free_space(sb.node_size) == 0 {
-                    return Err(LuksError::UnsupportedFsFeature(
-                        "btrfs free-space tree no longer fits in a single leaf".into(),
-                    ));
+                    i += 1;
+                    j += 1;
                 }
-                let fst_raw = fst_leaf.emit(sb.node_size)?;
-                pending_blocks.insert(fst_target, fst_raw);
+            }
+            while i < current_items.len() {
+                to_delete.push(current_items[i].0);
+                i += 1;
+            }
+            while j < desired_items.len() {
+                to_insert.push((desired_items[j].key, desired_items[j].data.clone()));
+                j += 1;
+            }
+
+            let fst_modified =
+                !to_delete.is_empty() || !to_insert.is_empty() || !to_mutate.is_empty();
+
+            if fst_modified {
+                for del_key in to_delete {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &del_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let _ = leaf.delete_item(&del_key)?;
+                            Ok(())
+                        },
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for (mut_key, mut_data) in to_mutate {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &mut_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let idx = leaf.find_item(&mut_key).ok_or_else(|| {
+                                LuksError::NotFound("fst item to mutate not found in leaf".into())
+                            })?;
+                            leaf.items[idx].data = mut_data;
+                            Ok(())
+                        },
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for (ins_key, ins_data) in to_insert {
+                    let fst_res = cow_tree_insert(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        ins_key,
+                        ins_data,
+                        new_generation,
+                        &mut allocator,
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
 
                 // Update ROOT_ITEM for FREE_SPACE_TREE in ROOT_TREE
                 let fst_root_key = Key::new(FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
@@ -1012,15 +1117,15 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                     &mut allocator,
                     |leaf| {
                         let idx = leaf.find_item(&fst_root_key).ok_or_else(|| {
-                            LuksError::NotFound("fst root item not found".into())
+                            LuksError::NotFound("fst root item not found in root tree".into())
                         })?;
                         let data = &mut leaf.items[idx].data;
                         if data.len() < 239 {
                             return Err(LuksError::CorruptFs("root item truncated"));
                         }
                         data[160..168].copy_from_slice(&new_generation.to_le_bytes());
-                        data[176..184].copy_from_slice(&fst_target.to_le_bytes());
-                        data[238] = 0; // level 0
+                        data[176..184].copy_from_slice(&fst_bytenr.to_le_bytes());
+                        data[238] = *fst_level;
                         Ok(())
                     },
                 )?;
@@ -1142,6 +1247,10 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
              had blocks to record after the round limit",
         ));
     }
+
+    crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::ConvergeRounds {
+        rounds: rounds_executed,
+    });
 
     let final_bytes_used = allocator
         .block_groups

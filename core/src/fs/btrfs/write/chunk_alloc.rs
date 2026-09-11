@@ -13,10 +13,9 @@ use std::collections::HashMap;
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::chunk::{Chunk, ChunkMap, DevExtent, BLOCK_GROUP_DATA};
-use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
     Key, CHUNK_TREE_OBJECTID, DEV_EXTENT_KEY, DEV_ITEMS_OBJECTID, DEV_ITEM_KEY, DEV_TREE_OBJECTID,
-    EXTENT_TREE_OBJECTID, FIRST_CHUNK_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID,
+    EXTENT_TREE_OBJECTID, FIRST_CHUNK_TREE_OBJECTID,
 };
 use crate::fs::btrfs::write::alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
@@ -209,11 +208,6 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
     gate::check_free_space_tree_no_bitmaps(fs)?;
     gate::check_sys_chunk_array_capacity(fs.superblock())?;
     let sb = fs.superblock();
-    if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
-        if let Ok(fst_root) = fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
-            gate::check_free_space_tree_shape(&fst_root)?;
-        }
-    }
 
     // 2. Search (§7 steps 1-3)
     let logical = next_logical(fs.chunk_map());

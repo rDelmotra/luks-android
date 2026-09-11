@@ -106,7 +106,7 @@ sealed class Verdict {
  * A single-block ext4 directory holds `(blockSize - 36) / 20` entries: 36 bytes for
  * "." + ".." (12 bytes each, minimum record for a 1-2 char name) plus a 12-byte
  * metadata-checksum tail, leaving the rest for 20-byte records (the size measured
- * in core/tests/statfs.rs for its `f_NNNN.txt`-style names). This reproduces both
+ * in core/tests/integration/statfs.rs for its `f_NNNN.txt`-style names). This reproduces both
  * measured points exactly: 4096 -> 203, 1024 -> 49. We do not implement htree
  * conversion, so exceeding it strands a half-copied tree -- this must refuse
  * up front, never surface as a mid-copy failure.
