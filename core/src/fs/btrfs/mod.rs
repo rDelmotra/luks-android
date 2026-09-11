@@ -358,7 +358,7 @@ impl<D: ReadAt> Btrfs<D> {
     pub fn fs_tree(&self) -> TreeRoot {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {
-            if batch.target_tree.map(|t| t.objectid == tree::FS_TREE_OBJECTID).unwrap_or(true) {
+            if batch.target_tree().map(|t| t.objectid == tree::FS_TREE_OBJECTID).unwrap_or(true) {
                 let mut root = self.fs_tree;
                 root.bytenr = batch.fs_root.0;
                 root.level = batch.fs_root.1;
@@ -373,7 +373,7 @@ impl<D: ReadAt> Btrfs<D> {
     pub fn target_tree(&self) -> TreeRoot {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {
-            if let Some(mut target) = batch.target_tree {
+            if let Some(mut target) = batch.target_tree() {
                 target.bytenr = batch.fs_root.0;
                 target.level = batch.fs_root.1;
                 target.generation = batch.generation;
