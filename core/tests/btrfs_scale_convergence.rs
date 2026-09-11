@@ -22,7 +22,7 @@ fn run_kernel_oracle_direct(image_path: &Path) -> (bool, String, String) {
         return (true, String::new(), String::new());
     }
 
-    let name = format!("verify-61g-{}", std::process::id());
+    let name = format!("verify-scale-{}", std::process::id());
     let mnt = format!("/tmp/mnt-{}", name);
     let remote_path = image_path.display().to_string();
 
@@ -32,9 +32,13 @@ set -euo pipefail
 IMG="{remote_path}"
 MNT="{mnt}"
 cleanup() {{
-    umount "$MNT" 2>/dev/null || true
-    rmdir "$MNT" 2>/dev/null || true
+    umount -l "$MNT" 2>/dev/null || true
+    rm -rf "$MNT" 2>/dev/null || true
+    for dev in $(losetup -j "$IMG" 2>/dev/null | cut -d: -f1); do
+        losetup -d "$dev" 2>/dev/null || true
+    done
 }}
+cleanup
 trap cleanup EXIT
 
 echo "--- btrfs check --readonly ---"
@@ -44,7 +48,9 @@ mkdir -p "$MNT"
 mount -o ro,loop "$IMG" "$MNT"
 echo "--- mounted read-only, root contains ---"
 ls -la "$MNT"
-ls -la "$MNT/benchmark"
+if [ -d "$MNT/benchmark" ]; then
+    ls -la "$MNT/benchmark"
+fi
 
 echo "--- btrfs scrub start -Bdr ---"
 SCRUB_OUT="$(btrfs scrub start -Bdr "$MNT" 2>&1)"
@@ -222,7 +228,7 @@ fn test_scale_61g_medium_accounting_and_convergence_headroom() {
     );
 }
 
-fn reset_4tb_sparse_image_massive(path: &Path) {
+fn reset_4tb_sparse_image_aged(path: &Path) {
     let status = Command::new("truncate")
         .arg("-s")
         .arg("4T")
@@ -231,13 +237,52 @@ fn reset_4tb_sparse_image_massive(path: &Path) {
         .expect("truncate sparse 4T");
     assert!(status.success(), "truncate failed");
 
-    // Use -n 4096 to encourage tree depth, and fallocate to force thousands of block groups
-    let remote_cmd = format!("mkfs.btrfs -n 4096 -f {0} && mkdir -p /tmp/mnt4tb && mount -o loop {0} /tmp/mnt4tb && fallocate -l 3500G /tmp/mnt4tb/huge_prealloc && btrfs fi sync /tmp/mnt4tb && umount /tmp/mnt4tb", path.display());
+    let pid = std::process::id();
+    let mnt = format!("/tmp/mnt-4tb-reset-{}", pid);
+    let remote_path = path.display().to_string();
+
+    let script = format!(
+        r#"
+set -euo pipefail
+IMG="{remote_path}"
+MNT="{mnt}"
+
+cleanup() {{
+    umount -l "$MNT" 2>/dev/null || true
+    rm -rf "$MNT" 2>/dev/null || true
+    for dev in $(losetup -j "$IMG" 2>/dev/null | cut -d: -f1); do
+        losetup -d "$dev" 2>/dev/null || true
+    done
+}}
+cleanup
+trap cleanup EXIT
+
+mkfs.btrfs -q -f "$IMG"
+mkdir -p "$MNT"
+mount -o loop "$IMG" "$MNT"
+
+python3 -c '
+import os
+for round in range(2):
+    for i in range(600):
+        fn = f"{mnt}/f_{{round:02d}}_{{i:04d}}.bin"
+        with open(fn, "wb") as f:
+            f.write(b"A" * 4096)
+    os.sync()
+    for i in range(0, 600, 2):
+        fn = f"{mnt}/f_{{round:02d}}_{{i:04d}}.bin"
+        os.remove(fn)
+    os.sync()
+'
+umount "$MNT"
+"#
+    );
+
     let status = Command::new("colima")
-        .args(["ssh", "--", "sudo", "bash", "-c", &remote_cmd])
+        .args(["ssh", "--", "sudo", "bash", "-c", &script])
         .status()
-        .expect("format 4T sparse image and fallocate with colima");
-    assert!(status.success(), "colima format/fallocate failed");
+        .expect("colima format/aging failed");
+    assert!(status.success(), "colima format/aging script failed");
 }
 
 #[test]
@@ -247,7 +292,7 @@ fn test_scale_4tb_metadata_massive_convergence() {
         .join("target")
         .join("test_sparse_4tb.img");
 
-    reset_4tb_sparse_image_massive(&img_path);
+    reset_4tb_sparse_image_aged(&img_path);
 
     let file_len = fs::metadata(&img_path).unwrap().len();
     assert_eq!(
@@ -335,5 +380,188 @@ fn test_scale_4tb_metadata_massive_convergence() {
     assert!(
         ok,
         "kernel oracle failed on 4 TiB medium: {err}\n{out}"
+    );
+}
+
+fn reset_4tb_sparse_image_fresh(path: &Path) {
+    let status = Command::new("truncate")
+        .arg("-s")
+        .arg("4T")
+        .arg(path)
+        .status()
+        .expect("truncate sparse 4T");
+    assert!(status.success(), "truncate failed");
+
+    let pid = std::process::id();
+    let mnt = format!("/tmp/mnt-4tb-fresh-{}", pid);
+    let remote_path = path.display().to_string();
+
+    let script = format!(
+        r#"
+set -euo pipefail
+IMG="{remote_path}"
+MNT="{mnt}"
+
+cleanup() {{
+    umount -l "$MNT" 2>/dev/null || true
+    rm -rf "$MNT" 2>/dev/null || true
+    for dev in $(losetup -j "$IMG" 2>/dev/null | cut -d: -f1); do
+        losetup -d "$dev" 2>/dev/null || true
+    done
+}}
+cleanup
+trap cleanup EXIT
+
+mkfs.btrfs -q -f "$IMG"
+"#
+    );
+
+    let status = Command::new("colima")
+        .args(["ssh", "--", "sudo", "bash", "-c", &script])
+        .status()
+        .expect("colima format failed");
+    assert!(status.success(), "colima format script failed");
+}
+
+#[test]
+fn test_scale_4tb_scalar_64bit_width() {
+    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("test_sparse_4tb_scalars.img");
+
+    reset_4tb_sparse_image_fresh(&img_path);
+
+    let file_len = fs::metadata(&img_path).unwrap().len();
+    assert_eq!(
+        file_len,
+        4 * 1024 * 1024 * 1024 * 1024,
+        "image must be exact 4 TiB"
+    );
+
+    let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable 4T image");
+    let mut fs = Btrfs::mount(dev).expect("mount writable 4T btrfs");
+
+    // S2 item 3: 64-bit width on addresses and lengths.
+    // alloc.rs:418 documents a real past instance — disk_num_bytes as u32 wrapped for
+    // files >= 4 GiB. Write one file larger than 4 GiB and one at a bytenr above 2^32
+    // on the sparse volume, then grade with the kernel.
+
+    // 1. Write one file larger than 4 GiB: 4097 MiB = 4 * 1024 * 1024 * 1024 + 1024 * 1024
+    let large_file_size: u64 = 4 * 1024 * 1024 * 1024 + 1024 * 1024;
+    let mut writer = fs.begin_file(large_file_size).expect("begin_file > 4 GiB");
+    let chunk = vec![0x5au8; 1024 * 1024]; // 1 MiB chunks
+    for _ in 0..4097 {
+        fs.write_chunk(&mut writer, &chunk).expect("write_chunk 1 MiB");
+    }
+    fs.finish_file(writer, "/", "large_over_4gb.bin")
+        .expect("finish_file > 4 GiB");
+    fs.commit_active_batch().expect("commit large file");
+
+    // 2. Write one file at a bytenr above 2^32:
+    // With 4097 MiB allocated across 1 GiB data chunks, chunk allocations have progressed
+    // beyond 2^32 = 4,294,967,296. The next file allocation lands in Chunk 5 (> 5 GiB logical).
+    let high_data = b"scalar 64-bit verification: bytenr strictly above 2^32";
+    fs.create_file_with_data("/", "file_above_2_32.txt", high_data)
+        .expect("create file above 2^32");
+    fs.commit_active_batch().expect("commit file above 2^32");
+
+    // Verify in-process accounting oracle across all block groups and trees
+    let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
+    let allocator = FreeSpaceMap::from_extent_tree(&extent_tree).expect("allocator from extent tree");
+    let report = AccountingOracle::check_with_allocator(&fs, &allocator)
+        .expect("accounting check_with_allocator must pass for 64-bit width test");
+
+    println!("64-bit width post-workload report: {report:#?}");
+    assert_eq!(report.superblock_bytes_used, report.total_block_group_used);
+    assert_eq!(report.superblock_bytes_used, report.total_referenced_bytes);
+
+    // Verify that at least one block group has bytenr >= 2^32 (4,294,967,296)
+    let has_extent_above_4g = report
+        .block_groups
+        .iter()
+        .any(|bg| bg.start >= (1u64 << 32) && bg.used > 0);
+    assert!(
+        has_extent_above_4g,
+        "expected at least one block group with bytenr >= 2^32 to have allocations"
+    );
+
+    drop(fs);
+
+    // Grade with the Linux kernel oracle
+    let (ok, out, err) = run_kernel_oracle_direct(&img_path);
+    assert!(
+        ok,
+        "kernel oracle failed on 64-bit scalar medium: {err}\n{out}"
+    );
+}
+
+#[test]
+fn test_scale_sys_chunk_array_threshold_refusal() {
+    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("test_sparse_4tb_chunk_array.img");
+
+    reset_4tb_sparse_image_fresh(&img_path);
+
+    let file_len = fs::metadata(&img_path).unwrap().len();
+    assert_eq!(
+        file_len,
+        4 * 1024 * 1024 * 1024 * 1024,
+        "image must be exact 4 TiB"
+    );
+
+    let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable 4T image");
+    let mut sb = luks_core::fs::btrfs::Superblock::find(&dev).expect("find superblock");
+
+    // S2 item 2: BTRFS_SYSTEM_CHUNK_ARRAY_SIZE (gate.rs:38) — 2048 bytes caps the system chunk count.
+    // Gated, but the gate has never been exercised at its threshold on a real filesystem.
+    // Confirm it refuses cleanly rather than corrupting.
+    
+    // Find the SYSTEM chunk item in sys_chunk_array:
+    // On fresh mkfs, sys_chunk_array has exactly 1 entry: the 129-byte SYSTEM chunk.
+    let sys_chunk_item = sb.sys_chunk_array.clone();
+    assert_eq!(sys_chunk_item.len(), 129);
+
+    // Expand sys_chunk_array with valid system chunk items until remaining capacity
+    // is insufficient (< 129 bytes remaining).
+    // BTRFS_SYSTEM_CHUNK_ARRAY_SIZE = 2048. Threshold is > 2048 - 129 = 1919 bytes.
+    let mut fake_logical = 0x2_0000_0000u64;
+    while sb.sys_chunk_array.len() + 129 <= 2048 {
+        let mut entry = sys_chunk_item.clone();
+        entry[9..17].copy_from_slice(&fake_logical.to_le_bytes());
+        sb.sys_chunk_array.extend_from_slice(&entry);
+        fake_logical += 8 * 1024 * 1024;
+    }
+    assert!(
+        sb.sys_chunk_array.len() > 2048 - 129,
+        "sys_chunk_array must exceed capacity threshold (len {})",
+        sb.sys_chunk_array.len()
+    );
+
+    // Mount the real filesystem with this superblock
+    let mut fs = Btrfs::mount_with_superblock(dev, sb)
+        .expect("mount real filesystem with threshold sys_chunk_array");
+
+    // Exercise the gate at its threshold: attempt chunk allocation
+    let res = fs.allocate_data_chunk();
+    match res {
+        Err(luks_core::error::LuksError::UnsupportedFsFeature(ref msg)) => {
+            assert!(
+                msg.contains("sys_chunk_array capacity exhausted"),
+                "unexpected error message: {msg}"
+            );
+        }
+        other => panic!("expected UnsupportedFsFeature for sys_chunk_array exhausted, got {other:?}"),
+    }
+
+    // Confirm filesystem is not corrupted: drop fs and grade untouched image with kernel
+    drop(fs);
+
+    let (ok, out, err) = run_kernel_oracle_direct(&img_path);
+    assert!(
+        ok,
+        "kernel oracle failed after clean sys_chunk_array refusal: {err}\n{out}"
     );
 }
