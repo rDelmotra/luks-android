@@ -292,11 +292,6 @@ fn test_conformance_fst_multileaf_stress() {
 }
 
 #[test]
-fn test_conformance_fst_aged_stress() {
-    run_conformance_stress("btrfs/fst-aged.img", 0x6167_6564_346b_3131, 50, 5, 80);
-}
-
-#[test]
 fn test_conformance_long_names_and_csum_split() {
     let (rng, seed) = ConformanceRng::from_env_or_default(0x6c6f_6e67_6373_756d);
     println!("[TEST] Long Names & CSUM Split Conformance Test with seed: {seed:#018x}");

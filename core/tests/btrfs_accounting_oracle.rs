@@ -1049,5 +1049,76 @@ fn test_negative_control_fst_bitmap_coverage_gap() {
     }
 }
 
+#[test]
+fn test_negative_control_fst_bitmap_out_of_bounds() {
+    let scratch = ScratchFixture::new("btrfs/fst-bitmap.img", "neg_fst_bm_oob");
+    let dev = FileDevice::open(scratch.path()).expect("open fst-bitmap.img");
+    let fs = Btrfs::mount(dev).expect("mount fst-bitmap.img");
+
+    let fst_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::FREE_SPACE_TREE_OBJECTID)
+        .expect("fst root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(fst_root.bytenr)
+        .expect("map fst root");
+    let node = fs
+        .read_node(fst_root.bytenr)
+        .expect("read fst root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // In fst-bitmap.img, block group 13631488 (len 8388608) has a FREE_SPACE_BITMAP item at key (13631488, 200, 8388608).
+    // Corrupt its offset (length) to 16 MiB so that bm_start + bm_len (13631488 + 16777216) spills beyond bg_end (22020096).
+    let bm_idx = leaf
+        .items
+        .iter()
+        .position(|it| {
+            it.key.item_type == luks_core::fs::btrfs::tree::FREE_SPACE_BITMAP_KEY
+                && it.key.objectid == 13631488
+        })
+        .expect("find fst bitmap item for 13631488");
+
+    let corrupted_len = 16 * 1024 * 1024;
+    leaf.items[bm_idx].key.offset = corrupted_len;
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::FstBitmapOutOfBounds {
+            bg_start,
+            bg_len,
+            bm_start,
+            bm_len,
+        }) => {
+            println!(
+                "Negative control passed: detected FstBitmapOutOfBounds on bitmap BG {bg_start:#x} (len {bg_len}): bm_start {bm_start:#x}, bm_len {bm_len}",
+            );
+            assert_eq!(bg_start, 13631488);
+            assert_eq!(bg_len, 8388608);
+            assert_eq!(bm_start, 13631488);
+            assert_eq!(bm_len, corrupted_len);
+        }
+        other => panic!("expected Err(AccountingError::FstBitmapOutOfBounds), got: {other:?}"),
+    }
+}
+
 
 

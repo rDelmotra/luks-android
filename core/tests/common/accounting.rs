@@ -134,6 +134,13 @@ pub enum AccountingError {
         recorded_count: u32,
         actual_count: usize,
     },
+    /// Invariant A-7: FREE_SPACE_BITMAP item is outside block group bounds or in a non-bitmap block group.
+    FstBitmapOutOfBounds {
+        bg_start: u64,
+        bg_len: u64,
+        bm_start: u64,
+        bm_len: u64,
+    },
     /// Underlying filesystem read/corruption error.
     CorruptFs(String),
 }
@@ -276,6 +283,17 @@ impl std::fmt::Display for AccountingError {
             } => write!(
                 f,
                 "Invariant A-7: FREE_SPACE_INFO at {bg_start:#x} recorded count {recorded_count} does not match actual FST extent count {actual_count}",
+            ),
+            Self::FstBitmapOutOfBounds {
+                bg_start,
+                bg_len,
+                bm_start,
+                bm_len,
+            } => write!(
+                f,
+                "Invariant A-7: FREE_SPACE_BITMAP at [{bm_start:#x}..{:#x}] (len {bm_len}) outside block group [{bg_start:#x}..{:#x}] (len {bg_len})",
+                bm_start + bm_len,
+                bg_start + bg_len,
             ),
             Self::CorruptFs(msg) => write!(f, "Filesystem corruption during accounting check: {msg}"),
         }
@@ -661,6 +679,34 @@ impl AccountingOracle {
             fst_extents.sort_by_key(|&(start, _)| start);
 
             let sectorsize = fs.superblock().sector_size as u64;
+
+            // Invariant A-7: Verify every bitmap in fst_bitmaps belongs to a valid bitmap block group and stays within bounds.
+            for &(bm_start, bm_len, _) in &fst_bitmaps {
+                let matching_bg = extent_tree.block_groups.iter().find(|bg| {
+                    bm_start >= bg.start && bm_start < bg.start + bg.length
+                });
+                match matching_bg {
+                    Some(bg) => {
+                        let (_, flags) = fst_infos.get(&bg.start).copied().unwrap_or((0, 0));
+                        if flags & 1 == 0 || bm_start + bm_len > bg.start + bg.length {
+                            return Err(AccountingError::FstBitmapOutOfBounds {
+                                bg_start: bg.start,
+                                bg_len: bg.length,
+                                bm_start,
+                                bm_len,
+                            });
+                        }
+                    }
+                    None => {
+                        return Err(AccountingError::FstBitmapOutOfBounds {
+                            bg_start: 0,
+                            bg_len: 0,
+                            bm_start,
+                            bm_len,
+                        });
+                    }
+                }
+            }
 
             for bg in &extent_tree.block_groups {
                 let bg_end = bg.start + bg.length;
