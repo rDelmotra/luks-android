@@ -19,8 +19,9 @@ See [Build from source](README.md#build-from-source) in the README for toolchain
 
 This project grades correctness against real Linux kernel tooling, not just its own test suite:
 
-- Run `cargo test --workspace` before opening a PR. For anything touching the write path, also run with `--features luks_core/dangerous-write-support,luks_jni/dangerous-write-support`.
-- Prefer the graded suite (`tools/test-graded.sh`) over raw `cargo test` where practical — it verifies output against `cryptsetup`, `e2fsck`, and `btrfs check` rather than just checking the code agrees with itself.
+- Run `tools/run-harness.sh --all` before opening a PR. This executes unit, stress, integration, kernel-oracle grading, structural transition coverage, and Android JVM tests.
+- For Btrfs write-path changes, run `tools/run-harness.sh --transitions` and verify 0 transition gate misses.
+- `cargo test --workspace` (with `--features luks_core/dangerous-write-support,luks_jni/dangerous-write-support` for write path) is for local development only. It does not run kernel-oracle grading or transition coverage verification.
 - Tests must fail when the code under test is actually broken. A passing test over an empty collection, a mocked assertion, or a swallowed error (`.ok()`, `let _ =`, `unwrap_or_default()`) proves nothing — don't add one.
 - No silent skips. If a fixture or tool is missing, the test should panic or record an explicit skip, not pass quietly.
 

@@ -47,8 +47,6 @@ colima ssh -- tar cf - -C /tmp/luks-fixtures . | tar xf - -C fixtures/luks
 UUIDs are random per run, so regenerating requires updating the assertions in
 `core/tests/crypto_luks/luks2_real_fixtures.rs`.
 
-Stop the VM when finished: `colima stop`.
-
 ## ext4 images (`fixtures/*.img`)
 
 Built natively on macOS — no VM, no root, no mounting:
@@ -62,4 +60,38 @@ debugfs -w -R "write local.txt /remote.txt" ext4-test.img
 `debugfs` splits arguments on whitespace, so source paths cannot contain spaces.
 Destination names may contain UTF-8.
 
-btrfs images **cannot** be built on macOS and require the VM.
+## Btrfs images (`fixtures/btrfs/`)
+
+btrfs images **cannot** be built on macOS — there is no btrfs-progs for macOS,
+and most of these have to be mounted to be populated. Built with real
+`mkfs.btrfs` in the colima VM:
+
+```bash
+colima start --cpu 4 --memory 4 --disk 10
+colima ssh -- sudo apt-get install -y btrfs-progs
+colima ssh -- bash -lc 'mkdir -p /tmp/btrfs && cd /tmp/btrfs'
+colima ssh -- tee /tmp/btrfs/gen.sh < tools/gen-btrfs-fixtures.sh
+colima ssh -- bash /tmp/btrfs/gen.sh /tmp/btrfs/out
+colima ssh -- tar -C /tmp/btrfs/out -cf - . | tar -C fixtures/btrfs -xf -
+```
+
+Build a single fixture image:
+```bash
+colima ssh -- sudo bash /tmp/btrfs/gen.sh /tmp/btrfs/out fst-aged
+```
+
+| Fixture | Exercises |
+|---|---|
+| `plain.img` | Default geometry: 4 KiB sectors, 16 KiB nodes, metadata DUP |
+| `compress.img` | zstd/LZO/zlib compression, holes, inline extents |
+| `mixed-4k.img` | Mixed block groups, nodesize == sectorsize |
+| `subvol.img` | More than one fs tree |
+| `nonmixed-4k.img` | 4 KiB nodesize, dedicated metadata chunk |
+| `sha256-4k.img` | 32-byte checksums (sha256 volume; write path refuses it — issue 44) |
+| `fst-aged.img` | ~500 free-space-tree extents, ~80-90% of the single-leaf ceiling (16 KiB nodes) |
+| `fst-multileaf.img` | 4096-byte nodes, free-space-tree root level >= 1 |
+| `fst-bitmap.img` | At least one block group with `flags & USING_BITMAPS` |
+
+`REQUIRED_BTRFS` in `tools/provision-fixtures.sh` is the authoritative list —
+check there if this table drifts.
+

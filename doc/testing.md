@@ -14,19 +14,39 @@ cat tools/README-fixtures.md
 cargo test --workspace
 cargo test --workspace --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support
 ```
+`core/tests/` is organized into domain subdirectories (`btrfs_ops/`, `fs_permutation/`,
+`txn_batch/`, etc.) — see [`core/tests/README.md`](../core/tests/README.md) for the
+layout and a legacy-path lookup table. Test names are preserved as explicit
+`[[test]]` targets in `core/Cargo.toml`, so `cargo test --test <name>` still works
+without knowing which subdirectory a test lives in.
 
-### 2. Linux Kernel Oracle Graded Suite
+### 2. Autonomous Test Harness (recommended before a PR)
+```bash
+# All 7 tiers: fast/stress/integration/oracle/strict/transitions/android
+tools/run-harness.sh --all
+
+# Just the structural transition coverage gate
+tools/run-harness.sh --transitions
+
+# Quick local iteration: fast unit + stress permutation tests only (<20s)
+tools/run-harness.sh
+```
+Executes six-tree B-tree validation, in-process accounting oracle (A-1 through A-7),
+structural transition coverage gating, and Linux kernel oracle verification.
+Run `tools/run-harness.sh` with no arguments to view all tier flags.
+
+### 3. Linux Kernel Oracle Graded Suite (granular alternative to `--oracle`)
 ```bash
 tools/test-graded.sh --workspace --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support
 ```
 
-### 3. Write-Path Safety Gate
+### 4. Write-Path Safety Gate
 Verifies that release builds contain zero write symbols or entry points:
 ```bash
 bash tools/verify-no-write-code.sh
 ```
 
-### 4. Android Unit Tests
+### 5. Android Unit Tests
 ```bash
 cd android && ./gradlew testDebugUnitTest
 ```
