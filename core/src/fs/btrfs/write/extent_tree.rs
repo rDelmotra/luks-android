@@ -643,14 +643,14 @@ pub(crate) fn collect_tree_items<D: ReadAt>(
 /// `INODE_ITEM_KEY` only would still be correct, just costs more steps when
 /// an inode's non-INODE_ITEM items (e.g. a later DIR_ITEM/EXTENT_DATA,
 /// type > 1) sort after it.
-pub(crate) fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>) -> Result<u64> {
+pub fn find_max_inode<D: ReadAt>(fs: &Btrfs<D>, tree_bytenr: u64) -> Result<u64> {
     const MAX_REAL_INODE_KEY: Key = Key {
         objectid: 0xFFFF_FFFF_FFFF_FEFF,
         item_type: u8::MAX,
         offset: u64::MAX,
     };
 
-    let mut cursor = fs.search_le(fs.fs_tree().bytenr, &MAX_REAL_INODE_KEY)?;
+    let mut cursor = fs.search_le(tree_bytenr, &MAX_REAL_INODE_KEY)?;
     loop {
         if !cursor.valid() {
             return Ok(256);

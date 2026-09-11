@@ -16,7 +16,7 @@ All integration tests are registered in [`core/Cargo.toml`](../Cargo.toml) with 
 | [`fs_permutation/`](fs_permutation/) | 11 | Structural B-tree permutations, leaf splits, node surgery, interior collapse, FST collapse, scale convergence, and oracles | `dangerous-write-support` |
 | [`txn_batch/`](txn_batch/) | 10 | Atomic commit pipeline, reservation stages (B2, C, FG), transaction batching, crash safety, fail-closed aborts | `dangerous-write-support` |
 | [`alloc_chunk/`](alloc_chunk/) | 8 | Btrfs chunk allocation, free space search, block group management, system chunk valves, extent trees | Default / `dangerous-write-support` |
-| [`btrfs_ops/`](btrfs_ops/) | 13 | High-level file and directory CRUD (read, create, write, delete, mkdir, rename, finish csum, timestamp, gates) | Default / `dangerous-write-support` |
+| [`btrfs_ops/`](btrfs_ops/) | 14 | High-level file and directory CRUD (read, create, write, delete, mkdir, rename, finish csum, timestamp, gates, subvolume prep) | Default / `dangerous-write-support` |
 | [`integration/`](integration/) | 6 | Full-stack scenarios, statfs capacity, tree import replays, forensic logs, and oracle ledgers | Default / `dangerous-write-support` |
 | [`common/`](common/) | - | Shared test harnesses: `accounting.rs`, `btree_validator.rs`, `fs_model.rs`, `mem_device.rs`, `oracle.rs`, `scratch.rs` | Shared helper modules |
 
@@ -136,6 +136,7 @@ If documentation, commit notes, or an agent refers to a legacy path directly und
 - `core/tests/btrfs_crash_safety.rs` -> `core/tests/btrfs_ops/btrfs_crash_safety.rs`
 - `core/tests/btrfs_write_gate.rs` -> `core/tests/btrfs_ops/btrfs_write_gate.rs`
 - `core/tests/btrfs_csum_type_gate.rs` -> `core/tests/btrfs_ops/btrfs_csum_type_gate.rs`
+- `core/tests/btrfs_subvol_prep.rs` -> `core/tests/btrfs_ops/btrfs_subvol_prep.rs`
 
 ### `integration/`
 - `core/tests/end_to_end.rs` -> `core/tests/integration/end_to_end.rs`

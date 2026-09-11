@@ -25,7 +25,6 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let trimmed = path.trim_matches('/');
         if trimmed.is_empty() {
@@ -41,6 +40,7 @@ impl Transaction {
         if !located_parent.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
+        gate::check_writeable_subvolume(&located_parent.tree)?;
         if located_parent.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "subvolume file deletion not yet supported".into(),
@@ -48,6 +48,7 @@ impl Transaction {
         }
 
         let located_target = fs.resolve_no_follow(fs.fs_tree(), path)?;
+        gate::check_writeable_subvolume(&located_target.tree)?;
         if located_target.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "subvolume file deletion not yet supported".into(),

@@ -27,12 +27,12 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let located = fs.resolve_no_follow(fs.fs_tree(), file_path)?;
         if located.inode.file_type().is_dir() {
             return Err(LuksError::IsADirectory(file_path.to_string()));
         }
+        gate::check_writeable_subvolume(&located.tree)?;
         if located.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "subvolume file write not yet supported".into(),
@@ -245,12 +245,12 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
         if !located_parent.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
+        gate::check_writeable_subvolume(&located_parent.tree)?;
         if located_parent.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "subvolume file creation not yet supported".into(),
@@ -262,7 +262,7 @@ impl Transaction {
         // Check if file already exists in parent directory
         let name_hash = crate::fs::btrfs::crc32c::name_hash(filename.as_bytes());
         let dir_item_key = Key::new(parent_ino, crate::fs::btrfs::tree::DIR_ITEM_KEY, name_hash);
-        if let Some(item_data) = fs.find_item(fs.fs_tree().bytenr, &dir_item_key)? {
+        if let Some(item_data) = fs.find_item(located_parent.tree.bytenr, &dir_item_key)? {
             let entries = crate::fs::btrfs::inode::parse_dir_entries(&item_data)?;
             if entries.iter().any(|e| e.name == filename.as_bytes()) {
                 return Err(LuksError::AlreadyExists(format!(
@@ -283,12 +283,12 @@ impl Transaction {
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
 
         // Find highest existing inode objectid and next directory index
-        let max_ino = find_max_inode(fs)?;
+        let max_ino = find_max_inode(fs, located_parent.tree.bytenr)?;
         let new_ino = if max_ino < 256 { 256 } else { max_ino + 1 };
 
         let mut max_dir_index = 1u64;
         fs.for_each_item(
-            fs.fs_tree().bytenr,
+            located_parent.tree.bytenr,
             parent_ino,
             crate::fs::btrfs::tree::DIR_INDEX_KEY,
             &mut |key, _| {

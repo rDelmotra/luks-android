@@ -9,7 +9,7 @@ use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::cow_tree_mutate;
 use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result, ExtentTree};
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::Btrfs;
+use crate::fs::btrfs::{Btrfs, TreeRoot};
 
 use super::Transaction;
 
@@ -17,12 +17,18 @@ impl Transaction {
     /// Prepare a transaction that updates the `mtime` and `ctime` of an existing file inode.
     pub fn update_inode_mtime<D: ReadAt>(
         fs: &Btrfs<D>,
+        target_tree: TreeRoot,
         inode_number: u64,
         mtime_sec: u64,
         mtime_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&fs.fs_tree())?;
+        gate::check_writeable_subvolume(&target_tree)?;
+        if target_tree.objectid != FS_TREE_OBJECTID {
+            return Err(LuksError::UnsupportedFsFeature(
+                "btrfs subvolume write not yet supported".into(),
+            ));
+        }
 
         let sb = fs.superblock();
         let new_generation = sb.generation + 1;
@@ -38,8 +44,8 @@ impl Transaction {
         let fs_res = cow_tree_mutate(
             fs,
             &pending_blocks,
-            fs.fs_tree().bytenr,
-            fs.fs_tree().level,
+            target_tree.bytenr,
+            target_tree.level,
             FS_TREE_OBJECTID,
             &inode_key,
             new_generation,
@@ -77,7 +83,7 @@ impl Transaction {
             FS_TREE_OBJECTID,
         )?;
 
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = target_tree;
         new_fs_tree.bytenr = fs_res.new_root_bytenr;
         new_fs_tree.level = fs_res.new_root_level;
         new_fs_tree.generation = new_generation;

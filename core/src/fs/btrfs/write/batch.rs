@@ -22,7 +22,8 @@ use crate::fs::btrfs::write::file::BtrfsFileWriter;
 use crate::fs::btrfs::write::interval_set::IntervalSet;
 use crate::fs::btrfs::write::node;
 use crate::fs::btrfs::write::txn::Transaction;
-use crate::fs::btrfs::{Btrfs, Node};
+use crate::fs::btrfs::write::gate;
+use crate::fs::btrfs::{Btrfs, Node, TreeRoot};
 
 /// Snapshot of batch state taken before adding a file, enabling single-file rollback.
 #[derive(Debug, Clone)]
@@ -34,8 +35,10 @@ pub struct FileMark {
     pub blocks_to_add: Vec<(u64, u8, u64)>,
     pub blocks_to_remove: Vec<(u64, u8)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
-    pub next_ino: u64,
+    pub next_ino: Option<u64>,
+    pub target_tree: Option<TreeRoot>,
     pub next_dir_index: HashMap<u64, u64>,
+    pub parents: HashMap<String, (u64, u32, u32)>,
     pub handed_out: IntervalSet,
     pub accumulated_files: usize,
     pub accumulated_data_bytes: u64,
@@ -51,7 +54,8 @@ pub struct Batch {
     pub blocks_to_add: Vec<(u64, u8, u64)>,
     pub blocks_to_remove: Vec<(u64, u8)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
-    pub next_ino: u64,
+    pub next_ino: Option<u64>,
+    pub target_tree: Option<TreeRoot>,
     pub next_dir_index: HashMap<u64, u64>,
     pub parents: HashMap<String, (u64, u32, u32)>, // path -> (ino, uid, gid)
     pub handed_out: IntervalSet,
@@ -79,9 +83,6 @@ impl Batch {
         let fs_tree = fs.fs_tree();
         let fs_root = (fs_tree.bytenr, fs_tree.level);
 
-        let max_ino = find_max_inode(fs)?;
-        let next_ino = if max_ino < 256 { 256 } else { max_ino + 1 };
-
         Ok(Self {
             generation,
             allocator,
@@ -92,7 +93,8 @@ impl Batch {
             blocks_to_add: Vec::new(),
             blocks_to_remove: Vec::new(),
             data_extents_to_add: Vec::new(),
-            next_ino,
+            next_ino: None,
+            target_tree: None,
             next_dir_index: HashMap::new(),
             parents: HashMap::new(),
             handed_out: IntervalSet::new(),
@@ -113,7 +115,9 @@ impl Batch {
             blocks_to_remove: self.blocks_to_remove.clone(),
             data_extents_to_add: self.data_extents_to_add.clone(),
             next_ino: self.next_ino,
+            target_tree: self.target_tree,
             next_dir_index: self.next_dir_index.clone(),
+            parents: self.parents.clone(),
             handed_out: self.handed_out.clone(),
             accumulated_files: self.accumulated_files,
             accumulated_data_bytes: self.accumulated_data_bytes,
@@ -131,7 +135,9 @@ impl Batch {
         self.blocks_to_remove = mark.blocks_to_remove;
         self.data_extents_to_add = mark.data_extents_to_add;
         self.next_ino = mark.next_ino;
+        self.target_tree = mark.target_tree;
         self.next_dir_index = mark.next_dir_index;
+        self.parents = mark.parents;
         self.handed_out = mark.handed_out;
         self.accumulated_files = mark.accumulated_files;
         self.accumulated_data_bytes = mark.accumulated_data_bytes;
@@ -329,18 +335,37 @@ impl Batch {
         }
 
         let (parent_ino, parent_uid, parent_gid) =
-            if let Some(&(ino, uid, gid)) = self.parents.get(parent_path) {
+            if let (Some(_), Some(&(ino, uid, gid))) = (self.target_tree, self.parents.get(parent_path)) {
                 (ino, uid, gid)
             } else {
                 let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
                 if !located_parent.inode.file_type().is_dir() {
                     return Err(LuksError::NotADirectory(parent_path.to_string()));
                 }
+                gate::check_writeable_subvolume(&located_parent.tree)?;
+
+                if let Some(target) = self.target_tree {
+                    if target.objectid != located_parent.tree.objectid {
+                        return Err(LuksError::UnsupportedFsFeature(
+                            "multi-subvolume batch not supported".into(),
+                        ));
+                    }
+                }
+
                 if located_parent.tree.objectid != FS_TREE_OBJECTID {
                     return Err(LuksError::UnsupportedFsFeature(
                         "subvolume file creation not yet supported".into(),
                     ));
                 }
+
+                if self.target_tree.is_none() {
+                    let max_ino = find_max_inode(fs, located_parent.tree.bytenr)?;
+                    let next = if max_ino < 256 { 256 } else { max_ino + 1 };
+                    self.next_ino = Some(next);
+                    self.target_tree = Some(located_parent.tree);
+                    self.fs_root = (located_parent.tree.bytenr, located_parent.tree.level);
+                }
+
                 let ino = located_parent.inode.objectid;
                 let uid = located_parent.inode.uid;
                 let gid = located_parent.inode.gid;
@@ -367,8 +392,9 @@ impl Batch {
         let sb = fs.superblock();
         let node_size = sb.node_size as u64;
         let new_generation = self.generation;
-        let new_ino = self.next_ino;
-        self.next_ino += 1;
+        let next_ino_ref = self.next_ino.as_mut().expect("next_ino bound with target_tree");
+        let new_ino = *next_ino_ref;
+        *next_ino_ref += 1;
 
         let dir_index = if let Some(next_idx) = self.next_dir_index.get_mut(&parent_ino) {
             let idx = *next_idx;
@@ -376,7 +402,7 @@ impl Batch {
             idx
         } else {
             let mut max_dir_index = 1u64;
-            fs.for_each_item(fs.fs_tree().bytenr, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
+            fs.for_each_item(self.fs_root.0, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
                 if key.offset > max_dir_index {
                     max_dir_index = key.offset;
                 }
@@ -668,7 +694,7 @@ impl Batch {
     /// Commit the current batch state to disk and re-arm the batch for the next file
     /// while preserving the cached allocator, next_ino, next_dir_index, and parent directory cache.
     pub fn commit_and_rearm<D: WriteAt>(&mut self, fs: &mut Btrfs<D>) -> Result<Transaction> {
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = self.target_tree.unwrap_or_else(|| fs.fs_tree());
         new_fs_tree.bytenr = self.fs_root.0;
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;
@@ -702,6 +728,11 @@ impl Batch {
         // `data_extents_to_add` are already empty — `std::mem::take` moved
         // their contents into `converge_and_finalize` above.
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
+        if let Some(ref mut target) = self.target_tree {
+            target.bytenr = txn.new_fs_tree.bytenr;
+            target.level = txn.new_fs_tree.level;
+            target.generation = txn.new_generation;
+        }
         self.csum_root = None;
         self.generation = txn.new_generation;
         self.handed_out.clear();
@@ -714,7 +745,7 @@ impl Batch {
 
     /// Commit the batch into a Transaction ready to be committed to disk.
     pub fn commit<D: WriteAt>(self, fs: &mut Btrfs<D>) -> Result<Transaction> {
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = self.target_tree.unwrap_or_else(|| fs.fs_tree());
         new_fs_tree.bytenr = self.fs_root.0;
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;

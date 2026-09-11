@@ -60,7 +60,6 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&fs.fs_tree())?;
 
         let plan = match resolve_rename(
             fs,
@@ -216,6 +215,9 @@ fn resolve_rename<D: ReadAt>(
     let located_old_parent = fs.resolve_no_follow(fs.fs_tree(), old_parent_path)?;
     let located_new_parent = fs.resolve_no_follow(fs.fs_tree(), new_parent_path)?;
 
+    gate::check_writeable_subvolume(&located_old_parent.tree)?;
+    gate::check_writeable_subvolume(&located_new_parent.tree)?;
+
     if located_old_parent.tree.objectid != FS_TREE_OBJECTID
         || located_new_parent.tree.objectid != FS_TREE_OBJECTID
     {
@@ -254,7 +256,7 @@ fn resolve_rename<D: ReadAt>(
     // Same source and destination: no-op
     if old_parent_ino == new_parent_ino && old_name == new_name {
         return Ok(RenameResolution::NoOp(Transaction::update_inode_mtime(
-            fs, child_ino, now_sec, now_nsec,
+            fs, located_old_parent.tree, child_ino, now_sec, now_nsec,
         )?));
     }
 
@@ -311,7 +313,7 @@ fn resolve_rename<D: ReadAt>(
         if dest_ino == child_ino {
             // Same file
             return Ok(RenameResolution::NoOp(Transaction::update_inode_mtime(
-                fs, child_ino, now_sec, now_nsec,
+                fs, located_new_parent.tree, child_ino, now_sec, now_nsec,
             )?));
         }
 

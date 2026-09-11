@@ -26,7 +26,8 @@ pub use commit::commit_transaction;
 pub use cow::cow_tree_mutate;
 pub use exclude::compute_sb_exclusions;
 pub use extent_tree::{
-    AllocatedExtent, BlockGroupItem, ExtentItem, ExtentTree, InlineBackref, MetadataItem,
+    find_max_inode, AllocatedExtent, BlockGroupItem, ExtentItem, ExtentTree, InlineBackref,
+    MetadataItem,
 };
 pub use interval_set::IntervalSet;
 pub use node::{InteriorEntry, InteriorNode, Leaf, LeafItem};
@@ -87,6 +88,7 @@ impl<D: WriteAt> Btrfs<D> {
     pub fn set_mtime(&mut self, path: &str, mtime_sec: u64, mtime_nsec: u32) -> Result<()> {
         self.commit_active_batch()?;
         let located = self.resolve_no_follow(self.fs_tree(), path)?;
+        gate::check_writeable_subvolume(&located.tree)?;
         if located.tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "btrfs subvolume write not yet supported".into(),
@@ -94,6 +96,7 @@ impl<D: WriteAt> Btrfs<D> {
         }
         let txn = Transaction::update_inode_mtime(
             self,
+            located.tree,
             located.inode.objectid,
             mtime_sec,
             mtime_nsec,
@@ -138,6 +141,7 @@ impl<D: WriteAt> Btrfs<D> {
         };
         let (txn, new_ino) = Transaction::create_directory_in_dir(
             self,
+            self.fs_tree(),
             parent_ino,
             located_parent.uid,
             located_parent.gid,

@@ -118,3 +118,4 @@ fixtures/
 scratch/
 DELETE/
 notes/
+*.md
