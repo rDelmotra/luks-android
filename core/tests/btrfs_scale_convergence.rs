@@ -221,3 +221,119 @@ fn test_scale_61g_medium_accounting_and_convergence_headroom() {
         "kernel oracle failed on 61 GiB medium: {err}\n{out}"
     );
 }
+
+fn reset_4tb_sparse_image_massive(path: &Path) {
+    let status = Command::new("truncate")
+        .arg("-s")
+        .arg("4T")
+        .arg(path)
+        .status()
+        .expect("truncate sparse 4T");
+    assert!(status.success(), "truncate failed");
+
+    // Use -n 4096 to encourage tree depth, and fallocate to force thousands of block groups
+    let remote_cmd = format!("mkfs.btrfs -n 4096 -f {0} && mkdir -p /tmp/mnt4tb && mount -o loop {0} /tmp/mnt4tb && fallocate -l 3500G /tmp/mnt4tb/huge_prealloc && btrfs fi sync /tmp/mnt4tb && umount /tmp/mnt4tb", path.display());
+    let status = Command::new("colima")
+        .args(["ssh", "--", "sudo", "bash", "-c", &remote_cmd])
+        .status()
+        .expect("format 4T sparse image and fallocate with colima");
+    assert!(status.success(), "colima format/fallocate failed");
+}
+
+#[test]
+fn test_scale_4tb_metadata_massive_convergence() {
+    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("test_sparse_4tb.img");
+
+    reset_4tb_sparse_image_massive(&img_path);
+
+    let file_len = fs::metadata(&img_path).unwrap().len();
+    assert_eq!(
+        file_len,
+        4 * 1024 * 1024 * 1024 * 1024,
+        "image must be exact 4 TiB"
+    );
+
+    let dev = FileDevice::open_writable(&img_path, file_len).expect("open writable 4T image");
+    let mut fs = Btrfs::mount(dev).expect("mount writable 4T btrfs");
+
+    luks_core::forensic::reset_structural_counts();
+
+    // Perform diverse operations on the massive 4 TB filesystem
+    fs.create_directory("/", "benchmark").expect("mkdir benchmark");
+    fs.create_directory("/benchmark", "sub").expect("mkdir sub");
+
+    // Write small files
+    for i in 0..50 {
+        let name = format!("file_{i:04}.txt");
+        let data = vec![((i * 19 + 7) & 0xFF) as u8; 1024];
+        fs.create_file_with_data("/benchmark/sub", &name, &data)
+            .expect("create file");
+    }
+
+    // Stream a 2 MiB file across chunks
+    let mut writer = fs.begin_file(2 * 1024 * 1024).expect("begin_file");
+    let chunk = vec![0xA5u8; 65536];
+    for _ in 0..32 {
+        fs.write_chunk(&mut writer, &chunk).expect("write_chunk");
+    }
+    fs.finish_file(writer, "/benchmark", "stream_2mb.bin")
+        .expect("finish_file");
+
+    // Commit active batch
+    fs.commit_active_batch().expect("commit active batch");
+
+    // Delete half the small files to trigger leaf deletions and extent prunings
+    for i in 0..25 {
+        let name = format!("/benchmark/sub/file_{i:04}.txt");
+        fs.delete_file(&name).expect("delete_file");
+    }
+
+    fs.commit_active_batch().expect("commit deletes");
+
+    // 3. In-process accounting oracle check with active allocator
+    let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
+    let allocator =
+        FreeSpaceMap::from_extent_tree(&extent_tree).expect("allocator from extent tree");
+    let post_report = AccountingOracle::check_with_allocator(&fs, &allocator)
+        .expect("accounting check_with_allocator must pass on 4T medium");
+
+    println!("4 TiB post-workload report: {post_report:#?}");
+    assert_eq!(
+        post_report.superblock_bytes_used,
+        post_report.total_block_group_used
+    );
+    assert_eq!(
+        post_report.superblock_bytes_used,
+        post_report.total_referenced_bytes
+    );
+
+    let counts = luks_core::forensic::get_structural_counts();
+    println!(
+        "4 TiB convergence: {} invocations, max {} rounds (limit 30)",
+        counts.converge_total_calls, counts.max_converge_rounds
+    );
+    assert!(
+        counts.converge_total_calls > 0,
+        "convergence loop never ran"
+    );
+    assert!(
+        counts.max_converge_rounds > 0,
+        "convergence rounds recorded as 0"
+    );
+    assert!(
+        counts.max_converge_rounds <= 12,
+        "convergence reached {} rounds on a 4 TiB medium against a hard limit of 30.",
+        counts.max_converge_rounds
+    );
+
+    drop(fs);
+
+    let (ok, out, err) = run_kernel_oracle_direct(&img_path);
+    assert!(
+        ok,
+        "kernel oracle failed on 4 TiB medium: {err}\n{out}"
+    );
+}
