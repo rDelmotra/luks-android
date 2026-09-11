@@ -45,7 +45,7 @@ colima ssh -- tar cf - -C /tmp/luks-fixtures . | tar xf - -C fixtures/luks
 ```
 
 UUIDs are random per run, so regenerating requires updating the assertions in
-`core/tests/luks2_real_fixtures.rs`.
+`core/tests/crypto_luks/luks2_real_fixtures.rs`.
 
 Stop the VM when finished: `colima stop`.
 

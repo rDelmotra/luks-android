@@ -20,7 +20,7 @@ import org.junit.Test
  * document provider, which no kernel can grade. Exporting alone can only be
  * checked against our own idea of what should have been written. Feeding the
  * exported bytes back through the *import* path -- which
- * `core/tests/tree_import_oracle.rs` already replays through the real btrfs
+ * `core/tests/integration/tree_import_oracle.rs` already replays through the real btrfs
  * writer -- turns "did the export produce the right bytes?" into a question
  * the kernel can answer, because a wrong export lands as a wrong tree on a
  * real filesystem.

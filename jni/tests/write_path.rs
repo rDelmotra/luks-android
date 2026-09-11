@@ -1580,7 +1580,7 @@ fn an_ordinary_refusal_from_delete_file_does_not_fence_the_write_session() {
 
 /// A device wrapper that lets exactly `budget` `write_at`/`flush` calls
 /// through, then answers every later one with a transport error — the same
-/// shape as `FailAfterNWrites` in `core/tests/btrfs_crash_safety.rs`, kept
+/// shape as `FailAfterNWrites` in `core/tests/btrfs_ops/btrfs_crash_safety.rs`, kept
 /// local here because these tests need to flip the budget with a live
 /// `Arc` *after* `unlock`, which that copy has no reason to expose.
 struct FailAfterNWrites {

@@ -55,7 +55,7 @@ make_luks2() {
 
 {
     echo "# Ground truth from real cryptsetup. Compared against our parser in"
-    echo "# core/tests/luks2_real_fixtures.rs"
+    echo "# core/tests/crypto_luks/luks2_real_fixtures.rs"
     echo "# $(cryptsetup --version)"
     echo "# password: test"
     echo
