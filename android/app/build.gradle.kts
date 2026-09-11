@@ -85,6 +85,8 @@ tasks.withType<Test>().configureEach {
         .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
+val isCodeQlAnalyze = providers.environmentVariable("CODEQL_ACTION_ANALYSIS_KEY").isPresent
+
 // Gradle has no idea Cargo exists. Rather than a plugin that breaks on every
 // AGP bump, the contract is: run tools/build-android-libs.sh, then build. This
 // check turns "forgot to run it" from an UnsatisfiedLinkError at runtime into a
@@ -92,6 +94,10 @@ tasks.withType<Test>().configureEach {
 val checkNativeLibs by tasks.registering {
     val soFile = layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libluks_jni.so")
     doLast {
+        if (isCodeQlAnalyze) {
+            logger.lifecycle("Skipping checkNativeLibs during CodeQL analyze autobuild.")
+            return@doLast
+        }
         if (!soFile.asFile.exists()) {
             throw GradleException(
                 """
@@ -128,6 +134,10 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 val checkNoWriteCodeInRelease by tasks.registering {
     val soFile = layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libluks_jni.so")
     doLast {
+        if (isCodeQlAnalyze) {
+            logger.lifecycle("Skipping checkNoWriteCodeInRelease during CodeQL analyze autobuild.")
+            return@doLast
+        }
         val needles = listOf(
             "nativeBenchmarkWrite",
             "nativeWriteFile",
@@ -206,4 +216,3 @@ dependencies {
     androidTestImplementation(libs.androidx.test.ext.junit)
     androidTestImplementation(libs.androidx.test.runner)
 }
-
