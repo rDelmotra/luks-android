@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::{
-    Key, CSUM_TREE_OBJECTID, FS_TREE_OBJECTID, INODE_ITEM_KEY,
+    Key, CSUM_TREE_OBJECTID, INODE_ITEM_KEY,
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
@@ -34,11 +34,6 @@ impl Transaction {
             return Err(LuksError::IsADirectory(file_path.to_string()));
         }
         gate::check_writeable_subvolume(&located.tree)?;
-        if located.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume file write not yet supported".into(),
-            ));
-        }
 
         let target_tree = TargetTree::new(located.tree);
         let ino = located.inode.objectid;
@@ -50,7 +45,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
         let mut data_extents_to_add = Vec::<(u64, u64, u64, u64, u64)>::new();
 
         // 1. Allocate data extent
@@ -253,11 +248,6 @@ impl Transaction {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
         gate::check_writeable_subvolume(&located_parent.tree)?;
-        if located_parent.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume file creation not yet supported".into(),
-            ));
-        }
 
         let target_tree = TargetTree::new(located_parent.tree);
         let parent_ino = located_parent.inode.objectid;
@@ -283,7 +273,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
 
         // Find highest existing inode objectid and next directory index
         let max_ino = find_max_inode(fs, located_parent.tree.bytenr)?;

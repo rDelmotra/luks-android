@@ -38,7 +38,6 @@ pub use txn::Transaction;
 
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::tree::FS_TREE_OBJECTID;
 use crate::fs::btrfs::Btrfs;
 
 /// How deep `delete_file`'s directory recursion may descend before refusing.
@@ -92,11 +91,6 @@ impl<D: WriteAt> Btrfs<D> {
         self.commit_active_batch()?;
         let located = self.resolve_no_follow(self.fs_tree(), path)?;
         gate::check_writeable_subvolume(&located.tree)?;
-        if located.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "btrfs subvolume write not yet supported".into(),
-            ));
-        }
         let txn = Transaction::update_inode_mtime(
             self,
             TargetTree::new(located.tree),
@@ -261,10 +255,15 @@ impl<D: WriteAt> Btrfs<D> {
         }
 
         let located = self.resolve_no_follow(self.fs_tree(), path)?;
-        if located.inode.file_type().is_dir() && located.tree.objectid == FS_TREE_OBJECTID {
+        if located.inode.file_type().is_dir() {
             let children = self.list_dir_by_inode(located.tree.bytenr, located.inode.objectid)?;
             let base = path.trim_end_matches('/');
             for child in children {
+                if child.is_subvolume {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "subvolume deletion is not supported".into(),
+                    ));
+                }
                 let child_path = if base.is_empty() {
                     format!("/{}", child.name)
                 } else {

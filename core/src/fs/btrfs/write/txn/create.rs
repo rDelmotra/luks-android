@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::tree::{Key, FS_TREE_OBJECTID, INODE_ITEM_KEY};
+use crate::fs::btrfs::tree::{Key, INODE_ITEM_KEY};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::extent_tree::{
@@ -32,11 +32,6 @@ impl Transaction {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
         gate::check_writeable_subvolume(&located_parent.tree)?;
-        if located_parent.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume file creation not yet supported".into(),
-            ));
-        }
 
         let target_tree = TargetTree::new(located_parent.tree);
         let parent_ino = located_parent.inode.objectid;
@@ -61,7 +56,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
 
         // Find highest existing inode objectid and next directory index
         let max_ino = find_max_inode(fs, located_parent.tree.bytenr)?;
@@ -286,11 +281,6 @@ impl Transaction {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
         gate::check_writeable_subvolume(&located_parent.tree)?;
-        if located_parent.tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume directory creation not yet supported".into(),
-            ));
-        }
 
         let parent_ino = located_parent.inode.objectid;
         Self::create_directory_in_dir(
@@ -318,11 +308,6 @@ impl Transaction {
     ) -> Result<(Self, u64)> {
         gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&parent_tree.root)?;
-        if parent_tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "subvolume directory creation not yet supported".into(),
-            ));
-        }
 
         // Check if entry already exists in parent directory
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
@@ -344,7 +329,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
 
         // Find highest existing inode objectid and next directory index
         let max_ino = find_max_inode(fs, parent_tree.bytenr())?;

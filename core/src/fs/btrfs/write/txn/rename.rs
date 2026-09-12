@@ -15,7 +15,7 @@ use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::{
     Key, CSUM_TREE_OBJECTID, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_CSUM_KEY, EXTENT_CSUM_OBJECTID,
-    EXTENT_DATA_KEY, FS_TREE_OBJECTID, INODE_ITEM_KEY, INODE_REF_KEY,
+    EXTENT_DATA_KEY, INODE_ITEM_KEY, INODE_REF_KEY,
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
@@ -92,7 +92,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
 
         let mut fs_root_bytenr = target_tree.bytenr();
         let mut fs_root_level = target_tree.level();
@@ -226,11 +226,9 @@ fn resolve_rename<D: ReadAt>(
     gate::check_writeable_subvolume(&located_old_parent.tree)?;
     gate::check_writeable_subvolume(&located_new_parent.tree)?;
 
-    if located_old_parent.tree.objectid != FS_TREE_OBJECTID
-        || located_new_parent.tree.objectid != FS_TREE_OBJECTID
-    {
+    if located_old_parent.tree.objectid != located_new_parent.tree.objectid {
         return Err(LuksError::UnsupportedFsFeature(
-            "subvolume rename not supported".into(),
+            "cross-subvolume rename not supported".into(),
         ));
     }
     let target_tree = TargetTree::new(located_old_parent.tree);
@@ -249,6 +247,12 @@ fn resolve_rename<D: ReadAt>(
     let old_entry = fs
         .lookup(target_tree.bytenr(), old_parent_ino, old_name)?
         .ok_or_else(|| LuksError::NotFound(format!("{}/{}", old_parent_path, old_name)))?;
+
+    if old_entry.is_subvolume() {
+        return Err(LuksError::UnsupportedFsFeature(
+            "subvolume rename not supported".into(),
+        ));
+    }
 
     let child_ino = old_entry.location.objectid;
     let child_is_dir = old_entry.file_type.is_dir();
@@ -318,6 +322,11 @@ fn resolve_rename<D: ReadAt>(
     let mut dest_replacement: Option<(u64, bool, u64, Vec<(u64, u64)>)> = None;
 
     if let Some(dest_entry) = dest_entry_opt {
+        if dest_entry.is_subvolume() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "subvolume deletion is not supported".into(),
+            ));
+        }
         let dest_ino = dest_entry.location.objectid;
         if dest_ino == child_ino {
             // Same file
@@ -484,7 +493,7 @@ fn rename_delete_destination<D: ReadAt>(
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
-    blocks_to_remove: &mut Vec<(u64, u8)>,
+    blocks_to_remove: &mut Vec<(u64, u8, u64)>,
     node_size: u32,
     dest_ino: u64,
     dest_dir_index: u64,
@@ -633,7 +642,7 @@ fn rename_swap_dirent<D: ReadAt>(
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
-    blocks_to_remove: &mut Vec<(u64, u8)>,
+    blocks_to_remove: &mut Vec<(u64, u8, u64)>,
     node_size: u32,
     old_parent_ino: u64,
     old_name: &str,
@@ -889,7 +898,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
-    blocks_to_remove: &mut Vec<(u64, u8)>,
+    blocks_to_remove: &mut Vec<(u64, u8, u64)>,
     node_size: u32,
     child_ino: u64,
     old_parent_ino: u64,

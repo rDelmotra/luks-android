@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::tree::{Key, FS_TREE_OBJECTID, INODE_ITEM_KEY};
+use crate::fs::btrfs::tree::{Key, INODE_ITEM_KEY};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::cow_tree_mutate;
 use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result, ExtentTree};
@@ -25,11 +25,6 @@ impl Transaction {
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
         gate::check_writeable_subvolume(&target_tree.root)?;
-        if target_tree.objectid != FS_TREE_OBJECTID {
-            return Err(LuksError::UnsupportedFsFeature(
-                "btrfs subvolume write not yet supported".into(),
-            ));
-        }
 
         let sb = fs.superblock();
         let new_generation = sb.generation + 1;
@@ -38,7 +33,7 @@ impl Transaction {
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new(); // (bytenr, level, owner)
-        let mut blocks_to_remove = Vec::<(u64, u8)>::new(); // (bytenr, level)
+        let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new(); // (bytenr, level, owner)
 
         // 1. CoW the target tree to modify the target INODE_ITEM.
         let inode_key = Key::new(inode_number, INODE_ITEM_KEY, 0);

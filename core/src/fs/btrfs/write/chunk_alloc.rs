@@ -260,7 +260,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
     }
     let mut pending_blocks = HashMap::new();
     let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
-    let mut blocks_to_remove = Vec::<(u64, u8)>::new();
+    let mut blocks_to_remove = Vec::<(u64, u8, u64)>::new();
 
     // 3. DEV_TREE (Root 4): insert DEV_EXTENT
     let dev_tree = fs.tree_root(DEV_TREE_OBJECTID)?;

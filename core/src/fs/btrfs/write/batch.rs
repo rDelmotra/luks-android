@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::{
-    Key, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_DATA_KEY, FS_TREE_OBJECTID, INODE_ITEM_KEY,
+    Key, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_DATA_KEY, INODE_ITEM_KEY,
     INODE_REF_KEY,
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
@@ -34,7 +34,7 @@ pub struct FileMark {
     pub csum_root: Option<(u64, u8)>,
     pub pending_blocks: HashMap<u64, Vec<u8>>,
     pub blocks_to_add: Vec<(u64, u8, u64)>,
-    pub blocks_to_remove: Vec<(u64, u8)>,
+    pub blocks_to_remove: Vec<(u64, u8, u64)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
     pub target: Option<(TargetTree, u64)>,
     pub next_dir_index: HashMap<u64, u64>,
@@ -52,7 +52,7 @@ pub struct Batch {
     pub pending_blocks: HashMap<u64, Vec<u8>>,
     pub pending_nodes: std::sync::Mutex<HashMap<u64, (u32, Node)>>,
     pub blocks_to_add: Vec<(u64, u8, u64)>,
-    pub blocks_to_remove: Vec<(u64, u8)>,
+    pub blocks_to_remove: Vec<(u64, u8, u64)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
     pub target: Option<(TargetTree, u64)>,
     pub next_dir_index: HashMap<u64, u64>,
@@ -356,12 +356,6 @@ impl Batch {
                             "multi-subvolume batch not supported".into(),
                         ));
                     }
-                }
-
-                if located_parent.tree.objectid != FS_TREE_OBJECTID {
-                    return Err(LuksError::UnsupportedFsFeature(
-                        "subvolume file creation not yet supported".into(),
-                    ));
                 }
 
                 if self.target.is_none() {

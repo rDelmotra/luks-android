@@ -505,7 +505,7 @@ pub fn read_block_groups<D: ReadAt>(fs: &Btrfs<D>) -> Result<Vec<BlockGroupItem>
 pub(crate) fn record_cow_result(
     res: &CowResult,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
-    blocks_to_remove: &mut Vec<(u64, u8)>,
+    blocks_to_remove: &mut Vec<(u64, u8, u64)>,
     allocator: &mut FreeSpaceMap,
     pending_blocks: &mut HashMap<u64, Vec<u8>>,
     node_size: u32,
@@ -534,10 +534,10 @@ pub(crate) fn record_cow_result(
             // allocator here, so leaving it in `pending_blocks` would let a
             // later reuse of the same address read the emptied node back.
             pending_blocks.remove(&b);
+            allocator.free_metadata(b, node_size)?;
         } else {
-            blocks_to_remove.push((b, lvl));
+            blocks_to_remove.push((b, lvl, owner));
         }
-        allocator.free_metadata(b, node_size)?;
     }
     for (b, data) in &res.emitted_blocks {
         pending_blocks.insert(*b, data.clone());
@@ -675,7 +675,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     pending_data: Vec<(u64, Vec<u8>)>,
     mut allocator: FreeSpaceMap,
     mut blocks_to_add: Vec<(u64, u8, u64)>,
-    mut blocks_to_remove: Vec<(u64, u8)>,
+    mut blocks_to_remove: Vec<(u64, u8, u64)>,
     data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
     data_extents_to_remove: Vec<(u64, u64)>,
 ) -> Result<Transaction> {
@@ -699,9 +699,18 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
             None
         };
 
-    // 1. Update FS_TREE root item in ROOT_TREE if modified.
-    if new_fs_tree.bytenr != fs.fs_tree().bytenr {
-        let fs_root_key = Key::new(FS_TREE_OBJECTID, ROOT_ITEM_KEY, 0);
+    // 1. Update target fs tree (FS_TREE or subvolume) root item in ROOT_TREE if modified.
+    let target_tree_modified = if new_fs_tree.objectid == FS_TREE_OBJECTID {
+        new_fs_tree.bytenr != fs.fs_tree().bytenr
+    } else {
+        match fs.tree_root(new_fs_tree.objectid) {
+            Ok(orig) => new_fs_tree.bytenr != orig.bytenr,
+            Err(_) => true,
+        }
+    };
+
+    if target_tree_modified {
+        let fs_root_key = Key::new(new_fs_tree.objectid, ROOT_ITEM_KEY, 0);
         let fs_root_bytenr = new_fs_tree.bytenr;
         let fs_root_level = new_fs_tree.level;
 
@@ -725,6 +734,12 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 data[160..168].copy_from_slice(&new_generation.to_le_bytes());
                 data[176..184].copy_from_slice(&fs_root_bytenr.to_le_bytes());
                 data[238] = fs_root_level;
+                if data.len() >= 247 {
+                    data[239..247].copy_from_slice(&new_generation.to_le_bytes());
+                }
+                if data.len() >= 303 {
+                    data[295..303].copy_from_slice(&new_generation.to_le_bytes());
+                }
                 Ok(())
             },
         )?;
@@ -897,8 +912,9 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         }
 
         let to_remove = std::mem::take(&mut blocks_to_remove);
-        for (old_b, old_lvl) in to_remove {
+        for (old_b, old_lvl, _old_owner) in to_remove {
             let del_key = Key::new(old_b, METADATA_ITEM_KEY, old_lvl as u64);
+            let mut freed_to_allocator = false;
             let ext_res = cow_tree_mutate(
                 fs,
                 &pending_blocks,
@@ -909,10 +925,28 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 new_generation,
                 &mut allocator,
                 |leaf| {
+                    let idx = leaf
+                        .find_item(&del_key)
+                        .ok_or_else(|| LuksError::NotFound("metadata item not found".into()))?;
+                    let data = &mut leaf.items[idx].data;
+                    if data.len() < 24 {
+                        return Err(LuksError::CorruptFs("metadata item truncated"));
+                    }
+                    let refs = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    if refs > 1 {
+                        return Err(LuksError::UnsupportedFsFeature(
+                            "modifying shared tree blocks is not supported (subvolume is snapshotted)".into(),
+                        ));
+                    }
                     let _ = leaf.delete_item(&del_key)?;
+                    freed_to_allocator = true;
                     Ok(())
                 },
             )?;
+
+            if freed_to_allocator {
+                allocator.free_metadata(old_b, sb.node_size)?;
+            }
 
             record_cow_result(
                 &ext_res,

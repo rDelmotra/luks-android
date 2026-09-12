@@ -241,16 +241,16 @@ btrfs subvolume create "$MNT/home"
 mkdir -p "$MNT/home/user/docs"
 printf 'four levels down, in another tree\n' > "$MNT/home/user/docs/deep.txt"
 
-# Populate /home with 50 files so inode numbers in /home advance past 300
-for i in $(seq 1 50); do
-    printf 'user file %d\n' "$i" > "$MNT/home/user/docs/file_$i.txt"
-done
-
 btrfs subvolume create "$MNT/home/user/snap"
 printf 'nested subvolume\n' > "$MNT/home/user/snap/inside.txt"
 
 mkdir -p "$MNT/snapshots"
 btrfs subvolume snapshot -r "$MNT/home" "$MNT/snapshots/home-snap"
+
+# Populate /home with 50 files so inode numbers in /home advance past 300
+for i in $(seq 1 50); do
+    printf 'user file %d\n' "$i" > "$MNT/home/user/docs/file_$i.txt"
+done
 
 sync
 btrfs subvolume set-default "$MNT/root"

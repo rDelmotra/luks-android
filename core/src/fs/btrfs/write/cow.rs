@@ -852,7 +852,7 @@ mod tests {
     fn test_plan_leaf_split_shape_2_item_at_start_of_right() {
         let node_size = 1024; // smaller node size to force shape 2
         // Left already has large item
-        let _items = vec![
+        let _items = [
             LeafItem {
                 key: Key::new(256, 1, 0),
                 data: vec![0u8; 700], // fits in 1024 (header 101 + item 25 + 700 = 826 <= 1024)

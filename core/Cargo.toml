@@ -344,7 +344,7 @@ path = "tests/alloc_chunk/btrfs_extent_tree.rs"
 required-features = ["dangerous-write-support"]
 
 
-# --- btrfs_ops (15 tests) ---
+# --- btrfs_ops (16 tests) ---
 [[test]]
 name = "btrfs_read"
 path = "tests/btrfs_ops/btrfs_read.rs"
@@ -417,6 +417,11 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_byte_identical"
 path = "tests/btrfs_ops/btrfs_byte_identical.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_subvol_write"
+path = "tests/btrfs_ops/btrfs_subvol_write.rs"
 required-features = ["dangerous-write-support"]
 
 

@@ -435,7 +435,9 @@ impl<D: ReadAt> Btrfs<D> {
     #[cfg(feature = "dangerous-write-support")]
     pub fn update_mount_state(&mut self, sb: Superblock, fs_tree: TreeRoot) {
         self.sb = sb;
-        self.fs_tree = fs_tree;
+        if fs_tree.objectid == tree::FS_TREE_OBJECTID {
+            self.fs_tree = fs_tree;
+        }
         self.nodes.clear();
         self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
         if let Ok(mut guard) = self.statfs_cache.lock() {

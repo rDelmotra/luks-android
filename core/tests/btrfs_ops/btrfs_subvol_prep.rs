@@ -237,18 +237,13 @@ fn test_read_only_subvolume_gate_negative_control() {
     }
 
     // 5. Positive control on read-write subvolume (/home):
-    // Since /home is NOT read-only, it passes check_writeable_subvolume and hits
-    // the general subvolume creation refusal!
+    // Since /home is NOT read-only, it passes check_writeable_subvolume and succeeds
+    // now that subvolume writes are supported in Phase 3.
     let res_rw_create = fs.create_file("/home", "writable_subvol_probe.txt");
-    match res_rw_create {
-        Err(LuksError::UnsupportedFsFeature(ref msg)) => {
-            assert!(
-                msg.contains("subvolume file creation not yet supported"),
-                "expected subvolume creation refusal on /home, got: {msg}"
-            );
-        }
-        other => panic!("expected UnsupportedFsFeature(subvolume file creation not yet supported), got: {other:?}"),
-    }
+    assert!(
+        res_rw_create.is_ok(),
+        "expected subvolume creation to succeed on /home in Phase 3, got: {res_rw_create:?}"
+    );
 
     let _ = std::fs::remove_file(&temp_path);
 }
