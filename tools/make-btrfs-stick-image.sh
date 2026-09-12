@@ -22,12 +22,17 @@ FAST_KDF=0
 if [ "${PHONE_KDF:-0}" = "1" ] || [ "${FAST_KDF:-0}" = "1" ]; then
     FAST_KDF=1
 fi
+WITH_SUBVOL=0
 
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --fast-kdf|--phone-kdf)
             FAST_KDF=1
+            shift
+            ;;
+        --subvol)
+            WITH_SUBVOL=1
             shift
             ;;
         *)
@@ -38,7 +43,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ ${#POSITIONAL[@]} -lt 1 ]; then
-    echo "usage: make-btrfs-stick-image.sh <output.img> [size] [password] [--fast-kdf|--phone-kdf]" >&2
+    echo "usage: make-btrfs-stick-image.sh <output.img> [size] [password] [--fast-kdf|--phone-kdf] [--subvol]" >&2
     exit 2
 fi
 
@@ -76,6 +81,7 @@ PBKDF_MEM="$4"
 PBKDF_PARALLEL="$5"
 PBKDF_ITERS="$6"
 PW_FILE="$7"
+WITH_SUBVOL="${8:-0}"
 MAPPER="/dev/mapper/$NAME"
 MNT="/tmp/mnt-$NAME"
 LOOP=""
@@ -142,8 +148,22 @@ mkdir -p "$MNT/docs" "$MNT/existing"
 echo "# Btrfs Test Stick" > "$MNT/docs/readme.md"
 head -c 4096 /dev/urandom > "$MNT/existing/one-block.bin"
 head -c $((256*1024)) /dev/urandom > "$MNT/existing/many-blocks.bin"
+
+if [ "$WITH_SUBVOL" = "1" ]; then
+    echo "Creating Btrfs subvolumes (/home, /var)..."
+    btrfs subvolume create "$MNT/home"
+    mkdir -p "$MNT/home/user/docs"
+    echo "hello from subvolume /home" > "$MNT/home/user/hello.txt"
+    echo "# Subvolume /home Readme" > "$MNT/home/user/docs/readme.md"
+    head -c 4096 /dev/urandom > "$MNT/home/user/docs/one-block.bin"
+
+    btrfs subvolume create "$MNT/var"
+    echo "var log file" > "$MNT/var/system.log"
+fi
+
 sync
 ls -la "$MNT"
+[ "$WITH_SUBVOL" = "1" ] && ls -la "$MNT/home/user"
 umount "$MNT"
 
 cryptsetup close "$NAME"
@@ -154,7 +174,7 @@ REMOTE_SCRIPT
 
 printf '%s' "$PASSWORD" | colima ssh -- tee "$REMOTE_PW" > /dev/null
 colima ssh -- tee "$REMOTE_SH" < "$LOCAL_SH" > /dev/null
-colima ssh -- sudo bash "$REMOTE_SH" "$REMOTE" "$SIZE" "$NAME" "$PBKDF_MEM" "$PBKDF_PARALLEL" "$PBKDF_ITERS" "$REMOTE_PW"
+colima ssh -- sudo bash "$REMOTE_SH" "$REMOTE" "$SIZE" "$NAME" "$PBKDF_MEM" "$PBKDF_PARALLEL" "$PBKDF_ITERS" "$REMOTE_PW" "$WITH_SUBVOL"
 
 colima ssh -- sudo cat "$REMOTE" > "$OUT"
 colima ssh -- sudo rm -f "$REMOTE" "$REMOTE_SH" "$REMOTE_PW"

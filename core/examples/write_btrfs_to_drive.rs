@@ -13,12 +13,8 @@
 //! own eyes — that number is the only thing standing between a typo in the
 //! device path and the wrong drive.
 //!
-//! Root-directory writes only — `Btrfs::create_file`/`write_file` refuse
-//! anything outside `FS_TREE_OBJECTID` (feature-btrfs-write.md, "not doing
-//! this yet"). A filesystem whose free-space tree spans more than one leaf
-//! is refused by name (Fix 1, 2026-08-14) rather than silently mishandled —
-//! this is the gate that currently keeps large storage devices out of reach; a
-//! partition whose free-space tree fits in one leaf is unaffected.
+//! Supports writing to root directory ("hello.txt") or inside any subvolume
+//! (e.g. "/home/user/docs/file.txt").
 
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
@@ -105,7 +101,16 @@ fn run(
         fs.superblock().node_size
     );
 
-    fs.create_file_with_data("/", dest, content)?;
+    // Split destination path into parent directory and file name.
+    // Handles paths like "/hello.txt", "hello.txt", "/home/user/test.txt", "home/user/test.txt".
+    let dest_clean = dest.strip_prefix('/').unwrap_or(dest);
+    let (parent, filename) = match dest_clean.rfind('/') {
+        Some(idx) => (format!("/{}", &dest_clean[..idx]), &dest_clean[idx + 1..]),
+        None => ("/".to_string(), dest_clean),
+    };
+
+    println!("target   parent='{parent}', filename='{filename}'");
+    fs.create_file_with_data(&parent, filename, content)?;
     println!("written and flushed");
 
     Ok(())

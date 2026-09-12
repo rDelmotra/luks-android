@@ -23,11 +23,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
-use luks_core::fs::btrfs::tree::FS_TREE_OBJECTID;
+use luks_core::fs::btrfs::tree::{EXTENT_TREE_OBJECTID, FS_TREE_OBJECTID, METADATA_ITEM_KEY};
 use luks_core::fs::btrfs::write::extent_tree::find_max_inode;
 use luks_core::fs::btrfs::Btrfs;
+use sha2::{Digest, Sha256};
 
 use common::accounting::AccountingOracle;
+use common::btree_validator::TreeValidator;
+use common::mem_device::MemoryDevice;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -375,6 +378,225 @@ fn test_aged_subvolume_write_no_collision() {
     assert!(
         run_verify_script(&temp_path),
         "Tier C Linux kernel verify-btrfs.sh must pass on mutated subvol-aged.img"
+    );
+
+    let _ = std::fs::remove_file(&temp_path);
+}
+
+#[test]
+fn test_fixture_subvol_shared_properties_vacuity_guard() {
+    let dev = MemoryDevice::from_fixture("btrfs/subvol-shared.img");
+    let fs = Btrfs::mount(dev).expect("mount subvol-shared.img");
+
+    let extent_root = fs.tree_root(EXTENT_TREE_OBJECTID).expect("extent tree root");
+    let mut shared_count = 0;
+    let mut dual_backref_count = 0;
+
+    fs.walk_tree(extent_root.bytenr, &mut |key, data| {
+        if key.item_type == METADATA_ITEM_KEY && data.len() >= 24 {
+            let refs = u64::from_le_bytes(data[0..8].try_into().unwrap());
+            if refs > 1 {
+                shared_count += 1;
+                assert_eq!(refs, 2, "shared tree block must have exactly refs == 2");
+                // Inline backrefs start at offset 24 for skinny metadata
+                if data.len() >= 42 && data[24] == 176 && data[33] == 176 {
+                    let root1 = u64::from_le_bytes(data[25..33].try_into().unwrap());
+                    let root2 = u64::from_le_bytes(data[34..42].try_into().unwrap());
+                    let mut roots = [root1, root2];
+                    roots.sort_unstable();
+                    if roots == [256, 257] {
+                        dual_backref_count += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+    .expect("walk extent tree");
+
+    // Vacuity Guard: assert at least 5 shared tree blocks (measured: 7)
+    assert!(
+        shared_count >= 5,
+        "VACUITY FAILURE: subvol-shared.img has {shared_count} shared blocks, expected >= 5"
+    );
+    assert_eq!(
+        dual_backref_count, shared_count,
+        "all shared blocks must have dual backrefs to root 256 and 257"
+    );
+}
+
+#[test]
+fn test_shared_metadata_refusal_negative_control() {
+    let dev = MemoryDevice::from_fixture("btrfs/subvol-shared.img");
+    let pre_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&dev.snapshot());
+        format!("{:x}", hasher.finalize())
+    };
+
+    let mut fs = Btrfs::mount(dev.clone()).expect("mount subvol-shared.img");
+
+    // 1. Attempt to create a new file in snapshotted subvolume /home
+    let res_create = fs.create_file(
+        "/home/user/docs",
+        "cannot_write.txt",
+    );
+    match res_create {
+        Err(LuksError::UnsupportedFsFeature(ref msg)) => {
+            assert!(
+                msg.contains("modifying shared tree blocks is not supported (subvolume is snapshotted)"),
+                "expected shared tree block refusal, got: {msg}"
+            );
+        }
+        other => panic!("expected shared tree block refusal on file create, got: {other:?}"),
+    }
+
+    // 2. Attempt directory creation in snapshotted subvolume /home
+    let res_mkdir = fs.create_directory("/home/user/docs", "forbidden_dir");
+    match res_mkdir {
+        Err(LuksError::UnsupportedFsFeature(ref msg)) => {
+            assert!(
+                msg.contains("modifying shared tree blocks is not supported (subvolume is snapshotted)"),
+                "expected shared tree block refusal on mkdir, got: {msg}"
+            );
+        }
+        other => panic!("expected shared tree block refusal on mkdir, got: {other:?}"),
+    }
+
+    // 3. Attempt mtime update on existing file in snapshotted subvolume /home
+    let res_mtime = fs.set_mtime("/home/user/docs/file_shared_leaf_1.txt", 1790001234, 0);
+    match res_mtime {
+        Err(LuksError::UnsupportedFsFeature(ref msg)) => {
+            assert!(
+                msg.contains("modifying shared tree blocks is not supported (subvolume is snapshotted)"),
+                "expected shared tree block refusal on mtime, got: {msg}"
+            );
+        }
+        other => panic!("expected shared tree block refusal on mtime, got: {other:?}"),
+    }
+
+    // 4. Attempt file deletion in snapshotted subvolume /home
+    let res_del = fs.delete_file("/home/user/docs/file_shared_leaf_1.txt");
+    match res_del {
+        Err(LuksError::UnsupportedFsFeature(ref msg)) => {
+            assert!(
+                msg.contains("modifying shared tree blocks is not supported (subvolume is snapshotted)"),
+                "expected shared tree block refusal on delete, got: {msg}"
+            );
+        }
+        other => panic!("expected shared tree block refusal on delete, got: {other:?}"),
+    }
+
+    // 3. Drop filesystem and assert 100% byte-identical image preservation
+    drop(fs);
+    let post_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(&dev.snapshot());
+        format!("{:x}", hasher.finalize())
+    };
+    assert_eq!(
+        pre_hash, post_hash,
+        "refused subvolume write must leave image 100% byte-identical"
+    );
+}
+
+#[test]
+fn test_subvol_shared_read_only_positive_control() {
+    let temp_path = copy_to_temp("subvol-shared.img");
+    let _len = std::fs::metadata(&temp_path).expect("stat").len();
+    let dev = FileDevice::open(&temp_path).expect("open subvol-shared.img");
+    let fs = Btrfs::mount(dev).expect("mount subvol-shared.img");
+
+    // Verify /home contents
+    let home_docs = fs.list_dir("/home/user/docs").expect("list /home/user/docs");
+    assert_eq!(home_docs.len(), 200, "expected 200 files in /home/user/docs");
+
+    let p1 = fs.read_file("/home/user/docs/file_shared_leaf_1.txt").expect("read file 1");
+    assert_eq!(&p1, b"user payload 1\n");
+
+    let p200 = fs.read_file("/home/user/docs/file_shared_leaf_200.txt").expect("read file 200");
+    assert_eq!(&p200, b"user payload 200\n");
+
+    // Verify /snapshots/home-snap contents
+    let snap_docs = fs.list_dir("/snapshots/home-snap/user/docs").expect("list snap docs");
+    assert_eq!(snap_docs.len(), 200, "expected 200 files in snapshot");
+
+    let sp1 = fs.read_file("/snapshots/home-snap/user/docs/file_shared_leaf_1.txt").expect("read snap file 1");
+    assert_eq!(&sp1, b"user payload 1\n");
+
+    // Tier A validation: all trees including subvolumes
+    let report = TreeValidator::validate_all(&fs).expect("Tier A TreeValidator passes");
+    assert!(
+        report.subvolume_trees.len() >= 2,
+        "must have at least 2 subvolume trees validated"
+    );
+
+    // Tier B validation
+    AccountingOracle::check(&fs).expect("Tier B AccountingOracle passes");
+
+    // Tier C validation
+    drop(fs);
+    assert!(
+        run_verify_script(&temp_path),
+        "Tier C verify-btrfs.sh passes on subvol-shared.img"
+    );
+
+    let _ = std::fs::remove_file(&temp_path);
+}
+
+#[test]
+fn test_subvol_aged_expanded_crud() {
+    let temp_path = copy_to_temp("subvol-aged.img");
+    let len = std::fs::metadata(&temp_path).expect("stat").len();
+    let dev = FileDevice::open_writable(&temp_path, len).expect("open subvol-aged.img rw");
+    let mut fs = Btrfs::mount(dev).expect("mount subvol-aged.img");
+
+    // 1. Mkdir inside /home
+    fs.create_directory("/home/user", "project_dir").expect("mkdir in /home");
+    assert!(fs.resolve_no_follow(fs.fs_tree(), "/home/user/project_dir").is_ok());
+
+    // 2. Create file inside new dir
+    fs.create_file_with_data("/home/user/project_dir", "notes.txt", b"aged subvol notes")
+        .expect("create file with data in aged subvol");
+    let read_notes = fs.read_file("/home/user/project_dir/notes.txt").expect("read notes.txt");
+    assert_eq!(&read_notes, b"aged subvol notes");
+
+    // 3. Rename inside /home
+    fs.rename(
+        "/home/user/project_dir",
+        "notes.txt",
+        "/home/user/project_dir",
+        "renamed_notes.txt",
+    )
+    .expect("rename inside aged subvolume");
+    assert!(fs.resolve_no_follow(fs.fs_tree(), "/home/user/project_dir/renamed_notes.txt").is_ok());
+
+    // 4. Update mtime
+    fs.set_mtime("/home/user/project_dir/renamed_notes.txt", 1790005555, 100)
+        .expect("set_mtime in aged subvol");
+    let loc = fs.resolve_no_follow(fs.fs_tree(), "/home/user/project_dir/renamed_notes.txt").expect("resolve");
+    assert_eq!(loc.inode.mtime, 1790005555);
+
+    // 5. Delete file
+    fs.delete_file("/home/user/project_dir/renamed_notes.txt").expect("delete file in aged subvol");
+    assert!(fs.resolve_no_follow(fs.fs_tree(), "/home/user/project_dir/renamed_notes.txt").is_err());
+
+    // 6. Delete directory
+    fs.delete_file("/home/user/project_dir").expect("delete dir in aged subvol");
+    assert!(fs.resolve_no_follow(fs.fs_tree(), "/home/user/project_dir").is_err());
+
+    // Tier A Oracle
+    let rep = TreeValidator::validate_all(&fs).expect("Tier A validate_all on aged subvol");
+    assert!(!rep.subvolume_trees.is_empty(), "subvolumes must be validated");
+
+    // Tier B Oracle
+    AccountingOracle::check(&fs).expect("Tier B AccountingOracle passes");
+
+    // Tier C Oracle
+    drop(fs);
+    assert!(
+        run_verify_script(&temp_path),
+        "Tier C verify-btrfs.sh passes on aged subvol"
     );
 
     let _ = std::fs::remove_file(&temp_path);

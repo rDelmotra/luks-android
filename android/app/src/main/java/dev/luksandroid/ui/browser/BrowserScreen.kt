@@ -411,8 +411,6 @@ fun isPathInsideReadOnlySubvolume(path: String, fsType: String, subvolumes: List
         if (subPath != "/" && (normPath == subPath || normPath.startsWith("$subPath/"))) {
             return if (subvol.readOnly) {
                 Pair(true, "Subvolume '${subvol.name}' is read-only")
-            } else if (subvol.id != 5L) {
-                Pair(true, "Subvolume '${subvol.name}' (ID ${subvol.id}) is outside root tree (read-only)")
             } else {
                 Pair(false, null)
             }

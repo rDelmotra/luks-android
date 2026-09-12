@@ -25,12 +25,13 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol subvol-aged large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
+TARGETS="${2:-plain compress mixed-4k subvol subvol-aged subvol-shared large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
 UUID_SUBVOL="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 UUID_SUBVOL_AGED="abababab-bcbc-cdcd-dede-efefefefefef"
+UUID_SUBVOL_SHARED="acacacac-bded-cefe-dfaf-e0e0e0e0e0e0"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
 UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
 UUID_SHA256="12121212-3434-5656-7878-909090909090"
@@ -257,6 +258,35 @@ btrfs subvolume set-default "$MNT/root"
 sync
 umount "$MNT"
 echo "  -> subvol-aged.img"
+fi
+
+# --- subvol-shared.img: snapshotted subvolume with shared metadata blocks ----
+# Populates /home with 200 files in /home/user/docs, forcing the tree to expand
+# into level 1 (interior node with multiple child leaves). A read-only snapshot
+# /snapshots/home-snap is taken of /home, and nothing is touched afterwards.
+# This produces leaves with refs = 2 shared between /home and /snapshots/home-snap.
+if want subvol-shared; then
+echo "Building subvol-shared.img..."
+IMG="$OUT/subvol-shared.img"
+rm -f "$IMG"
+truncate -s 160M "$IMG"
+mkfs.btrfs -q -L BTRFSSUBSHR -U "$UUID_SUBVOL_SHARED" "$IMG"
+mount -o loop "$IMG" "$MNT"
+
+printf 'top level file\n' > "$MNT/toplevel.txt"
+
+btrfs subvolume create "$MNT/home"
+mkdir -p "$MNT/home/user/docs"
+for i in $(seq 1 200); do
+    printf 'user payload %d\n' "$i" > "$MNT/home/user/docs/file_shared_leaf_$i.txt"
+done
+
+mkdir -p "$MNT/snapshots"
+sync
+btrfs subvolume snapshot -r "$MNT/home" "$MNT/snapshots/home-snap"
+sync
+umount "$MNT"
+echo "  -> subvol-shared.img"
 fi
 
 # --- large.img: chunk allocation under pressure ----------------------------

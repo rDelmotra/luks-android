@@ -64,6 +64,7 @@ pub struct AllTreesValidationReport {
     pub csum_tree: Option<TreeValidationReport>,
     pub dev_tree: TreeValidationReport,
     pub free_space_tree: Option<TreeValidationReport>,
+    pub subvolume_trees: Vec<(u64, TreeValidationReport)>,
 }
 
 impl AllTreesValidationReport {
@@ -77,6 +78,9 @@ impl AllTreesValidationReport {
         }
         if let Some(ref fst) = self.free_space_tree {
             total += fst.total_nodes;
+        }
+        for (_id, subvol) in &self.subvolume_trees {
+            total += subvol.total_nodes;
         }
         total
     }
@@ -92,6 +96,9 @@ impl AllTreesValidationReport {
         if let Some(ref fst) = self.free_space_tree {
             total += fst.total_items;
         }
+        for (_id, subvol) in &self.subvolume_trees {
+            total += subvol.total_items;
+        }
         total
     }
 
@@ -106,6 +113,9 @@ impl AllTreesValidationReport {
         if let Some(ref fst) = self.free_space_tree {
             total += fst.total_single_child_interior_nodes;
         }
+        for (_id, subvol) in &self.subvolume_trees {
+            total += subvol.total_single_child_interior_nodes;
+        }
         total
     }
 
@@ -116,6 +126,9 @@ impl AllTreesValidationReport {
         }
         if let Some(ref fst) = self.free_space_tree {
             reports.push(fst);
+        }
+        for (_id, subvol) in &self.subvolume_trees {
+            reports.push(subvol);
         }
         reports
     }
@@ -242,6 +255,14 @@ impl TreeValidator {
             Err(_) => None,
         };
 
+        // 7. Subvolume trees (if any)
+        let mut subvolume_trees = Vec::new();
+        let subvols = fs.subvolumes()?;
+        for subvol in subvols {
+            let subvol_tree = Self::validate(fs, subvol.root.bytenr, Some(subvol.root.level))?;
+            subvolume_trees.push((subvol.id, subvol_tree));
+        }
+
         Ok(AllTreesValidationReport {
             fs_tree,
             root_tree,
@@ -249,6 +270,7 @@ impl TreeValidator {
             csum_tree,
             dev_tree,
             free_space_tree,
+            subvolume_trees,
         })
     }
 

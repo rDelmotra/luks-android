@@ -86,10 +86,10 @@ class ComponentLogicTest {
         val (roRoot, _) = isPathInsideReadOnlySubvolume("/", "btrfs", subvols)
         assertFalse(roRoot)
 
-        // Path inside @home (id 256 != 5) is outside root tree
+        // Path inside @home (id 256, readOnly = false) is writable
         val (roHome, reasonHome) = isPathInsideReadOnlySubvolume("/home/user", "btrfs", subvols)
-        assertTrue(roHome)
-        assertNotNull(reasonHome)
+        assertFalse(roHome)
+        assertNull(reasonHome)
 
         // Path inside @snapshots is read-only
         val (roSnap, reasonSnap) = isPathInsideReadOnlySubvolume("/snapshots/backup1", "btrfs", subvols)

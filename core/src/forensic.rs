@@ -16,6 +16,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const RING_CAPACITY: usize = 256;
 
+/// Capacity of the dedicated Btrfs-only ring buffer (see `GLOBAL_BTRFS_RING_BUFFER`).
+///
+/// USB/SCSI transport events outnumber btrfs structural events by orders of magnitude
+/// on a real transfer, so the shared ring above can be entirely evicted of structural
+/// events (LeafSplit / InteriorSplit / HeightGrew / RootCollapsed / NodeRemoved) before a
+/// dump is ever taken, leaving only whichever btrfs event happened to land last. This
+/// second ring holds only `ForensicEvent::Btrfs` records so transport traffic can never
+/// evict them.
+///
+/// Tied to `RING_CAPACITY` rather than a separate literal: `RingBuffer`'s backing array
+/// is sized to `RING_CAPACITY` internally (see `RingBuffer::new`), so a diverging literal
+/// here would silently lie about the buffer's real capacity.
+const BTRFS_RING_CAPACITY: usize = RING_CAPACITY;
+
 static MONOTONIC_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// An event captured in the forensic ring buffer.
@@ -59,7 +73,7 @@ pub enum BtrfsEvent {
     Mkdir { parent_ino: u64, new_ino: u64 },
     Rename { from_parent: u64, to_parent: u64, ino: u64 },
     ChunkAlloc { logical: u64, length: u64, dev_offset: u64 },
-    Commit { generation: u64, transid: u64, nodes_written: usize },
+    Commit { tree: u64, generation: u64, transid: u64, nodes_written: usize },
     Error { stage: &'static str, code: i32 },
     LeafSplit { tree: u64, shape: u8, groups: u8, pos_class: u8 },
     InteriorSplit { tree: u64, level: u8 },
@@ -150,6 +164,12 @@ impl RingBuffer {
 }
 
 static GLOBAL_RING_BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
+
+/// Dedicated ring buffer holding only `ForensicEvent::Btrfs` records. See
+/// `BTRFS_RING_CAPACITY` for why this exists. Guarded exactly like `GLOBAL_RING_BUFFER`
+/// (a plain `Mutex`, lock failures ignored rather than unwrapped) so a poisoned lock can
+/// never panic or deadlock the JNI thread driving a live transfer.
+static GLOBAL_BTRFS_RING_BUFFER: Mutex<RingBuffer> = Mutex::new(RingBuffer::new());
 
 /// Record a generic forensic event into the global ring buffer.
 pub fn record(event: ForensicEvent) {
@@ -307,7 +327,15 @@ fn update_structural_counts(event: &BtrfsEvent) {
 /// Helper to record a Btrfs event.
 pub fn record_btrfs(event: BtrfsEvent) {
     update_structural_counts(&event);
+    // Cloned before the move into `record()` below so the dedicated btrfs-only ring
+    // (see `GLOBAL_BTRFS_RING_BUFFER`) also gets a copy; the main ring must keep
+    // receiving every event exactly as before so its interleaved USB/SCSI/Btrfs
+    // ordering is unaffected.
+    let btrfs_ring_copy = event.clone();
     record(ForensicEvent::Btrfs(event));
+    if let Ok(mut buf) = GLOBAL_BTRFS_RING_BUFFER.lock() {
+        buf.push(ForensicEvent::Btrfs(btrfs_ring_copy));
+    }
 }
 
 /// Return cumulative structural transition counts since program start or last reset.
@@ -453,9 +481,21 @@ pub fn snapshot() -> Vec<ForensicRecord> {
     }
 }
 
-/// Reset the ring buffer (primarily for test isolation).
+/// Take an in-memory chronological snapshot of the dedicated Btrfs-only ring buffer.
+fn btrfs_snapshot() -> Vec<ForensicRecord> {
+    if let Ok(buf) = GLOBAL_BTRFS_RING_BUFFER.lock() {
+        buf.snapshot()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Reset the ring buffers (primarily for test isolation).
 pub fn clear() {
     if let Ok(mut buf) = GLOBAL_RING_BUFFER.lock() {
+        buf.clear();
+    }
+    if let Ok(mut buf) = GLOBAL_BTRFS_RING_BUFFER.lock() {
         buf.clear();
     }
 }
@@ -464,6 +504,75 @@ pub fn clear() {
 pub fn dump_json() -> String {
     let records = snapshot();
     serde_json::to_string_pretty(&records).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Format a single Btrfs event exactly the way `dump_text()` has always formatted it,
+/// including the trailing newline. Factored out of the main dump loop so the dedicated
+/// Btrfs-only ring section (see `GLOBAL_BTRFS_RING_BUFFER`) can reuse the identical
+/// per-event line format instead of duplicating each `format!` string.
+fn format_btrfs_event_line(b: &BtrfsEvent) -> String {
+    match b {
+        BtrfsEvent::Mount { generation, root_bytenr } => {
+            format!("BTRFS mount gen={generation} root={root_bytenr}\n")
+        }
+        BtrfsEvent::BeginFile { file_len } => {
+            format!("BTRFS begin_file len={file_len}\n")
+        }
+        BtrfsEvent::WriteChunk { len, bytenr } => {
+            format!("BTRFS write_chunk len={len} bytenr={bytenr}\n")
+        }
+        BtrfsEvent::FinishFile { ino, total_bytes } => {
+            format!("BTRFS finish_file ino={ino} bytes={total_bytes}\n")
+        }
+        BtrfsEvent::AbandonFile { runs_count, total_bytes } => {
+            format!("BTRFS abandon_file runs={runs_count} bytes={total_bytes}\n")
+        }
+        BtrfsEvent::CreateFile { parent_ino, new_ino } => {
+            format!("BTRFS create parent_ino={parent_ino} ino={new_ino}\n")
+        }
+        BtrfsEvent::DeleteFile { parent_ino, ino } => {
+            format!("BTRFS delete parent_ino={parent_ino} ino={ino}\n")
+        }
+        BtrfsEvent::Mkdir { parent_ino, new_ino } => {
+            format!("BTRFS mkdir parent_ino={parent_ino} ino={new_ino}\n")
+        }
+        BtrfsEvent::Rename { from_parent, to_parent, ino } => {
+            format!("BTRFS rename from_parent={from_parent} to_parent={to_parent} ino={ino}\n")
+        }
+        BtrfsEvent::ChunkAlloc { logical, length, dev_offset } => {
+            format!("BTRFS chunk_alloc logical={logical} len={length} dev_offset={dev_offset}\n")
+        }
+        BtrfsEvent::Commit { tree, generation, transid, nodes_written } => {
+            format!("BTRFS commit tree={tree} gen={generation} transid={transid} nodes={nodes_written}\n")
+        }
+        BtrfsEvent::Error { stage, code } => {
+            format!("BTRFS error stage={stage} code={code}\n")
+        }
+        BtrfsEvent::LeafSplit { tree, shape, groups, pos_class } => {
+            format!("BTRFS leaf_split tree={tree} shape={shape} groups={groups} pos={pos_class}\n")
+        }
+        BtrfsEvent::InteriorSplit { tree, level } => {
+            format!("BTRFS interior_split tree={tree} level={level}\n")
+        }
+        BtrfsEvent::HeightGrew { tree, from, to } => {
+            format!("BTRFS height_grew tree={tree} from={from} to={to}\n")
+        }
+        BtrfsEvent::RootCollapsed { tree, from, to } => {
+            format!("BTRFS root_collapsed tree={tree} from={from} to={to}\n")
+        }
+        BtrfsEvent::NodeRemoved { tree, level } => {
+            format!("BTRFS node_removed tree={tree} level={level}\n")
+        }
+        BtrfsEvent::BlockReused { tree, level } => {
+            format!("BTRFS block_reused tree={tree} level={level}\n")
+        }
+        BtrfsEvent::BlockCowed { tree, level } => {
+            format!("BTRFS block_cowed tree={tree} level={level}\n")
+        }
+        BtrfsEvent::ConvergeRounds { rounds } => {
+            format!("BTRFS converge_rounds rounds={rounds}\n")
+        }
+    }
 }
 
 /// Format the ring buffer snapshot as monotonic text lines.
@@ -513,72 +622,28 @@ pub fn dump_text() -> String {
                     out.push_str("SCSI reset\n");
                 }
             },
-            ForensicEvent::Btrfs(ref b) => match b {
-                BtrfsEvent::Mount { generation, root_bytenr } => {
-                    out.push_str(&format!("BTRFS mount gen={generation} root={root_bytenr}\n"));
-                }
-                BtrfsEvent::BeginFile { file_len } => {
-                    out.push_str(&format!("BTRFS begin_file len={file_len}\n"));
-                }
-                BtrfsEvent::WriteChunk { len, bytenr } => {
-                    out.push_str(&format!("BTRFS write_chunk len={len} bytenr={bytenr}\n"));
-                }
-                BtrfsEvent::FinishFile { ino, total_bytes } => {
-                    out.push_str(&format!("BTRFS finish_file ino={ino} bytes={total_bytes}\n"));
-                }
-                BtrfsEvent::AbandonFile { runs_count, total_bytes } => {
-                    out.push_str(&format!("BTRFS abandon_file runs={runs_count} bytes={total_bytes}\n"));
-                }
-                BtrfsEvent::CreateFile { parent_ino, new_ino } => {
-                    out.push_str(&format!("BTRFS create parent_ino={parent_ino} ino={new_ino}\n"));
-                }
-                BtrfsEvent::DeleteFile { parent_ino, ino } => {
-                    out.push_str(&format!("BTRFS delete parent_ino={parent_ino} ino={ino}\n"));
-                }
-                BtrfsEvent::Mkdir { parent_ino, new_ino } => {
-                    out.push_str(&format!("BTRFS mkdir parent_ino={parent_ino} ino={new_ino}\n"));
-                }
-                BtrfsEvent::Rename { from_parent, to_parent, ino } => {
-                    out.push_str(&format!("BTRFS rename from_parent={from_parent} to_parent={to_parent} ino={ino}\n"));
-                }
-                BtrfsEvent::ChunkAlloc { logical, length, dev_offset } => {
-                    out.push_str(&format!("BTRFS chunk_alloc logical={logical} len={length} dev_offset={dev_offset}\n"));
-                }
-                BtrfsEvent::Commit { generation, transid, nodes_written } => {
-                    out.push_str(&format!("BTRFS commit gen={generation} transid={transid} nodes={nodes_written}\n"));
-                }
-                BtrfsEvent::Error { stage, code } => {
-                    out.push_str(&format!("BTRFS error stage={stage} code={code}\n"));
-                }
-                BtrfsEvent::LeafSplit { tree, shape, groups, pos_class } => {
-                    out.push_str(&format!("BTRFS leaf_split tree={tree} shape={shape} groups={groups} pos={pos_class}\n"));
-                }
-                BtrfsEvent::InteriorSplit { tree, level } => {
-                    out.push_str(&format!("BTRFS interior_split tree={tree} level={level}\n"));
-                }
-                BtrfsEvent::HeightGrew { tree, from, to } => {
-                    out.push_str(&format!("BTRFS height_grew tree={tree} from={from} to={to}\n"));
-                }
-                BtrfsEvent::RootCollapsed { tree, from, to } => {
-                    out.push_str(&format!("BTRFS root_collapsed tree={tree} from={from} to={to}\n"));
-                }
-                BtrfsEvent::NodeRemoved { tree, level } => {
-                    out.push_str(&format!("BTRFS node_removed tree={tree} level={level}\n"));
-                }
-                BtrfsEvent::BlockReused { tree, level } => {
-                    out.push_str(&format!("BTRFS block_reused tree={tree} level={level}\n"));
-                }
-                BtrfsEvent::BlockCowed { tree, level } => {
-                    out.push_str(&format!("BTRFS block_cowed tree={tree} level={level}\n"));
-                }
-                BtrfsEvent::ConvergeRounds { rounds } => {
-                    out.push_str(&format!("BTRFS converge_rounds rounds={rounds}\n"));
-                }
-            },
+            ForensicEvent::Btrfs(ref b) => {
+                out.push_str(&format_btrfs_event_line(b));
+            }
             ForensicEvent::Panic(ref p) => {
                 out.push_str(&format!("PANIC at {}:{}:{} - {}\n", p.file, p.line, p.col, p.message));
             }
         }
     }
+
+    // Dedicated section for the Btrfs-only ring (see `GLOBAL_BTRFS_RING_BUFFER`).
+    // Appended after the existing dump above so the pre-existing text format and any
+    // parsers reading it are unaffected; this is purely additive.
+    out.push_str(&format!(
+        "=== BTRFS EVENT RING (last {BTRFS_RING_CAPACITY} btrfs events) ===\n"
+    ));
+    for rec in btrfs_snapshot() {
+        out.push_str(&format!("[#{:06} +{}ms] ", rec.seq, rec.timestamp_ms));
+        if let ForensicEvent::Btrfs(ref b) = rec.event {
+            out.push_str(&format_btrfs_event_line(b));
+        }
+    }
+    out.push_str("=== END BTRFS EVENT RING ===\n");
+
     out
 }

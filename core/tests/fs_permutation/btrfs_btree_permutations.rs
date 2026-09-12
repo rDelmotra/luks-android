@@ -536,6 +536,8 @@ fn test_validate_all_on_all_fixtures() {
         "btrfs/mixed-4k.img",
         "btrfs/nonmixed-4k.img",
         "btrfs/subvol.img",
+        "btrfs/subvol-aged.img",
+        "btrfs/subvol-shared.img",
         "btrfs/sha256-4k.img",
     ];
 
@@ -547,7 +549,7 @@ fn test_validate_all_on_all_fixtures() {
             .unwrap_or_else(|e| panic!("validate_all failed on {fixture}: {e}"));
 
         println!(
-            "{fixture}: total_nodes={}, total_items={}, fs_items={}, root_items={}, extent_items={}, dev_items={}, csum_items={:?}",
+            "{fixture}: total_nodes={}, total_items={}, fs_items={}, root_items={}, extent_items={}, dev_items={}, csum_items={:?}, subvols={}",
             report.total_nodes(),
             report.total_items(),
             report.fs_tree.total_items,
@@ -555,6 +557,7 @@ fn test_validate_all_on_all_fixtures() {
             report.extent_tree.total_items,
             report.dev_tree.total_items,
             report.csum_tree.as_ref().map(|c| c.total_items),
+            report.subvolume_trees.len(),
         );
 
         assert!(
@@ -581,6 +584,23 @@ fn test_validate_all_on_all_fixtures() {
             report.csum_tree.as_ref().unwrap().total_nodes > 0,
             "{fixture}: csum_tree has 0 nodes"
         );
+
+        if fixture.starts_with("btrfs/subvol") {
+            assert!(
+                !report.subvolume_trees.is_empty(),
+                "{fixture}: must have subvolume trees validated"
+            );
+            for (id, sub_rep) in &report.subvolume_trees {
+                assert!(
+                    sub_rep.total_nodes > 0,
+                    "{fixture}: subvolume {id} has 0 nodes"
+                );
+                assert!(
+                    sub_rep.total_items > 0,
+                    "{fixture}: subvolume {id} has 0 items"
+                );
+            }
+        }
     }
 }
 
@@ -937,6 +957,32 @@ fn test_tree_validator_validate_all_catches_extent_and_csum_corruption() {
         assert!(
             res.is_err(),
             "validate_all must catch structural corruption in CSUM_TREE"
+        );
+    }
+
+    // 3. Corrupt Subvolume Tree (subvol 257 in subvol.img)
+    {
+        let mem_dev = MemoryDevice::from_fixture("btrfs/subvol.img");
+        let fs = Btrfs::mount(mem_dev.clone()).expect("mount subvol");
+        let subvol_root = fs.tree_root(257).expect("subvol tree root 257");
+
+        let node = fs.read_node(subvol_root.bytenr).expect("read subvol root node");
+        let mut leaf = Leaf::from_node(&node, fs.superblock().csum_type).expect("leaf from node");
+        assert!(leaf.items.len() >= 2, "subvolume tree must have at least 2 items");
+        leaf.items.swap(0, 1); // Invert sort order in subvolume tree leaf
+        let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+        let stripes = fs.chunk_map().map_all_stripes(subvol_root.bytenr).expect("map all stripes");
+        for phys in stripes {
+            mem_dev.write_at(phys, &emitted).expect("write corrupted subvol leaf");
+        }
+
+        let remounted = Btrfs::mount(mem_dev).expect("remount");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            TreeValidator::validate_all(&remounted).expect("validate_all must fail on corrupted subvolume");
+        }));
+        assert!(
+            res.is_err(),
+            "validate_all must catch structural corruption in subvolume tree"
         );
     }
 }
