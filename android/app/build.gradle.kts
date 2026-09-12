@@ -59,6 +59,8 @@ android {
                 storePassword = findProperty("luksReleaseStorePassword") as String?
                 keyAlias = findProperty("luksReleaseKeyAlias") as String?
                 keyPassword = findProperty("luksReleaseKeyPassword") as String?
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
