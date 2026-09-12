@@ -72,7 +72,7 @@ fn dump_device_to_file<D: ReadAt>(dev: &D, path: &std::path::Path) -> std::io::R
     let len = dev.len().expect("device len must be known") as usize;
     let mut buf = vec![0u8; len];
     dev.read_at(0, &mut buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e:?}")))?;
+        .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
     let mut file = std::fs::File::create(path)?;
     std::io::Write::write_all(&mut file, &buf)?;
     file.sync_all()
@@ -1218,13 +1218,11 @@ pub fn execute_op_tier_ab<D: WriteAt + ReadAt + Clone>(
                 let info = fs.file_info(&btrfs_new).unwrap_or_else(|e| {
                     panic!("[CONFORMANCE TIER A FAILURE] Step {step}: new renamed path '{new_norm}' file_info failed: {e}");
                 });
-                if let Some(entry) = model.get_entry(&new_norm) {
-                    if let EntryState::File { mtime_sec, .. } = entry {
-                        assert_eq!(
-                            info.mtime, *mtime_sec as i64,
-                            "[CONFORMANCE TIER A FAILURE] Step {step}: renamed '{new_norm}' mtime mismatch"
-                        );
-                    }
+                if let Some(EntryState::File { mtime_sec, .. }) = model.get_entry(&new_norm) {
+                    assert_eq!(
+                        info.mtime, *mtime_sec as i64,
+                        "[CONFORMANCE TIER A FAILURE] Step {step}: renamed '{new_norm}' mtime mismatch"
+                    );
                 }
             }
             DriverOp::Delete { path } => {

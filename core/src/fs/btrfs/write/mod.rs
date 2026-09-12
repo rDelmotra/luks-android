@@ -8,6 +8,7 @@ pub mod batch;
 pub mod chunk_alloc;
 pub mod commit;
 pub mod cow;
+pub mod csum_delete;
 pub mod exclude;
 pub mod extent_tree;
 pub mod file;

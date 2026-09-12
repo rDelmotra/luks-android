@@ -45,7 +45,7 @@ fn a_read_only_device_refuses_to_write() {
     let dev = FileDevice::open(&path).expect("open");
     assert!(!dev.is_writable());
 
-    let err = dev.write_at(0, b"nope").err().expect("must refuse");
+    let err = dev.write_at(0, b"nope").expect_err("must refuse");
     let msg = err.to_string();
     assert!(
         msg.contains("read-only") || msg.contains("open_writable"),

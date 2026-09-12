@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::tree::{
-    Key, CSUM_TREE_OBJECTID, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_CSUM_KEY, EXTENT_CSUM_OBJECTID,
-    EXTENT_DATA_KEY, INODE_ITEM_KEY, INODE_REF_KEY,
+    Key, CSUM_TREE_OBJECTID, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_DATA_KEY, INODE_ITEM_KEY,
+    INODE_REF_KEY,
 };
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
@@ -1093,71 +1093,17 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
         }
 
         if let Ok(csum_root) = fs.tree_root(CSUM_TREE_OBJECTID) {
-            let mut csum_keys_to_delete = Vec::new();
-            for &(disk_bytenr, disk_num_bytes) in data_extents_to_free {
-                let search_key = Key::new(
-                    EXTENT_CSUM_OBJECTID,
-                    EXTENT_CSUM_KEY,
-                    disk_bytenr,
-                );
-                let mut cursor = fs.search_le(csum_root.bytenr, &search_key)?;
-                while cursor.valid() {
-                    let key = cursor.key()?;
-                    if key.objectid != EXTENT_CSUM_OBJECTID
-                        || key.item_type != EXTENT_CSUM_KEY
-                    {
-                        if key < Key::new(EXTENT_CSUM_OBJECTID, EXTENT_CSUM_KEY, 0) {
-                            cursor.advance()?;
-                            continue;
-                        }
-                        break;
-                    }
-                    if key.offset >= disk_bytenr + disk_num_bytes {
-                        break;
-                    }
-                    if key.offset >= disk_bytenr {
-                        csum_keys_to_delete.push(key);
-                    }
-                    cursor.advance()?;
-                }
-            }
-            csum_keys_to_delete.sort_unstable();
-            csum_keys_to_delete.dedup();
-
-            if !csum_keys_to_delete.is_empty() {
-                let mut csum_root_bytenr = csum_root.bytenr;
-                let mut csum_root_level = csum_root.level;
-
-                for csum_key in csum_keys_to_delete {
-                    let res = cow_tree_mutate(
-                        fs,
-                        pending_blocks,
-                        csum_root_bytenr,
-                        csum_root_level,
-                        CSUM_TREE_OBJECTID,
-                        &csum_key,
-                        new_generation,
-                        allocator,
-                        |leaf| {
-                            leaf.delete_item(&csum_key)?;
-                            Ok(())
-                        },
-                    )?;
-                    record_cow_result(
-                        &res,
-                        blocks_to_add,
-                        blocks_to_remove,
-                        allocator,
-                        pending_blocks,
-                        node_size,
-                        CSUM_TREE_OBJECTID,
-                    )?;
-                    csum_root_bytenr = res.new_root_bytenr;
-                    csum_root_level = res.new_root_level;
-                }
-
-                csum_root_opt = Some((csum_root_bytenr, csum_root_level));
-            }
+            csum_root_opt = crate::fs::btrfs::write::csum_delete::delete_extent_csums(
+                fs,
+                pending_blocks,
+                csum_root.bytenr,
+                csum_root.level,
+                data_extents_to_free,
+                new_generation,
+                allocator,
+                blocks_to_add,
+                blocks_to_remove,
+            )?;
         }
     }
 

@@ -1121,5 +1121,149 @@ fn test_negative_control_fst_bitmap_out_of_bounds() {
     }
 }
 
+#[test]
+fn test_negative_control_csum_orphan_extent() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_csum_orphan");
+    let dev = FileDevice::open(scratch.path()).expect("open fixture");
+    let fs = Btrfs::mount(dev).expect("mount fixture");
+
+    let csum_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::CSUM_TREE_OBJECTID)
+        .expect("csum root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(csum_root.bytenr)
+        .expect("csum root phys");
+
+    let node = fs.read_node(csum_root.bytenr).expect("read csum root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // Insert an orphan EXTENT_CSUM item pointing to an address with no data extent
+    let orphan_bytenr = 0x8888_0000u64;
+    let fake_csum_payload = vec![0x12, 0x34, 0x56, 0x78]; // 1 sector CRC32c
+    leaf.items.push(luks_core::fs::btrfs::write::node::LeafItem {
+        key: luks_core::fs::btrfs::Key::new(
+            luks_core::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
+            luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY,
+            orphan_bytenr,
+        ),
+        data: fake_csum_payload,
+    });
+    leaf.items.sort_by_key(|it| it.key);
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::CsumOrphanExtent {
+            bytenr,
+            csum_start,
+            csum_len,
+        }) => {
+            println!(
+                "Negative control passed: detected CsumOrphanExtent at {bytenr:#x} (csum_start={csum_start:#x}, len={csum_len})"
+            );
+            assert_eq!(bytenr, orphan_bytenr);
+            assert_eq!(csum_start, orphan_bytenr);
+            assert_eq!(csum_len, 4096);
+        }
+        other => panic!("expected Err(AccountingError::CsumOrphanExtent), got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_negative_control_csum_self_overlap() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_csum_overlap");
+    let dev = FileDevice::open(scratch.path()).expect("open fixture");
+    let fs = Btrfs::mount(dev).expect("mount fixture");
+
+    let csum_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::CSUM_TREE_OBJECTID)
+        .expect("csum root");
+    let (phys, _) = fs
+        .chunk_map()
+        .map(csum_root.bytenr)
+        .expect("csum root phys");
+
+    let node = fs.read_node(csum_root.bytenr).expect("read csum root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // Find first EXTENT_CSUM item
+    let first_idx = leaf
+        .items
+        .iter()
+        .position(|it| it.key.item_type == luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY)
+        .expect("find first csum item");
+
+    let first_key = leaf.items[first_idx].key;
+    // Insert an overlapping item at first_key.offset + 2048 (not sector aligned or partial overlap)
+    // or same offset + 4096 if length > 4096
+    let overlap_key = luks_core::fs::btrfs::Key::new(
+        first_key.objectid,
+        first_key.item_type,
+        first_key.offset + 2048,
+    );
+    leaf.items.push(luks_core::fs::btrfs::write::node::LeafItem {
+        key: overlap_key,
+        data: vec![0xaa, 0xbb, 0xcc, 0xdd],
+    });
+    leaf.items.sort_by_key(|it| it.key);
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    let res = AccountingOracle::check(&fs);
+    match res {
+        Err(AccountingError::CsumSelfOverlap {
+            first_start,
+            first_len,
+            second_start,
+            second_len,
+        }) => {
+            println!(
+                "Negative control passed: detected CsumSelfOverlap [{first_start:#x}..{:#x}] with [{second_start:#x}..{:#x}]",
+                first_start + first_len,
+                second_start + second_len
+            );
+            assert_eq!(first_start, first_key.offset);
+            assert_eq!(second_start, overlap_key.offset);
+        }
+        other => panic!("expected Err(AccountingError::CsumSelfOverlap), got: {other:?}"),
+    }
+}
+
 
 

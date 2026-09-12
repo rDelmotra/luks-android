@@ -34,7 +34,7 @@ use luks_core::device::ReadAt;
 use luks_core::error::{LuksError, Result};
 use luks_core::fs::btrfs::extent::{ExtentKind, FileExtent};
 use luks_core::fs::btrfs::tree::{
-    CHUNK_TREE_OBJECTID, EXTENT_DATA_KEY, FREE_SPACE_BITMAP_KEY, FREE_SPACE_EXTENT_KEY,
+    CHUNK_TREE_OBJECTID, EXTENT_CSUM_KEY, EXTENT_DATA_KEY, FREE_SPACE_BITMAP_KEY, FREE_SPACE_EXTENT_KEY,
     FREE_SPACE_INFO_KEY, FREE_SPACE_TREE_OBJECTID, ROOT_ITEM_KEY, ROOT_TREE_OBJECTID,
 };
 use luks_core::fs::btrfs::write::alloc::FreeSpaceMap;
@@ -140,6 +140,19 @@ pub enum AccountingError {
         bg_len: u64,
         bm_start: u64,
         bm_len: u64,
+    },
+    /// Invariant A-8: CSUM_TREE covers an unallocated/orphan sector missing from Extent Tree.
+    CsumOrphanExtent {
+        bytenr: u64,
+        csum_start: u64,
+        csum_len: u64,
+    },
+    /// Invariant A-8: Two EXTENT_CSUM items in CSUM_TREE overlap each other.
+    CsumSelfOverlap {
+        first_start: u64,
+        first_len: u64,
+        second_start: u64,
+        second_len: u64,
     },
     /// Underlying filesystem read/corruption error.
     CorruptFs(String),
@@ -295,6 +308,26 @@ impl std::fmt::Display for AccountingError {
                 bm_start + bm_len,
                 bg_start + bg_len,
             ),
+            Self::CsumOrphanExtent {
+                bytenr,
+                csum_start,
+                csum_len,
+            } => write!(
+                f,
+                "Invariant A-8: CSUM_TREE covers unallocated/orphan sector at {bytenr:#x} (within csum item [{csum_start:#x}..{:#x}])",
+                csum_start + csum_len
+            ),
+            Self::CsumSelfOverlap {
+                first_start,
+                first_len,
+                second_start,
+                second_len,
+            } => write!(
+                f,
+                "Invariant A-8: Two CSUM_TREE items overlap on disk: [{first_start:#x}..{:#x}] overlaps with [{second_start:#x}..{:#x}]",
+                first_start + first_len,
+                second_start + second_len
+            ),
             Self::CorruptFs(msg) => write!(f, "Filesystem corruption during accounting check: {msg}"),
         }
     }
@@ -404,6 +437,7 @@ impl AccountingOracle {
         let mut referenced_data: HashMap<u64, ReferencedDataExtent> = HashMap::new();
         let mut visited_nodes: HashMap<u64, u8> = HashMap::new();
         let mut checked_tree_ids: Vec<u64> = Vec::new();
+        let mut csum_items: Vec<(u64, u64)> = Vec::new();
 
         // 2. Recursively walk every tree and collect all referenced blocks and data extents
         for &(tree_id, root_bytenr, root_level) in &tree_roots {
@@ -417,6 +451,7 @@ impl AccountingOracle {
                 &mut referenced_metadata,
                 &mut referenced_data,
                 &mut visited_nodes,
+                &mut csum_items,
             )?;
         }
         checked_tree_ids.sort_unstable();
@@ -857,6 +892,52 @@ impl AccountingOracle {
             }
         }
 
+        // 10. Invariant A-8: CSUM_TREE extent coverage and self-overlap check
+        csum_items.sort_by_key(|&(start, _)| start);
+        let sectorsize = sb.sector_size as u64;
+        for i in 0..csum_items.len() {
+            let (curr_start, curr_len) = csum_items[i];
+            let curr_end = curr_start + curr_len;
+
+            // Check self-overlap
+            if i + 1 < csum_items.len() {
+                let (next_start, next_len) = csum_items[i + 1];
+                if curr_end > next_start {
+                    return Err(AccountingError::CsumSelfOverlap {
+                        first_start: curr_start,
+                        first_len: curr_len,
+                        second_start: next_start,
+                        second_len: next_len,
+                    });
+                }
+            }
+
+            // Check that every sector covered by this csum item has an active data extent in extent_tree
+            let mut sec = curr_start;
+            while sec < curr_end {
+                let extent_covers = match extent_tree.extents.binary_search_by_key(&sec, |e| e.bytenr) {
+                    Ok(idx) => extent_tree.extents[idx].is_data,
+                    Err(idx) => {
+                        if idx > 0 {
+                            let prev = &extent_tree.extents[idx - 1];
+                            prev.is_data && prev.bytenr + prev.length > sec
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if !extent_covers {
+                    return Err(AccountingError::CsumOrphanExtent {
+                        bytenr: sec,
+                        csum_start: curr_start,
+                        csum_len: curr_len,
+                    });
+                }
+                sec += sectorsize;
+            }
+        }
+
         Ok(AccountingReport {
             superblock_bytes_used: sb_bytes_used,
             total_block_group_used: total_bg_used,
@@ -921,6 +1002,7 @@ impl AccountingOracle {
         referenced_metadata: &mut HashMap<u64, ReferencedBlock>,
         referenced_data: &mut HashMap<u64, ReferencedDataExtent>,
         visited_nodes: &mut HashMap<u64, u8>,
+        csum_items: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
         if visited_nodes.contains_key(&bytenr) {
             return Ok(());
@@ -962,6 +1044,15 @@ impl AccountingOracle {
                             );
                         }
                     }
+                } else if key.item_type == EXTENT_CSUM_KEY {
+                    let data = node.item_data(i)?;
+                    let csum_size = fs.superblock().csum_type.size();
+                    let sector_size = fs.superblock().sector_size as u64;
+                    if csum_size > 0 && sector_size > 0 {
+                        let num_sectors = data.len() / csum_size;
+                        let len = num_sectors as u64 * sector_size;
+                        csum_items.push((key.offset, len));
+                    }
                 }
             }
         } else {
@@ -976,6 +1067,7 @@ impl AccountingOracle {
                     referenced_metadata,
                     referenced_data,
                     visited_nodes,
+                    csum_items,
                 )?;
             }
         }

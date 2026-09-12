@@ -409,3 +409,229 @@ fn deleting_deep_tree_collapses_root_and_allows_subsequent_creation() {
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
 
+fn get_file_disk_bytenr(fs: &Btrfs<FileDevice>, path: &str) -> u64 {
+    let loc = fs.resolve_no_follow(fs.fs_tree(), path).expect("resolve path");
+    let mut disk_bytenr = None;
+    fs.for_each_item(
+        loc.tree.bytenr,
+        loc.inode.objectid,
+        luks_core::fs::btrfs::tree::EXTENT_DATA_KEY,
+        &mut |key, data| {
+            let fe = luks_core::fs::btrfs::extent::FileExtent::parse(key.offset, data)?;
+            if fe.has_disk_bytes() {
+                disk_bytenr = Some(fe.disk_bytenr);
+            }
+            Ok(true)
+        },
+    )
+    .expect("for_each_item");
+    disk_bytenr.expect("file must have a data extent on disk")
+}
+
+fn pack_adjacent_csums(
+    image_path: &PathBuf,
+    start_bytenr: u64,
+    num_sectors: usize,
+) {
+    let file_len = fs::metadata(image_path).unwrap().len();
+    let dev = FileDevice::open_writable(image_path, file_len).expect("open writable");
+    let fs = Btrfs::mount(dev).expect("mount btrfs");
+    let sb = fs.superblock();
+    let sector_size = sb.sector_size as u64;
+    let csum_size = sb.csum_type.size();
+
+    let csum_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::CSUM_TREE_OBJECTID)
+        .expect("csum root");
+    assert_eq!(csum_root.level, 0, "vacuity: expected csum root to be leaf in test fixture");
+    let physicals = fs
+        .chunk_map()
+        .map_all_stripes(csum_root.bytenr)
+        .expect("map csum root stripes");
+    assert!(!physicals.is_empty(), "vacuity: csum root must map to physical stripes");
+
+    let node = fs.read_node(csum_root.bytenr).expect("read csum root node");
+    let mut leaf = luks_core::fs::btrfs::write::node::Leaf::from_node(&node, sb.csum_type).expect("parse leaf");
+
+    let mut combined_data = Vec::with_capacity(num_sectors * csum_size);
+    let mut keys_to_remove = Vec::new();
+
+    for i in 0..num_sectors {
+        let expected_offset = start_bytenr + i as u64 * sector_size;
+        let key = luks_core::fs::btrfs::Key::new(
+            luks_core::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
+            luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY,
+            expected_offset,
+        );
+        let idx = leaf
+            .find_item(&key)
+            .unwrap_or_else(|| panic!("csum item not found at offset {expected_offset:#x}"));
+        assert_eq!(
+            leaf.items[idx].data.len(),
+            csum_size,
+            "expected single-sector csum item at {expected_offset:#x}"
+        );
+        combined_data.extend_from_slice(&leaf.items[idx].data);
+        if i > 0 {
+            keys_to_remove.push(key);
+        }
+    }
+
+    assert_eq!(combined_data.len(), num_sectors * csum_size);
+
+    let first_key = luks_core::fs::btrfs::Key::new(
+        luks_core::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
+        luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY,
+        start_bytenr,
+    );
+    let first_idx = leaf.find_item(&first_key).expect("first key");
+    leaf.items[first_idx].data = combined_data;
+
+    for k in keys_to_remove {
+        leaf.delete_item(&k).expect("delete subsequent csum key");
+    }
+
+    let emitted = leaf.emit(sb.node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(image_path)
+            .expect("open image for raw write");
+        for phys in physicals {
+            file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+            file.write_all(&emitted).expect("write emitted node");
+        }
+        file.flush().expect("flush");
+    }
+}
+
+#[test]
+fn test_delete_file_sharing_csum_item_with_adjacent_file() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let data1 = vec![0x11u8; 4096];
+    let data2 = vec![0x22u8; 4096];
+    let data3 = vec![0x33u8; 4096];
+
+    let b1;
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+        fs.create_file_with_data("/", "f1.bin", &data1).expect("create f1");
+        fs.create_file_with_data("/", "f2.bin", &data2).expect("create f2");
+        fs.create_file_with_data("/", "f3.bin", &data3).expect("create f3");
+
+        b1 = get_file_disk_bytenr(&fs, "/f1.bin");
+        let b2 = get_file_disk_bytenr(&fs, "/f2.bin");
+        let b3 = get_file_disk_bytenr(&fs, "/f3.bin");
+
+        assert_eq!(b2, b1 + 4096, "f2 extent must immediately follow f1");
+        assert_eq!(b3, b2 + 4096, "f3 extent must immediately follow f2");
+    }
+
+    // Pack the 3 adjacent single-sector csum items into one 12-byte item at b1
+    pack_adjacent_csums(&temp_img, b1, 3);
+
+    // Verify initial packed state passes AccountingOracle (Invariant A-8)
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let fs = Btrfs::mount(dev).expect("mount btrfs");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check on packed initial state failed");
+
+    // Phase 1: Tail truncation — delete f3.bin
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount btrfs");
+        fs.delete_file("/f3.bin").expect("delete f3 (tail truncation)");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check after tail truncation failed");
+
+    // Phase 2: Head truncation — delete f1.bin
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount btrfs");
+        fs.delete_file("/f1.bin").expect("delete f1 (head truncation)");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check after head truncation failed");
+
+    // Phase 3: Full removal — delete remaining f2.bin
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount btrfs");
+        fs.delete_file("/f2.bin").expect("delete f2 (full removal)");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check after full removal failed");
+}
+
+#[test]
+fn test_delete_file_csum_middle_hole_punch() {
+    let temp_img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&temp_img).unwrap().len();
+
+    let data1 = vec![0x44u8; 4096];
+    let data2 = vec![0x55u8; 4096];
+    let data3 = vec![0x66u8; 4096];
+
+    let b1;
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+
+        fs.create_file_with_data("/", "f1.bin", &data1).expect("create f1");
+        fs.create_file_with_data("/", "f2.bin", &data2).expect("create f2");
+        fs.create_file_with_data("/", "f3.bin", &data3).expect("create f3");
+
+        b1 = get_file_disk_bytenr(&fs, "/f1.bin");
+        let b2 = get_file_disk_bytenr(&fs, "/f2.bin");
+        let b3 = get_file_disk_bytenr(&fs, "/f3.bin");
+
+        assert_eq!(b2, b1 + 4096, "f2 extent must immediately follow f1");
+        assert_eq!(b3, b2 + 4096, "f3 extent must immediately follow f2");
+    }
+
+    // Pack the 3 adjacent single-sector csum items into one 12-byte item at b1
+    pack_adjacent_csums(&temp_img, b1, 3);
+
+    // Verify initial packed state
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let fs = Btrfs::mount(dev).expect("mount btrfs");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check on packed initial state failed");
+
+    // Middle hole punch: delete middle file f2.bin
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount btrfs");
+        fs.delete_file("/f2.bin").expect("delete f2 (middle hole punch)");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check after middle hole punch failed");
+
+    // Verify f1.bin and f3.bin are still intact and readable with correct data
+    {
+        let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount btrfs");
+        assert_eq!(fs.read_file("/f1.bin").expect("read f1"), data1);
+        assert_eq!(fs.read_file("/f3.bin").expect("read f3"), data3);
+
+        // Delete remaining files
+        fs.delete_file("/f1.bin").expect("delete f1");
+        fs.delete_file("/f3.bin").expect("delete f3");
+        AccountingOracle::assert_clean(&fs);
+    }
+    assert!(run_verify_script(&temp_img), "oracle check after clean up failed");
+}
+
+

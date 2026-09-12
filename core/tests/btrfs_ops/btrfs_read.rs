@@ -1860,8 +1860,7 @@ fn a_single_corrupted_byte_of_file_data_is_caught() {
 
     let err = fs
         .read_file("/big.bin")
-        .err()
-        .expect("a corrupted data extent must not be returned as a file");
+        .expect_err("a corrupted data extent must not be returned as a file");
     assert!(
         matches!(err, LuksError::FsChecksumMismatch(_)),
         "expected a checksum error, got {err}"

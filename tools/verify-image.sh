@@ -38,11 +38,10 @@ PASSWORD="${2:-test}"
 
 if [ -f "$IMG" ]; then
     :
-elif [ -b "$IMG" ]; then
+elif [ -b "$IMG" ] || [ -c "$IMG" ]; then
     [ -r "$IMG" ] || {
         echo "cannot read $IMG — run 'diskutil unmountDisk $IMG' first, and" >&2
-        echo "if that still isn't readable, this user does not own the node;" >&2
-        echo "re-run under sudo." >&2
+        echo "if that still isn't readable, run 'sudo chmod 644 $IMG' first, then re-run as normal user" >&2
         exit 2
     }
 else
