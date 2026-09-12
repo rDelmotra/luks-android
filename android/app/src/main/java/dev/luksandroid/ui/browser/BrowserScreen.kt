@@ -50,6 +50,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -96,6 +97,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.luksandroid.Entry
+import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.StatFsInfo
@@ -601,6 +603,20 @@ fun BrowserScreen(
     val allTransfers by TransferManager.transfers.collectAsState()
     val activeTransferItem = activeTransferId?.let { id -> allTransfers.find { it.id == id } }
 
+    // Plain volume write arming state
+    var isPlainWriteArmedState by remember { mutableStateOf(volume.isPlainWriteArmed) }
+    var showPlainWriteConfirmDialog by remember { mutableStateOf(false) }
+    var pendingActionAfterArm by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    fun performWriteAction(action: () -> Unit) {
+        if (!volumeInfo.encrypted && !isPlainWriteArmedState) {
+            pendingActionAfterArm = action
+            showPlainWriteConfirmDialog = true
+        } else {
+            action()
+        }
+    }
+
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Check Subvolume Refusal State
@@ -1040,8 +1056,10 @@ fun BrowserScreen(
                                     icon = BrowserIcons.CreateFolder,
                                     onClick = {
                                         isSpeedDialOpen = false
-                                        newFolderError = null
-                                        showNewFolderDialog = true
+                                        performWriteAction {
+                                            newFolderError = null
+                                            showNewFolderDialog = true
+                                        }
                                     },
                                 )
 
@@ -1050,7 +1068,9 @@ fun BrowserScreen(
                                     icon = BrowserIcons.Folder,
                                     onClick = {
                                         isSpeedDialOpen = false
-                                        folderImporter.launch(null)
+                                        performWriteAction {
+                                            folderImporter.launch(null)
+                                        }
                                     },
                                 )
 
@@ -1059,7 +1079,9 @@ fun BrowserScreen(
                                     icon = BrowserIcons.Upload,
                                     onClick = {
                                         isSpeedDialOpen = false
-                                        importer.launch(arrayOf("*/*"))
+                                        performWriteAction {
+                                            importer.launch(arrayOf("*/*"))
+                                        }
                                     },
                                 )
                             }
@@ -1110,8 +1132,10 @@ fun BrowserScreen(
                         onSelectAll = { selectedPaths = browserItems.map { it.fullPath }.toSet() },
                         onClear = { selectedPaths = emptySet() },
                         onDelete = {
-                            deleteSelectionError = null
-                            confirmingDeleteSelection = true
+                            performWriteAction {
+                                deleteSelectionError = null
+                                confirmingDeleteSelection = true
+                            }
                         },
                     )
                 } else {
@@ -1258,6 +1282,52 @@ fun BrowserScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                        }
+                    }
+                }
+
+                if (!volumeInfo.encrypted) {
+                    Surface(
+                        color = if (!isPlainWriteArmedState) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Icon(
+                                imageVector = if (!isPlainWriteArmedState) Icons.Default.Warning else Icons.Default.Info,
+                                contentDescription = null,
+                                tint = if (!isPlainWriteArmedState) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (!isPlainWriteArmedState) "Unencrypted Drive · Read-Only" else "Unencrypted Drive · Writes Armed",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (!isPlainWriteArmedState) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    text = if (!isPlainWriteArmedState) {
+                                        "Data on this drive is stored in plaintext. Writing requires explicit confirmation."
+                                    } else {
+                                        "Data written to this partition is stored in plaintext without LUKS encryption."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (!isPlainWriteArmedState) MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.9f) else MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            if (!isPlainWriteArmedState && canWriteVolume && !isSubvolumeReadOnly) {
+                                Button(
+                                    onClick = { showPlainWriteConfirmDialog = true },
+                                    shape = RoundedCornerShape(8.dp),
+                                ) {
+                                    Text("Enable Writing")
+                                }
+                            }
                         }
                     }
                 }
@@ -1465,12 +1535,16 @@ fun BrowserScreen(
                             }
                         },
                         onRename = {
-                            renameError = null
-                            renamingItem = item
+                            performWriteAction {
+                                renameError = null
+                                renamingItem = item
+                            }
                         },
                         onDelete = {
-                            deleteError = null
-                            deletingItem = item
+                            performWriteAction {
+                                deleteError = null
+                                deletingItem = item
+                            }
                         },
                         onChecksum = {
                             calculateChecksum(item)
@@ -1511,6 +1585,72 @@ fun BrowserScreen(
 }
 
     // Dialogs
+    if (showPlainWriteConfirmDialog) {
+        val deviceDesc = (LuksSession.device as? LuksDevice)?.info?.let { "${it.vendor} ${it.product}".trim() }
+            ?.ifBlank { null }
+            ?: (if (volumeInfo.label.isNotBlank()) volumeInfo.label else "USB Drive")
+        AlertDialog(
+            onDismissRequest = {
+                showPlainWriteConfirmDialog = false
+                pendingActionAfterArm = null
+            },
+            icon = {
+                Icon(
+                    imageVector = Icons.Default.Warning,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(32.dp),
+                )
+            },
+            title = {
+                Text(
+                    text = "Enable Writing to Unencrypted Drive?",
+                    fontWeight = FontWeight.Bold,
+                )
+            },
+            text = {
+                Text(
+                    text = "You are about to allow write operations on '$deviceDesc' (${formatSize(volumeInfo.sizeBytes)}).\n\n" +
+                        "This partition is NOT encrypted. Any files written, modified, or deleted will not have LUKS encryption.\n\n" +
+                        "This confirmation will remain active for the current session only.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        try {
+                            volume.armPlainWrites()
+                            isPlainWriteArmedState = true
+                            showPlainWriteConfirmDialog = false
+                            val action = pendingActionAfterArm
+                            pendingActionAfterArm = null
+                            action?.invoke()
+                        } catch (e: Exception) {
+                            Trace.err(-1, "arm_plain")
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                    ),
+                ) {
+                    Text("Enable Writing")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showPlainWriteConfirmDialog = false
+                        pendingActionAfterArm = null
+                    },
+                ) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
     if (showNewFolderDialog) {
         NewFolderDialog(
             onDismissRequest = { showNewFolderDialog = false },

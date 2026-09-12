@@ -30,6 +30,7 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isCancelled: Boolean get() = code == CANCELLED
     val isDirectoryNotEmpty: Boolean get() = code == DIRECTORY_NOT_EMPTY
     val isWriteSessionFenced: Boolean get() = code == WRITE_SESSION_FENCED
+    val isReadOnlyVolume: Boolean get() = code == READ_ONLY_VOLUME
 
     /**
      * Whether this failure means no further write on this volume can be

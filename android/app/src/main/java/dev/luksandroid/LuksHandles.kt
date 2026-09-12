@@ -389,9 +389,16 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
      * Consent lasts for this handle only; closing the volume revokes it.
      * A no-op on an encrypted volume.
      */
+    @Volatile
+    private var explicitlyArmed: Boolean = false
+
+    open val isPlainWriteArmed: Boolean
+        get() = explicitlyArmed || (runCatching { info.encrypted }.getOrDefault(true))
+
     open fun armPlainWrites() {
         check(handle != 0L) { "volume is closed" }
         LuksNative.nativeArmPlainWrites(handle)
+        explicitlyArmed = true
     }
 
     open fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
