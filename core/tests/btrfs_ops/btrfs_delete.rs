@@ -621,3 +621,77 @@ fn test_delete_subvolume_file_sharing_packed_csum_with_root_tree_file() {
         );
     }
 }
+
+/// Deletes the *pre-existing, kernel-written* data files in a fixture.
+///
+/// This is the test that would have caught the packed-checksum defect without a
+/// physical drive, and it is worth understanding why it did not exist. Every other
+/// write test in this suite creates its own file and then deletes that file — data
+/// the driver wrote, one `EXTENT_CSUM` item per extent, because this driver never
+/// packs. The fixtures, built by `mkfs.btrfs` and by a real kernel mount, do pack:
+/// `compress.img` carries a single 72-byte item at `0xd00000` covering 73,728 bytes
+/// across four separate inodes (257 zlib.txt, 258 lzo.txt, 259 zstd.txt,
+/// 261 sparse.bin). The hazardous layout was committed and in use the whole time;
+/// no test ever deleted anything inside it.
+///
+/// `lzo.txt`'s first extent is at `0xd05000`, inside an item keyed at `0xd00000`,
+/// so the old `key.offset >= disk_bytenr` test skipped it and left an orphan.
+/// These files are also compressed, so `disk_num_bytes != num_bytes`.
+#[test]
+fn delete_preexisting_kernel_written_files_with_packed_csums() {
+    // Deliberately not in disk order: zstd.txt sits after lzo.txt in the packed
+    // item, so removing lzo.txt first exercises a middle hole punch and then a
+    // second trim of an item that has already been split once.
+    for victims in [
+        vec!["/lzo.txt", "/zstd.txt", "/zlib.txt", "/sparse.bin"],
+        vec!["/sparse.bin", "/zlib.txt", "/zstd.txt", "/lzo.txt"],
+    ] {
+        let temp_img = copy_to_temp("compress.img");
+        let file_len = fs::metadata(&temp_img).unwrap().len();
+
+        // Record contents up front so survivors can be proven byte-identical.
+        let mut expected: Vec<(String, Vec<u8>)> = Vec::new();
+        {
+            let dev = FileDevice::open(&temp_img).expect("open fixture");
+            let fs_ro = Btrfs::mount(dev).expect("mount fixture");
+            for v in &victims {
+                expected.push((v.to_string(), fs_ro.read_file(v).expect("read fixture file")));
+            }
+            // Vacuity: these must be real on-disk extents, not inline data, or the
+            // packed-item hazard is not being exercised at all.
+            let b = get_file_disk_bytenr(&fs_ro, "/lzo.txt");
+            assert!(
+                b > 0,
+                "vacuity: lzo.txt must have an on-disk extent for packing to apply"
+            );
+        }
+
+        for (i, victim) in victims.iter().enumerate() {
+            {
+                let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+                let mut fs_rw = Btrfs::mount(dev).expect("mount writable");
+                fs_rw
+                    .delete_file(victim)
+                    .unwrap_or_else(|e| panic!("delete {victim}: {e}"));
+                assert!(matches!(fs_rw.read_file(victim), Err(LuksError::NotFound(_))));
+
+                // Every not-yet-deleted file must still read back byte-identical.
+                for (name, want) in expected.iter().skip(i + 1) {
+                    assert_eq!(
+                        &fs_rw.read_file(name).unwrap_or_else(|e| panic!("read {name}: {e}")),
+                        want,
+                        "{name} corrupted after deleting {victim}"
+                    );
+                }
+
+                AccountingOracle::assert_clean(&fs_rw);
+            }
+            assert!(
+                run_verify_script(&temp_img),
+                "kernel check failed after deleting {victim}"
+            );
+        }
+
+        let _ = fs::remove_file(&temp_img);
+    }
+}
