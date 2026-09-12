@@ -14,7 +14,10 @@ pub mod file;
 pub mod gate;
 pub mod interval_set;
 pub mod node;
+pub mod target;
 pub mod txn;
+
+pub use target::TargetTree;
 
 pub use alloc::{BlockGroupFreeSpace, FreeRange, FreeSpaceMap};
 pub use batch::Batch;
@@ -96,7 +99,7 @@ impl<D: WriteAt> Btrfs<D> {
         }
         let txn = Transaction::update_inode_mtime(
             self,
-            located.tree,
+            TargetTree::new(located.tree),
             located.inode.objectid,
             mtime_sec,
             mtime_nsec,
@@ -141,7 +144,7 @@ impl<D: WriteAt> Btrfs<D> {
         };
         let (txn, new_ino) = Transaction::create_directory_in_dir(
             self,
-            self.fs_tree(),
+            TargetTree::from_fs_tree(self.fs_tree()),
             parent_ino,
             located_parent.uid,
             located_parent.gid,

@@ -47,6 +47,7 @@ REQUIRED_BTRFS=(
     "compress.img"
     "mixed-4k.img"
     "subvol.img"
+    "subvol-aged.img"
     "nonmixed-4k.img"
     "sha256-4k.img"
     "fst-aged.img"

@@ -9,7 +9,8 @@ use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::cow_tree_mutate;
 use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result, ExtentTree};
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::{Btrfs, TreeRoot};
+use crate::fs::btrfs::write::target::TargetTree;
+use crate::fs::btrfs::Btrfs;
 
 use super::Transaction;
 
@@ -17,13 +18,13 @@ impl Transaction {
     /// Prepare a transaction that updates the `mtime` and `ctime` of an existing file inode.
     pub fn update_inode_mtime<D: ReadAt>(
         fs: &Btrfs<D>,
-        target_tree: TreeRoot,
+        target_tree: TargetTree,
         inode_number: u64,
         mtime_sec: u64,
         mtime_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&target_tree)?;
+        gate::check_writeable_subvolume(&target_tree.root)?;
         if target_tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "btrfs subvolume write not yet supported".into(),
@@ -39,14 +40,14 @@ impl Transaction {
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new(); // (bytenr, level, owner)
         let mut blocks_to_remove = Vec::<(u64, u8)>::new(); // (bytenr, level)
 
-        // 1. CoW the FS tree to modify the target INODE_ITEM.
+        // 1. CoW the target tree to modify the target INODE_ITEM.
         let inode_key = Key::new(inode_number, INODE_ITEM_KEY, 0);
         let fs_res = cow_tree_mutate(
             fs,
             &pending_blocks,
-            target_tree.bytenr,
-            target_tree.level,
-            FS_TREE_OBJECTID,
+            target_tree.bytenr(),
+            target_tree.level(),
+            target_tree.objectid,
             &inode_key,
             new_generation,
             &mut allocator,
@@ -80,10 +81,10 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
 
-        let mut new_fs_tree = target_tree;
+        let mut new_fs_tree = target_tree.root;
         new_fs_tree.bytenr = fs_res.new_root_bytenr;
         new_fs_tree.level = fs_res.new_root_level;
         new_fs_tree.generation = new_generation;

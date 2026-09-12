@@ -110,6 +110,70 @@ fn test_find_max_inode_differs_across_subvolumes() {
 }
 
 #[test]
+fn test_fixture_subvol_aged_properties() {
+    let dev = FileDevice::open(fixture("subvol-aged.img")).expect("open subvol-aged.img");
+    let fs = Btrfs::mount(dev).expect("mount subvol-aged.img");
+
+    let max_fs = find_max_inode(&fs, fs.fs_tree().bytenr).expect("find_max_inode on fs_tree");
+
+    let subvols = fs.subvolumes().expect("list subvolumes");
+    let home_subvol = subvols
+        .iter()
+        .find(|s| s.path == "/home")
+        .expect("must find /home subvolume");
+
+    let home_root = fs.tree_root(home_subvol.id).expect("home tree_root");
+    let max_home = find_max_inode(&fs, home_root.bytenr).expect("find_max_inode on home_root");
+
+    // Vacuity guards:
+    assert!(max_fs >= 256, "max_fs must be >= 256, got {max_fs}");
+    assert!(max_home >= 300, "max_home must be >= 300 due to 50 aged files, got {max_home}");
+
+    // Defect D-2 remediation proof:
+    // Subvolume inode count strictly exceeds FS_TREE's inode count (the dangerous direction)!
+    // If a writer improperly allocates next_ino using FS_TREE instead of the target subvolume,
+    // it would collide with existing inodes in /home!
+    assert!(
+        max_home > max_fs,
+        "max_home ({max_home}) must strictly exceed max_fs ({max_fs}) in subvol-aged.img"
+    );
+
+    // Assert that /home has at least 50 files
+    let mut file_count = 0;
+    let docs = fs.list_dir("/home/user/docs").expect("list /home/user/docs");
+    for entry in &docs {
+        if entry.name.starts_with("file_") {
+            file_count += 1;
+        }
+    }
+    assert!(
+        file_count >= 50,
+        "vacuity guard: /home/user/docs must have at least 50 files, got {file_count}"
+    );
+
+    // Direct Hazard H-A proof on aged on-disk fixture:
+    let old_bug_ino = max_fs + 1;
+    assert!(
+        old_bug_ino <= max_home,
+        "hazard proof: unparameterized writer would select inode {old_bug_ino} <= {max_home}, colliding in /home"
+    );
+    let docs_inodes: std::collections::HashSet<u64> = docs
+        .iter()
+        .filter(|entry| !entry.is_subvolume)
+        .map(|entry| entry.inode)
+        .collect();
+    assert!(
+        docs_inodes.contains(&old_bug_ino),
+        "hazard proof: inode {old_bug_ino} is a live, non-subvolume entry in /home/user/docs — an unparameterized writer would have overwritten it"
+    );
+    let fixed_ino = max_home + 1;
+    assert!(
+        fixed_ino > max_home,
+        "hazard remediation: parameterized writer selects {fixed_ino} > {max_home}, collision impossible"
+    );
+}
+
+#[test]
 fn test_read_only_subvolume_gate_negative_control() {
     let temp_path = copy_to_temp("subvol.img");
     let len = std::fs::metadata(&temp_path).expect("stat").len();

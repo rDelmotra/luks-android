@@ -25,11 +25,12 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
+TARGETS="${2:-plain compress mixed-4k subvol subvol-aged large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
 UUID_SUBVOL="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+UUID_SUBVOL_AGED="abababab-bcbc-cdcd-dede-efefefefefef"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
 UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
 UUID_SHA256="12121212-3434-5656-7878-909090909090"
@@ -213,6 +214,49 @@ btrfs subvolume get-default "$MNT" >> "$WORK/subvol-list.txt"
 sync
 umount "$MNT"
 echo "  -> subvol.img"
+fi
+
+# --- subvol-aged.img: subvolume max inode exceeds FS_TREE max inode ---------
+# On real Linux systems (e.g. Fedora), FS_TREE typically contains only a few
+# mountpoint directories (low max inode), while /home or /root subvolumes
+# contain hundreds or thousands of files (high max inode).
+# In subvol.img, FS_TREE happened to have max_ino = 260 while /home had 259.
+# This fixture populates /home with 50 files so max_home (>= 307) strictly
+# exceeds max_fs (<= 260).
+if want subvol-aged; then
+echo "Building subvol-aged.img..."
+IMG="$OUT/subvol-aged.img"
+rm -f "$IMG"
+truncate -s 160M "$IMG"
+mkfs.btrfs -q -L BTRFSSUBAGED -U "$UUID_SUBVOL_AGED" "$IMG"
+mount -o loop "$IMG" "$MNT"
+
+printf 'top level file\n' > "$MNT/toplevel.txt"
+
+btrfs subvolume create "$MNT/root"
+mkdir -p "$MNT/root/etc"
+printf 'fixture.localdomain\n' > "$MNT/root/etc/hostname"
+
+btrfs subvolume create "$MNT/home"
+mkdir -p "$MNT/home/user/docs"
+printf 'four levels down, in another tree\n' > "$MNT/home/user/docs/deep.txt"
+
+# Populate /home with 50 files so inode numbers in /home advance past 300
+for i in $(seq 1 50); do
+    printf 'user file %d\n' "$i" > "$MNT/home/user/docs/file_$i.txt"
+done
+
+btrfs subvolume create "$MNT/home/user/snap"
+printf 'nested subvolume\n' > "$MNT/home/user/snap/inside.txt"
+
+mkdir -p "$MNT/snapshots"
+btrfs subvolume snapshot -r "$MNT/home" "$MNT/snapshots/home-snap"
+
+sync
+btrfs subvolume set-default "$MNT/root"
+sync
+umount "$MNT"
+echo "  -> subvol-aged.img"
 fi
 
 # --- large.img: chunk allocation under pressure ----------------------------

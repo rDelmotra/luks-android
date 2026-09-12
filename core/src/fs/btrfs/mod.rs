@@ -57,7 +57,7 @@ use crate::error::{LuksError, Result};
 const MAX_LEVEL: u8 = 8;
 
 /// Where one tree lives, from its `ROOT_ITEM`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TreeRoot {
     /// The tree's own id — 5 for the top level, 256 and up for a subvolume.
     pub objectid: u64,
@@ -373,11 +373,12 @@ impl<D: ReadAt> Btrfs<D> {
     pub fn target_tree(&self) -> TreeRoot {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {
-            if let Some(mut target) = batch.target_tree() {
-                target.bytenr = batch.fs_root.0;
-                target.level = batch.fs_root.1;
-                target.generation = batch.generation;
-                return target;
+            if let Some(target) = batch.target_tree() {
+                let mut root = target.root;
+                root.bytenr = batch.fs_root.0;
+                root.level = batch.fs_root.1;
+                root.generation = batch.generation;
+                return root;
             }
         }
         self.fs_tree()

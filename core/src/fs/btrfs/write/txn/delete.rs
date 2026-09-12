@@ -12,6 +12,7 @@ use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::cow_tree_mutate;
 use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result, ExtentTree};
 use crate::fs::btrfs::write::gate;
+use crate::fs::btrfs::write::target::TargetTree;
 use crate::fs::btrfs::Btrfs;
 
 use super::Transaction;
@@ -54,6 +55,9 @@ impl Transaction {
                 "subvolume file deletion not yet supported".into(),
             ));
         }
+        let target_tree = TargetTree::new(located_target.tree);
+        let target_objectid = target_tree.objectid;
+
         let target_is_dir = located_target.inode.file_type().is_dir();
         if target_is_dir {
             // DIR_INDEX and DIR_ITEM always come in pairs per entry (see
@@ -67,7 +71,7 @@ impl Transaction {
             // non-empty directory here is what prevents that.
             let mut has_children = false;
             fs.for_each_item(
-                fs.fs_tree().bytenr,
+                target_tree.bytenr(),
                 located_target.inode.objectid,
                 DIR_INDEX_KEY,
                 &mut |_, _| {
@@ -96,7 +100,7 @@ impl Transaction {
         let name_hash = crate::fs::btrfs::crc32c::name_hash(filename.as_bytes());
         let dir_item_key = Key::new(parent_ino, DIR_ITEM_KEY, name_hash);
         let dir_item_raw = fs
-            .find_item(fs.fs_tree().bytenr, &dir_item_key)?
+            .find_item(target_tree.bytenr(), &dir_item_key)?
             .ok_or_else(|| LuksError::NotFound(path.to_string()))?;
         let dir_entries = crate::fs::btrfs::inode::parse_dir_entries(&dir_item_raw)?;
         if !dir_entries
@@ -108,7 +112,7 @@ impl Transaction {
 
         // 2. Find dir_index for DIR_INDEX
         let inode_ref_key = Key::new(target_ino, INODE_REF_KEY, parent_ino);
-        let dir_index = if let Some(ref_data) = fs.find_item(fs.fs_tree().bytenr, &inode_ref_key)? {
+        let dir_index = if let Some(ref_data) = fs.find_item(target_tree.bytenr(), &inode_ref_key)? {
             if ref_data.len() >= 8 {
                 u64::from_le_bytes(ref_data[0..8].try_into().unwrap())
             } else {
@@ -122,7 +126,7 @@ impl Transaction {
         } else {
             let mut found_idx = 0;
             fs.for_each_item(
-                fs.fs_tree().bytenr,
+                target_tree.bytenr(),
                 parent_ino,
                 DIR_INDEX_KEY,
                 &mut |key, data| {
@@ -146,7 +150,7 @@ impl Transaction {
 
         // 3. Scan all items for target_ino
         let mut target_items: Vec<(Key, Vec<u8>)> = Vec::new();
-        let mut cursor = fs.search(fs.fs_tree().bytenr, &Key::new(target_ino, 0, 0))?;
+        let mut cursor = fs.search(target_tree.bytenr(), &Key::new(target_ino, 0, 0))?;
         while cursor.valid() {
             let key = cursor.key()?;
             if key.objectid != target_ino {
@@ -191,16 +195,16 @@ impl Transaction {
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
 
-        let mut fs_root_bytenr = fs.fs_tree().bytenr;
-        let mut fs_root_level = fs.fs_tree().level;
+        let mut fs_root_bytenr = target_tree.bytenr();
+        let mut fs_root_level = target_tree.level();
 
-        // 5. CoW FS_TREE: Update parent directory DIR_ITEM
+        // 5. CoW target tree: Update parent directory DIR_ITEM
         let res = cow_tree_mutate(
             fs,
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &dir_item_key,
             new_generation,
             &mut allocator,
@@ -243,18 +247,18 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
 
-        // 6. CoW FS_TREE: Delete parent directory DIR_INDEX
+        // 6. CoW target tree: Delete parent directory DIR_INDEX
         let res = cow_tree_mutate(
             fs,
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &dir_index_key,
             new_generation,
             &mut allocator,
@@ -270,12 +274,12 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
 
-        // 7. CoW FS_TREE: Update parent directory INODE_ITEM
+        // 7. CoW target tree: Update parent directory INODE_ITEM
         let parent_inode_key = Key::new(parent_ino, INODE_ITEM_KEY, 0);
         let name_len = filename.len() as u64;
         let res = cow_tree_mutate(
@@ -283,7 +287,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &parent_inode_key,
             new_generation,
             &mut allocator,
@@ -316,19 +320,19 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
 
-        // 8. CoW FS_TREE: Delete all items with objectid == target_ino
+        // 8. CoW target tree: Delete all items with objectid == target_ino
         for (item_key, _) in &target_items {
             let res = cow_tree_mutate(
                 fs,
                 &pending_blocks,
                 fs_root_bytenr,
                 fs_root_level,
-                FS_TREE_OBJECTID,
+                target_objectid,
                 item_key,
                 new_generation,
                 &mut allocator,
@@ -344,7 +348,7 @@ impl Transaction {
                 &mut allocator,
                 &mut pending_blocks,
                 sb.node_size,
-                FS_TREE_OBJECTID,
+                target_objectid,
             )?;
             fs_root_bytenr = res.new_root_bytenr;
             fs_root_level = res.new_root_level;
@@ -427,7 +431,7 @@ impl Transaction {
             }
         }
 
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = target_tree.root;
         new_fs_tree.bytenr = fs_root_bytenr;
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;

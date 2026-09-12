@@ -21,9 +21,10 @@ use crate::fs::btrfs::write::extent_tree::{
 use crate::fs::btrfs::write::file::BtrfsFileWriter;
 use crate::fs::btrfs::write::interval_set::IntervalSet;
 use crate::fs::btrfs::write::node;
+use crate::fs::btrfs::write::target::TargetTree;
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::{Btrfs, Node, TreeRoot};
+use crate::fs::btrfs::{Btrfs, Node};
 
 /// Snapshot of batch state taken before adding a file, enabling single-file rollback.
 #[derive(Debug, Clone)]
@@ -35,7 +36,7 @@ pub struct FileMark {
     pub blocks_to_add: Vec<(u64, u8, u64)>,
     pub blocks_to_remove: Vec<(u64, u8)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
-    pub target: Option<(TreeRoot, u64)>,
+    pub target: Option<(TargetTree, u64)>,
     pub next_dir_index: HashMap<u64, u64>,
     pub parents: HashMap<String, (u64, u32, u32)>,
     pub handed_out: IntervalSet,
@@ -53,7 +54,7 @@ pub struct Batch {
     pub blocks_to_add: Vec<(u64, u8, u64)>,
     pub blocks_to_remove: Vec<(u64, u8)>,
     pub data_extents_to_add: Vec<(u64, u64, u64, u64, u64)>,
-    pub target: Option<(TreeRoot, u64)>,
+    pub target: Option<(TargetTree, u64)>,
     pub next_dir_index: HashMap<u64, u64>,
     pub parents: HashMap<String, (u64, u32, u32)>, // path -> (ino, uid, gid)
     pub handed_out: IntervalSet,
@@ -102,7 +103,7 @@ impl Batch {
     }
 
     /// The target tree of this batch, if bound.
-    pub fn target_tree(&self) -> Option<TreeRoot> {
+    pub fn target_tree(&self) -> Option<TargetTree> {
         self.target.map(|(t, _)| t)
     }
 
@@ -366,7 +367,7 @@ impl Batch {
                 if self.target.is_none() {
                     let max_ino = find_max_inode(fs, located_parent.tree.bytenr)?;
                     let next = if max_ino < 256 { 256 } else { max_ino + 1 };
-                    self.target = Some((located_parent.tree, next));
+                    self.target = Some((TargetTree::new(located_parent.tree), next));
                     self.fs_root = (located_parent.tree.bytenr, located_parent.tree.level);
                 }
 
@@ -396,7 +397,7 @@ impl Batch {
         let sb = fs.superblock();
         let node_size = sb.node_size as u64;
         let new_generation = self.generation;
-        let (_, ref mut next_ino_ref) = match self.target.as_mut() {
+        let (ref mut target_tree, ref mut next_ino_ref) = match self.target.as_mut() {
             Some(t) => t,
             None => {
                 return Err(LuksError::CorruptFs(
@@ -406,6 +407,7 @@ impl Batch {
         };
         let new_ino = *next_ino_ref;
         *next_ino_ref += 1;
+        let target_objectid = target_tree.objectid;
 
         let dir_index = if let Some(next_idx) = self.next_dir_index.get_mut(&parent_ino) {
             let idx = *next_idx;
@@ -435,7 +437,7 @@ impl Batch {
             &self.pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &parent_inode_key,
             new_generation,
             &mut self.allocator,
@@ -466,7 +468,7 @@ impl Batch {
             &mut self.allocator,
             &mut self.pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -478,7 +480,7 @@ impl Batch {
             &self.pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             dir_item_key,
             dir_item_data.clone(),
             new_generation,
@@ -494,7 +496,7 @@ impl Batch {
             &mut self.allocator,
             &mut self.pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -506,7 +508,7 @@ impl Batch {
             &self.pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             dir_index_key,
             dir_item_data,
             new_generation,
@@ -522,7 +524,7 @@ impl Batch {
             &mut self.allocator,
             &mut self.pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -550,7 +552,7 @@ impl Batch {
             &self.pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             inode_key,
             inode_data,
             new_generation,
@@ -566,7 +568,7 @@ impl Batch {
             &mut self.allocator,
             &mut self.pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -579,7 +581,7 @@ impl Batch {
             &self.pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             inode_ref_key,
             inode_ref_data,
             new_generation,
@@ -595,7 +597,7 @@ impl Batch {
             &mut self.allocator,
             &mut self.pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -617,7 +619,7 @@ impl Batch {
                     &self.pending_blocks,
                     fs_root_bytenr,
                     fs_root_level,
-                    FS_TREE_OBJECTID,
+                    target_objectid,
                     extent_data_key,
                     extent_data_item,
                     new_generation,
@@ -633,14 +635,14 @@ impl Batch {
                     &mut self.allocator,
                     &mut self.pending_blocks,
                     sb.node_size,
-                    FS_TREE_OBJECTID,
+                    target_objectid,
                 )?;
                 fs_root_bytenr = res.new_root_bytenr;
                 fs_root_level = res.new_root_level;
                 self.data_extents_to_add.push((
                     bytenr,
                     run_len,
-                    FS_TREE_OBJECTID,
+                    target_objectid,
                     new_ino,
                     file_offset,
                 ));
@@ -649,6 +651,9 @@ impl Batch {
         }
 
         self.fs_root = (fs_root_bytenr, fs_root_level);
+        if let Some((ref mut target_tree, _)) = self.target {
+            target_tree.update_root(fs_root_bytenr, fs_root_level, new_generation);
+        }
 
         // 7. CoW CSUM_TREE: insert EXTENT_CSUM items covering all data runs (if CSUM tree is present and non-empty)
         if !checksums.is_empty() {
@@ -705,7 +710,7 @@ impl Batch {
     /// Commit the current batch state to disk and re-arm the batch for the next file
     /// while preserving the cached allocator, next_ino, next_dir_index, and parent directory cache.
     pub fn commit_and_rearm<D: WriteAt>(&mut self, fs: &mut Btrfs<D>) -> Result<Transaction> {
-        let mut new_fs_tree = self.target_tree().unwrap_or_else(|| fs.fs_tree());
+        let mut new_fs_tree = self.target_tree().map(|t| t.root).unwrap_or_else(|| fs.fs_tree());
         new_fs_tree.bytenr = self.fs_root.0;
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;
@@ -740,9 +745,7 @@ impl Batch {
         // their contents into `converge_and_finalize` above.
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
         if let Some((ref mut target_tree, _)) = self.target {
-            target_tree.bytenr = txn.new_fs_tree.bytenr;
-            target_tree.level = txn.new_fs_tree.level;
-            target_tree.generation = txn.new_generation;
+            target_tree.update_root(txn.new_fs_tree.bytenr, txn.new_fs_tree.level, txn.new_generation);
         }
         self.csum_root = None;
         self.generation = txn.new_generation;
@@ -756,7 +759,7 @@ impl Batch {
 
     /// Commit the batch into a Transaction ready to be committed to disk.
     pub fn commit<D: WriteAt>(self, fs: &mut Btrfs<D>) -> Result<Transaction> {
-        let mut new_fs_tree = self.target_tree().unwrap_or_else(|| fs.fs_tree());
+        let mut new_fs_tree = self.target_tree().map(|t| t.root).unwrap_or_else(|| fs.fs_tree());
         new_fs_tree.bytenr = self.fs_root.0;
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;

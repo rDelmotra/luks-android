@@ -23,12 +23,14 @@ use crate::fs::btrfs::write::extent_tree::{
     converge_and_finalize, find_item_in_tree, record_cow_result, ExtentTree,
 };
 use crate::fs::btrfs::write::gate;
+use crate::fs::btrfs::write::target::TargetTree;
 use crate::fs::btrfs::Btrfs;
 
 use super::Transaction;
 
 /// Everything the resolution phase determined, needed by the CoW phases.
 struct RenamePlan {
+    target_tree: TargetTree,
     old_parent_ino: u64,
     new_parent_ino: u64,
     child_ino: u64,
@@ -74,6 +76,9 @@ impl Transaction {
             RenameResolution::Proceed(plan) => plan,
         };
 
+        let target_tree = plan.target_tree;
+        let target_objectid = target_tree.objectid;
+
         crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Rename {
             from_parent: plan.old_parent_ino,
             to_parent: plan.new_parent_ino,
@@ -89,8 +94,8 @@ impl Transaction {
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
 
-        let mut fs_root_bytenr = fs.fs_tree().bytenr;
-        let mut fs_root_level = fs.fs_tree().level;
+        let mut fs_root_bytenr = target_tree.bytenr();
+        let mut fs_root_level = target_tree.level();
 
         let mut data_extents_to_free = Vec::new();
         let dest_replaced = plan.dest_replacement.is_some();
@@ -104,6 +109,7 @@ impl Transaction {
                 &mut pending_blocks,
                 fs_root_bytenr,
                 fs_root_level,
+                target_objectid,
                 new_generation,
                 &mut allocator,
                 &mut blocks_to_add,
@@ -124,6 +130,7 @@ impl Transaction {
             &mut pending_blocks,
             fs_root_bytenr,
             fs_root_level,
+            target_objectid,
             new_generation,
             &mut allocator,
             &mut blocks_to_add,
@@ -147,6 +154,7 @@ impl Transaction {
             &mut pending_blocks,
             fs_root_bytenr,
             fs_root_level,
+            target_objectid,
             new_generation,
             &mut allocator,
             &mut blocks_to_add,
@@ -165,7 +173,7 @@ impl Transaction {
         fs_root_bytenr = b;
         fs_root_level = l;
 
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = target_tree.root;
         new_fs_tree.bytenr = fs_root_bytenr;
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
@@ -225,6 +233,7 @@ fn resolve_rename<D: ReadAt>(
             "subvolume rename not supported".into(),
         ));
     }
+    let target_tree = TargetTree::new(located_old_parent.tree);
 
     if !located_old_parent.inode.file_type().is_dir() {
         return Err(LuksError::NotADirectory(old_parent_path.to_string()));
@@ -238,7 +247,7 @@ fn resolve_rename<D: ReadAt>(
 
     // Lookup old_name in old_parent
     let old_entry = fs
-        .lookup(fs.fs_tree().bytenr, old_parent_ino, old_name)?
+        .lookup(target_tree.bytenr(), old_parent_ino, old_name)?
         .ok_or_else(|| LuksError::NotFound(format!("{}/{}", old_parent_path, old_name)))?;
 
     let child_ino = old_entry.location.objectid;
@@ -256,7 +265,7 @@ fn resolve_rename<D: ReadAt>(
     // Same source and destination: no-op
     if old_parent_ino == new_parent_ino && old_name == new_name {
         return Ok(RenameResolution::NoOp(Transaction::update_inode_mtime(
-            fs, located_old_parent.tree, child_ino, now_sec, now_nsec,
+            fs, target_tree, child_ino, now_sec, now_nsec,
         )?));
     }
 
@@ -271,7 +280,7 @@ fn resolve_rename<D: ReadAt>(
 
         let mut curr = new_parent_ino;
         let mut depth = 0;
-        while curr != 256 && curr != fs.fs_tree().root_dirid && depth < 256 {
+        while curr != 256 && curr != target_tree.root_dirid() && depth < 256 {
             if curr == child_ino {
                 return Err(LuksError::UnsupportedFsFeature(format!(
                     "cannot move directory '{}' into its own descendant",
@@ -281,7 +290,7 @@ fn resolve_rename<D: ReadAt>(
 
             let mut parent_of_curr = None;
             let ref_search_key = Key::new(curr, INODE_REF_KEY, 0);
-            let cursor = fs.search(fs.fs_tree().bytenr, &ref_search_key)?;
+            let cursor = fs.search(target_tree.bytenr(), &ref_search_key)?;
             if cursor.valid() {
                 let k = cursor.key()?;
                 if k.objectid == curr && k.item_type == INODE_REF_KEY {
@@ -305,7 +314,7 @@ fn resolve_rename<D: ReadAt>(
     }
 
     // Destination collision check
-    let dest_entry_opt = fs.lookup(fs.fs_tree().bytenr, new_parent_ino, new_name)?;
+    let dest_entry_opt = fs.lookup(target_tree.bytenr(), new_parent_ino, new_name)?;
     let mut dest_replacement: Option<(u64, bool, u64, Vec<(u64, u64)>)> = None;
 
     if let Some(dest_entry) = dest_entry_opt {
@@ -313,7 +322,7 @@ fn resolve_rename<D: ReadAt>(
         if dest_ino == child_ino {
             // Same file
             return Ok(RenameResolution::NoOp(Transaction::update_inode_mtime(
-                fs, located_new_parent.tree, child_ino, now_sec, now_nsec,
+                fs, target_tree, child_ino, now_sec, now_nsec,
             )?));
         }
 
@@ -325,11 +334,11 @@ fn resolve_rename<D: ReadAt>(
 
             // Check if directory is empty
             let mut has_entries = false;
-            fs.for_each_item(fs.fs_tree().bytenr, dest_ino, DIR_INDEX_KEY, &mut |_, _| {
+            fs.for_each_item(target_tree.bytenr(), dest_ino, DIR_INDEX_KEY, &mut |_, _| {
                 has_entries = true;
                 Ok(false)
             })?;
-            let dest_inode = fs.read_inode(fs.fs_tree().bytenr, dest_ino)?;
+            let dest_inode = fs.read_inode(target_tree.bytenr(), dest_ino)?;
             if has_entries || dest_inode.size > 0 {
                 return Err(LuksError::UnsupportedFsFeature(format!(
                     "destination directory '{}/{}' is not empty",
@@ -339,7 +348,7 @@ fn resolve_rename<D: ReadAt>(
 
             // Find dest_dir_index
             let inode_ref_key = Key::new(dest_ino, INODE_REF_KEY, new_parent_ino);
-            let dest_dir_index = if let Some(ref_data) = fs.find_item(fs.fs_tree().bytenr, &inode_ref_key)? {
+            let dest_dir_index = if let Some(ref_data) = fs.find_item(target_tree.bytenr(), &inode_ref_key)? {
                 if ref_data.len() >= 8 {
                     u64::from_le_bytes(ref_data[0..8].try_into().unwrap())
                 } else {
@@ -354,7 +363,7 @@ fn resolve_rename<D: ReadAt>(
                 return Err(LuksError::NotADirectory(format!("{}/{}", new_parent_path, new_name)));
             }
 
-            let dest_inode = fs.read_inode(fs.fs_tree().bytenr, dest_ino)?;
+            let dest_inode = fs.read_inode(target_tree.bytenr(), dest_ino)?;
             if dest_inode.nlink > 1 {
                 return Err(LuksError::UnsupportedFsFeature(
                     "overwriting files with hardlinks (nlink > 1) is not supported".into(),
@@ -363,7 +372,7 @@ fn resolve_rename<D: ReadAt>(
 
             // Collect dest extents to free
             let mut data_extents_to_free = Vec::new();
-            let mut cursor = fs.search(fs.fs_tree().bytenr, &Key::new(dest_ino, 0, 0))?;
+            let mut cursor = fs.search(target_tree.bytenr(), &Key::new(dest_ino, 0, 0))?;
             while cursor.valid() {
                 let key = cursor.key()?;
                 if key.objectid != dest_ino {
@@ -396,7 +405,7 @@ fn resolve_rename<D: ReadAt>(
             }
 
             let inode_ref_key = Key::new(dest_ino, INODE_REF_KEY, new_parent_ino);
-            let dest_dir_index = if let Some(ref_data) = fs.find_item(fs.fs_tree().bytenr, &inode_ref_key)? {
+            let dest_dir_index = if let Some(ref_data) = fs.find_item(target_tree.bytenr(), &inode_ref_key)? {
                 if ref_data.len() >= 8 {
                     u64::from_le_bytes(ref_data[0..8].try_into().unwrap())
                 } else {
@@ -411,7 +420,7 @@ fn resolve_rename<D: ReadAt>(
 
     // Find old_dir_index of child in old_parent
     let inode_ref_key = Key::new(child_ino, INODE_REF_KEY, old_parent_ino);
-    let old_dir_index = if let Some(ref_data) = fs.find_item(fs.fs_tree().bytenr, &inode_ref_key)? {
+    let old_dir_index = if let Some(ref_data) = fs.find_item(target_tree.bytenr(), &inode_ref_key)? {
         if ref_data.len() >= 8 {
             u64::from_le_bytes(ref_data[0..8].try_into().unwrap())
         } else {
@@ -424,7 +433,7 @@ fn resolve_rename<D: ReadAt>(
         old_dir_index
     } else {
         let mut found_idx = 0;
-        fs.for_each_item(fs.fs_tree().bytenr, old_parent_ino, DIR_INDEX_KEY, &mut |key, data| {
+        fs.for_each_item(target_tree.bytenr(), old_parent_ino, DIR_INDEX_KEY, &mut |key, data| {
             if let Ok(entries) = crate::fs::btrfs::inode::parse_dir_entries(data) {
                 for e in entries {
                     if e.name == old_name.as_bytes() && e.location.objectid == child_ino {
@@ -443,7 +452,7 @@ fn resolve_rename<D: ReadAt>(
 
     // Find next dir_index for new_parent
     let mut max_dir_index = 1u64;
-    fs.for_each_item(fs.fs_tree().bytenr, new_parent_ino, DIR_INDEX_KEY, &mut |key, _| {
+    fs.for_each_item(target_tree.bytenr(), new_parent_ino, DIR_INDEX_KEY, &mut |key, _| {
         if key.offset > max_dir_index {
             max_dir_index = key.offset;
         }
@@ -452,6 +461,7 @@ fn resolve_rename<D: ReadAt>(
     let new_dir_index = max_dir_index + 1;
 
     Ok(RenameResolution::Proceed(RenamePlan {
+        target_tree,
         old_parent_ino,
         new_parent_ino,
         child_ino,
@@ -470,6 +480,7 @@ fn rename_delete_destination<D: ReadAt>(
     pending_blocks: &mut HashMap<u64, Vec<u8>>,
     mut fs_root_bytenr: u64,
     mut fs_root_level: u8,
+    target_objectid: u64,
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
@@ -480,9 +491,9 @@ fn rename_delete_destination<D: ReadAt>(
     new_parent_ino: u64,
     new_name: &str,
 ) -> Result<(u64, u8)> {
-    // Delete all items of dest_ino from fs_tree
+    // Delete all items of dest_ino from target tree
     let mut dest_item_keys = Vec::new();
-    let mut cursor = fs.search(fs.fs_tree().bytenr, &Key::new(dest_ino, 0, 0))?;
+    let mut cursor = fs.search(fs_root_bytenr, &Key::new(dest_ino, 0, 0))?;
     while cursor.valid() {
         let key = cursor.key()?;
         if key.objectid != dest_ino {
@@ -498,7 +509,7 @@ fn rename_delete_destination<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             item_key,
             new_generation,
             allocator,
@@ -514,7 +525,7 @@ fn rename_delete_destination<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -528,7 +539,7 @@ fn rename_delete_destination<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &dest_dir_index_key,
             new_generation,
             allocator,
@@ -544,7 +555,7 @@ fn rename_delete_destination<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -558,7 +569,7 @@ fn rename_delete_destination<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         &dest_dir_item_key,
         new_generation,
         allocator,
@@ -601,7 +612,7 @@ fn rename_delete_destination<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -618,6 +629,7 @@ fn rename_swap_dirent<D: ReadAt>(
     pending_blocks: &mut HashMap<u64, Vec<u8>>,
     mut fs_root_bytenr: u64,
     mut fs_root_level: u8,
+    target_objectid: u64,
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
@@ -640,7 +652,7 @@ fn rename_swap_dirent<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         &old_dir_item_key,
         new_generation,
         allocator,
@@ -683,7 +695,7 @@ fn rename_swap_dirent<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -694,7 +706,7 @@ fn rename_swap_dirent<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         &old_dir_index_key,
         new_generation,
         allocator,
@@ -710,7 +722,7 @@ fn rename_swap_dirent<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -734,7 +746,7 @@ fn rename_swap_dirent<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &new_dir_item_key,
             new_generation,
             allocator,
@@ -753,7 +765,7 @@ fn rename_swap_dirent<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -763,7 +775,7 @@ fn rename_swap_dirent<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             new_dir_item_key,
             new_dir_item_entry.clone(),
             new_generation,
@@ -776,7 +788,7 @@ fn rename_swap_dirent<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -788,7 +800,7 @@ fn rename_swap_dirent<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         new_dir_index_key,
         new_dir_item_entry,
         new_generation,
@@ -801,7 +813,7 @@ fn rename_swap_dirent<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -816,7 +828,7 @@ fn rename_swap_dirent<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         &old_child_ref_key,
         new_generation,
         allocator,
@@ -832,7 +844,7 @@ fn rename_swap_dirent<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -843,7 +855,7 @@ fn rename_swap_dirent<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         new_child_ref_key,
         new_inode_ref_data,
         new_generation,
@@ -856,7 +868,7 @@ fn rename_swap_dirent<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -873,6 +885,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
     pending_blocks: &mut HashMap<u64, Vec<u8>>,
     mut fs_root_bytenr: u64,
     mut fs_root_level: u8,
+    target_objectid: u64,
     new_generation: u64,
     allocator: &mut FreeSpaceMap,
     blocks_to_add: &mut Vec<(u64, u8, u64)>,
@@ -895,7 +908,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
         pending_blocks,
         fs_root_bytenr,
         fs_root_level,
-        FS_TREE_OBJECTID,
+        target_objectid,
         &child_inode_key,
         new_generation,
         allocator,
@@ -922,7 +935,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
         allocator,
         pending_blocks,
         node_size,
-        FS_TREE_OBJECTID,
+        target_objectid,
     )?;
     fs_root_bytenr = res.new_root_bytenr;
     fs_root_level = res.new_root_level;
@@ -935,7 +948,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &parent_inode_key,
             new_generation,
             allocator,
@@ -968,7 +981,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -980,7 +993,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &old_parent_inode_key,
             new_generation,
             allocator,
@@ -1012,7 +1025,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -1024,7 +1037,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_objectid,
             &new_parent_inode_key,
             new_generation,
             allocator,
@@ -1057,7 +1070,7 @@ fn rename_finalize_bookkeeping<D: ReadAt>(
             allocator,
             pending_blocks,
             node_size,
-            FS_TREE_OBJECTID,
+            target_objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;

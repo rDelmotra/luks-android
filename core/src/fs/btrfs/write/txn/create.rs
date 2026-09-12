@@ -11,7 +11,8 @@ use crate::fs::btrfs::write::extent_tree::{
     converge_and_finalize, find_item_in_tree, find_max_inode, record_cow_result, ExtentTree,
 };
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::{Btrfs, TreeRoot};
+use crate::fs::btrfs::write::target::TargetTree;
+use crate::fs::btrfs::Btrfs;
 
 use super::Transaction;
 
@@ -37,6 +38,7 @@ impl Transaction {
             ));
         }
 
+        let target_tree = TargetTree::new(located_parent.tree);
         let parent_ino = located_parent.inode.objectid;
 
         // Check if file already exists in parent directory
@@ -79,8 +81,8 @@ impl Transaction {
         )?;
         let dir_index = max_dir_index + 1;
 
-        let mut fs_root_bytenr = fs.fs_tree().bytenr;
-        let mut fs_root_level = fs.fs_tree().level;
+        let mut fs_root_bytenr = target_tree.bytenr();
+        let mut fs_root_level = target_tree.level();
 
         // 1. Update parent directory INODE_ITEM (size += name_len * 2, sequence += 1, transid, mtime/ctime)
         let parent_inode_key = Key::new(parent_ino, INODE_ITEM_KEY, 0);
@@ -90,7 +92,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
             &parent_inode_key,
             new_generation,
             &mut allocator,
@@ -121,7 +123,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -138,7 +140,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
             dir_item_key,
             dir_item_data.clone(),
             new_generation,
@@ -151,7 +153,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -163,7 +165,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
             dir_index_key,
             dir_item_data,
             new_generation,
@@ -176,7 +178,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -197,7 +199,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
             new_inode_key,
             new_inode_data,
             new_generation,
@@ -210,7 +212,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -223,7 +225,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
             inode_ref_key,
             inode_ref_data,
             new_generation,
@@ -236,12 +238,12 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            target_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
 
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = target_tree.root;
         new_fs_tree.bytenr = fs_root_bytenr;
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
@@ -293,7 +295,7 @@ impl Transaction {
         let parent_ino = located_parent.inode.objectid;
         Self::create_directory_in_dir(
             fs,
-            located_parent.tree,
+            TargetTree::new(located_parent.tree),
             parent_ino,
             located_parent.inode.uid,
             located_parent.inode.gid,
@@ -306,7 +308,7 @@ impl Transaction {
     /// Prepare a transaction that creates a new directory named `name` inside `parent_ino`.
     pub fn create_directory_in_dir<D: ReadAt>(
         fs: &Btrfs<D>,
-        parent_tree: TreeRoot,
+        parent_tree: TargetTree,
         parent_ino: u64,
         parent_uid: u32,
         parent_gid: u32,
@@ -315,7 +317,7 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
         gate::check_writeable_fs(fs.superblock())?;
-        gate::check_writeable_subvolume(&parent_tree)?;
+        gate::check_writeable_subvolume(&parent_tree.root)?;
         if parent_tree.objectid != FS_TREE_OBJECTID {
             return Err(LuksError::UnsupportedFsFeature(
                 "subvolume directory creation not yet supported".into(),
@@ -325,7 +327,7 @@ impl Transaction {
         // Check if entry already exists in parent directory
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
         let dir_item_key = Key::new(parent_ino, crate::fs::btrfs::tree::DIR_ITEM_KEY, name_hash);
-        if let Some(data) = fs.find_item(parent_tree.bytenr, &dir_item_key)? {
+        if let Some(data) = fs.find_item(parent_tree.bytenr(), &dir_item_key)? {
             let entries = crate::fs::btrfs::inode::parse_dir_entries(&data)?;
             if entries.iter().any(|e| e.name == name.as_bytes()) {
                 return Err(LuksError::AlreadyExists(format!(
@@ -345,12 +347,12 @@ impl Transaction {
         let mut blocks_to_remove = Vec::<(u64, u8)>::new();
 
         // Find highest existing inode objectid and next directory index
-        let max_ino = find_max_inode(fs, parent_tree.bytenr)?;
+        let max_ino = find_max_inode(fs, parent_tree.bytenr())?;
         let new_ino = if max_ino < 256 { 256 } else { max_ino + 1 };
 
         let mut max_dir_index = 1u64;
         fs.for_each_item(
-            parent_tree.bytenr,
+            parent_tree.bytenr(),
             parent_ino,
             crate::fs::btrfs::tree::DIR_INDEX_KEY,
             &mut |key, _| {
@@ -362,8 +364,8 @@ impl Transaction {
         )?;
         let dir_index = max_dir_index + 1;
 
-        let mut fs_root_bytenr = fs.fs_tree().bytenr;
-        let mut fs_root_level = fs.fs_tree().level;
+        let mut fs_root_bytenr = parent_tree.bytenr();
+        let mut fs_root_level = parent_tree.level();
 
         // 1. Update parent directory INODE_ITEM (size += name_len * 2, sequence += 1, transid, mtime/ctime)
         let parent_inode_key = Key::new(parent_ino, INODE_ITEM_KEY, 0);
@@ -373,7 +375,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
             &parent_inode_key,
             new_generation,
             &mut allocator,
@@ -404,7 +406,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -425,7 +427,7 @@ impl Transaction {
                 &pending_blocks,
                 fs_root_bytenr,
                 fs_root_level,
-                FS_TREE_OBJECTID,
+                parent_tree.objectid,
                 &dir_item_key,
                 new_generation,
                 &mut allocator,
@@ -444,7 +446,7 @@ impl Transaction {
                 &mut allocator,
                 &mut pending_blocks,
                 sb.node_size,
-                FS_TREE_OBJECTID,
+                parent_tree.objectid,
             )?;
             fs_root_bytenr = res.new_root_bytenr;
             fs_root_level = res.new_root_level;
@@ -454,7 +456,7 @@ impl Transaction {
                 &pending_blocks,
                 fs_root_bytenr,
                 fs_root_level,
-                FS_TREE_OBJECTID,
+                parent_tree.objectid,
                 dir_item_key,
                 dir_item_entry.clone(),
                 new_generation,
@@ -467,7 +469,7 @@ impl Transaction {
                 &mut allocator,
                 &mut pending_blocks,
                 sb.node_size,
-                FS_TREE_OBJECTID,
+                parent_tree.objectid,
             )?;
             fs_root_bytenr = res.new_root_bytenr;
             fs_root_level = res.new_root_level;
@@ -480,7 +482,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
             dir_index_key,
             dir_item_entry,
             new_generation,
@@ -493,7 +495,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -514,7 +516,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
             new_inode_key,
             new_inode_data,
             new_generation,
@@ -527,7 +529,7 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
@@ -540,7 +542,7 @@ impl Transaction {
             &pending_blocks,
             fs_root_bytenr,
             fs_root_level,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
             inode_ref_key,
             inode_ref_data,
             new_generation,
@@ -553,12 +555,12 @@ impl Transaction {
             &mut allocator,
             &mut pending_blocks,
             sb.node_size,
-            FS_TREE_OBJECTID,
+            parent_tree.objectid,
         )?;
         fs_root_bytenr = res.new_root_bytenr;
         fs_root_level = res.new_root_level;
 
-        let mut new_fs_tree = fs.fs_tree();
+        let mut new_fs_tree = parent_tree.root;
         new_fs_tree.bytenr = fs_root_bytenr;
         new_fs_tree.level = fs_root_level;
         new_fs_tree.generation = new_generation;
