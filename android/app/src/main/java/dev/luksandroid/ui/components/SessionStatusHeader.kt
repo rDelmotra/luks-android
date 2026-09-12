@@ -4,12 +4,14 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -69,149 +71,113 @@ fun SessionStatusHeader(
                 val fsType = volInfo.fsType.uppercase()
                 val isTimerPaused = activeLeases > 0
 
-                Card(
+                Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
-                    ),
-                    shape = RoundedCornerShape(12.dp),
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                    shape = RoundedCornerShape(10.dp),
                 ) {
-                    Column(
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        // Top row: Storage Icon, Label, FileSystem badge, and 1-tap Lock Button
+                        // Left: Storage Icon, Label, FileSystem badge, and Live Timer/Lease chip
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
+                            modifier = Modifier.weight(1f, fill = false),
                         ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.weight(1f, fill = false),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Storage,
-                                    contentDescription = "Drive",
-                                    tint = SuccessGreen,
-                                    modifier = Modifier.size(20.dp),
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = label,
-                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                // Filesystem pill badge
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(MaterialTheme.colorScheme.primaryContainer)
-                                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                                ) {
-                                    Text(
-                                        text = fsType,
-                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    )
-                                }
-                            }
-
-                            // 1-tap Lock button
-                            FilledTonalButton(
-                                onClick = {
-                                    scope.launch { LuksSession.lock() }
-                                },
-                                colors = ButtonDefaults.filledTonalButtonColors(
-                                    containerColor = MaterialTheme.colorScheme.errorContainer,
-                                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
-                                ),
-                                contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
-                                shape = RoundedCornerShape(8.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Lock,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Lock", style = MaterialTheme.typography.labelMedium)
-                            }
-                        }
-
-                        // UUID & size info
-                        if (volInfo.uuid.isNotBlank()) {
+                            Icon(
+                                imageVector = Icons.Default.Storage,
+                                contentDescription = "Drive",
+                                tint = SuccessGreen,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "UUID: ${volInfo.uuid} · ${formatSize(volInfo.sizeBytes)}",
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                    fontSize = 11.sp,
-                                ),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                text = label,
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurface,
                             )
-                        }
-
-                        // Bottom row: Lease Count & Idle Countdown Timer
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            // Active lease indicator
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (activeLeases > 0) {
-                                    Icon(
-                                        imageVector = Icons.Default.Sync,
-                                        contentDescription = "Active leases",
-                                        tint = WarningAmber,
-                                        modifier = Modifier.size(14.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = "$activeLeases active ${if (activeLeases == 1) "lease" else "leases"}",
-                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Medium),
-                                        color = WarningAmber,
-                                    )
-                                } else {
-                                    Text(
-                                        text = "0 active leases (idle)",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                            }
-
-                            // Live idle countdown timer
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.HourglassEmpty,
-                                    contentDescription = "Idle timer",
-                                    tint = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(14.dp),
+                            Spacer(modifier = Modifier.width(6.dp))
+                            // Filesystem pill badge
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(MaterialTheme.colorScheme.primaryContainer)
+                                    .padding(horizontal = 5.dp, vertical = 1.dp),
+                            ) {
+                                Text(
+                                    text = fsType,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp,
+                                    ),
+                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 )
-                                Spacer(modifier = Modifier.width(4.dp))
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            // Live lease / relock countdown pill
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(
+                                        if (isTimerPaused) WarningAmber.copy(alpha = 0.15f)
+                                        else MaterialTheme.colorScheme.surfaceVariant
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (isTimerPaused) Icons.Default.Sync else Icons.Default.HourglassEmpty,
+                                    contentDescription = null,
+                                    tint = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(12.dp),
+                                )
+                                Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = if (isTimerPaused) {
-                                        "Relocking paused (active transfer)"
+                                        "$activeLeases active"
                                     } else {
-                                        "Relocking in ${formatIdleTime(remainingIdleMs)}"
+                                        formatIdleTime(remainingIdleMs)
                                     },
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         fontFamily = FontFamily.Monospace,
+                                        fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
                                     ),
-                                    color = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.primary,
+                                    color = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                        }
+
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        // 1-tap Lock button
+                        FilledTonalButton(
+                            onClick = {
+                                scope.launch { LuksSession.lock() }
+                            },
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = MaterialTheme.colorScheme.errorContainer,
+                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                            modifier = Modifier.height(32.dp),
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Lock", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold))
                         }
                     }
                 }
@@ -221,19 +187,19 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
                     color = MaterialTheme.colorScheme.errorContainer,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
                             imageVector = Icons.Default.Warning,
                             contentDescription = "Detached",
                             tint = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
@@ -249,19 +215,19 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
                     color = MaterialTheme.colorScheme.errorContainer,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
                             imageVector = Icons.Default.Warning,
                             contentDescription = "Failed",
                             tint = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
@@ -277,19 +243,19 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
-                        modifier = Modifier.padding(12.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
                             imageVector = Icons.Default.Sync,
                             contentDescription = "Unlocking",
                             tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(

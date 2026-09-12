@@ -1,6 +1,8 @@
 package dev.luksandroid.ui.components
 
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -98,12 +100,12 @@ fun BreadcrumbBar(
                 IconButton(
                     onClick = { onNavigate(parentOfPath(currentPath)) },
                     enabled = enabled,
-                    modifier = Modifier.size(36.dp),
+                    modifier = Modifier.size(30.dp),
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                         contentDescription = "Navigate Up",
-                        modifier = Modifier.size(20.dp),
+                        modifier = Modifier.size(18.dp),
                         tint = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f),
                     )
                 }
@@ -113,7 +115,7 @@ fun BreadcrumbBar(
                 modifier = Modifier
                     .weight(1f)
                     .horizontalScroll(scrollState)
-                    .padding(horizontal = 4.dp),
+                    .padding(horizontal = 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
@@ -122,12 +124,14 @@ fun BreadcrumbBar(
                         TextButton(
                             onClick = { if (!segment.isLast) onNavigate("/") },
                             enabled = enabled && !segment.isLast,
+                            modifier = Modifier.size(30.dp),
+                            contentPadding = PaddingValues(0.dp),
                             shape = RoundedCornerShape(6.dp),
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Home,
                                 contentDescription = "Root Directory",
-                                modifier = Modifier.size(18.dp),
+                                modifier = Modifier.size(16.dp),
                                 tint = if (segment.isLast) {
                                     MaterialTheme.colorScheme.primary
                                 } else {
@@ -138,7 +142,7 @@ fun BreadcrumbBar(
                     } else {
                         Text(
                             text = "›",
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
                             fontWeight = FontWeight.Bold,
                         )
@@ -150,8 +154,8 @@ fun BreadcrumbBar(
                             ) {
                                 Text(
                                     text = segment.name,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+                                    style = MaterialTheme.typography.bodySmall,
                                     fontWeight = FontWeight.SemiBold,
                                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                                     maxLines = 1,
@@ -162,11 +166,13 @@ fun BreadcrumbBar(
                             TextButton(
                                 onClick = { onNavigate(segment.path) },
                                 enabled = enabled,
+                                modifier = Modifier.height(30.dp),
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                                 shape = RoundedCornerShape(6.dp),
                             ) {
                                 Text(
                                     text = segment.name,
-                                    style = MaterialTheme.typography.bodyMedium,
+                                    style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,

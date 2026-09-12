@@ -21,6 +21,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import dev.luksandroid.StatFsInfo
 import dev.luksandroid.formatSize
 
@@ -39,8 +40,8 @@ fun CapacityBar(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             if (statFsInfo == null) {
                 Row(
@@ -62,8 +63,8 @@ fun CapacityBar(
                 LinearProgressIndicator(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(6.dp)
-                        .clip(RoundedCornerShape(3.dp)),
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
                     color = MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 )
@@ -94,7 +95,7 @@ fun CapacityBar(
                     ) {
                         Text(
                             text = freeText,
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Medium,
                             color = MaterialTheme.colorScheme.onSurface,
                         )
@@ -107,7 +108,7 @@ fun CapacityBar(
                                 Text(
                                     text = fsType.uppercase(),
                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                                    style = MaterialTheme.typography.labelSmall,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                                 )
                             }
@@ -121,7 +122,7 @@ fun CapacityBar(
                                 Text(
                                     text = "READ-ONLY",
                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                                    style = MaterialTheme.typography.labelSmall,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                                     color = MaterialTheme.colorScheme.onErrorContainer,
                                     fontWeight = FontWeight.Bold,
                                 )
@@ -131,7 +132,7 @@ fun CapacityBar(
 
                     Text(
                         text = "$progressPercent% used",
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.typography.labelSmall,
                         color = if (rawProgress >= 0.90f) barColor else MaterialTheme.colorScheme.onSurfaceVariant,
                         fontWeight = if (rawProgress >= 0.90f) FontWeight.Bold else FontWeight.Normal,
                     )
@@ -141,8 +142,8 @@ fun CapacityBar(
                     progress = { animatedProgress },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(6.dp)
-                        .clip(RoundedCornerShape(3.dp)),
+                        .height(4.dp)
+                        .clip(RoundedCornerShape(2.dp)),
                     color = barColor,
                     trackColor = MaterialTheme.colorScheme.surfaceVariant,
                 )

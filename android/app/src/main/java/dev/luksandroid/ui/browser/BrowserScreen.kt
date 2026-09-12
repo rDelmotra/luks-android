@@ -8,16 +8,24 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.ui.draw.rotate
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -454,6 +462,54 @@ fun renameTargetExists(existingNames: List<String>, currentName: String, newName
     newName != currentName && existingNames.any { it == newName }
 
 /**
+ * Speed Dial Action Item used in the unified add/import FAB menu.
+ */
+@Composable
+private fun SpeedDialItem(
+    label: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.clickable(
+            interactionSource = remember { MutableInteractionSource() },
+            indication = null,
+            onClick = onClick,
+        ),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(6.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            tonalElevation = 4.dp,
+            shadowElevation = 3.dp,
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            )
+        }
+
+        SmallFloatingActionButton(
+            onClick = onClick,
+            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+            shape = CircleShape,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                modifier = Modifier.size(20.dp),
+            )
+        }
+    }
+}
+
+/**
  * Main File Browser Screen for Phase L.
  */
 @Composable
@@ -511,6 +567,7 @@ fun BrowserScreen(
     var showNewFolderDialog by remember { mutableStateOf(false) }
     var isCreatingFolder by remember { mutableStateOf(false) }
     var newFolderError by remember { mutableStateOf<String?>(null) }
+    var isSpeedDialOpen by remember { mutableStateOf(false) }
 
     var renamingItem by remember { mutableStateOf<BrowserItem?>(null) }
     var isRenaming by remember { mutableStateOf(false) }
@@ -527,6 +584,12 @@ fun BrowserScreen(
     var confirmingDeleteSelection by remember { mutableStateOf(false) }
     var isDeletingSelection by remember { mutableStateOf(false) }
     var deleteSelectionError by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(selectedPaths.isNotEmpty()) {
+        if (selectedPaths.isNotEmpty()) {
+            isSpeedDialOpen = false
+        }
+    }
 
     var activeChecksum by remember { mutableStateOf<ChecksumResult?>(null) }
     var pendingExportItem by remember { mutableStateOf<BrowserItem?>(null) }
@@ -953,259 +1016,251 @@ fun BrowserScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             if (!isWriteDisabled) {
-                Column(
-                    horizontalAlignment = Alignment.End,
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                AnimatedVisibility(
+                    visible = selectedPaths.isEmpty(),
+                    enter = scaleIn() + fadeIn(),
+                    exit = scaleOut() + fadeOut(),
                 ) {
-                    FloatingActionButton(
-                        onClick = {
-                            newFolderError = null
-                            showNewFolderDialog = true
-                        },
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    Column(
+                        horizontalAlignment = Alignment.End,
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        Icon(
-                            imageVector = BrowserIcons.CreateFolder,
-                            contentDescription = "New Folder",
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-
-                    SmallFloatingActionButton(
-                        onClick = { folderImporter.launch(null) },
-                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
-                    ) {
-                        Icon(
-                            imageVector = BrowserIcons.CreateFolder,
-                            contentDescription = "Import Folder",
-                            modifier = Modifier.size(24.dp),
-                        )
-                    }
-
-                    ExtendedFloatingActionButton(
-                        onClick = { importer.launch(arrayOf("*/*")) },
-                        icon = {
-                            Icon(
-                                imageVector = BrowserIcons.Upload,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        },
-                        text = { Text("Import File") },
-                        containerColor = MaterialTheme.colorScheme.primaryContainer,
-                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                    )
-                }
-            }
-        },
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            // Header Bar — replaced by a selection action bar while
-            // selectedPaths is non-empty.
-            if (selectedPaths.isNotEmpty()) {
-                SelectionActionBar(
-                    selectedCount = selectedPaths.size,
-                    totalCount = browserItems.size,
-                    canDelete = canDeleteSelection,
-                    onSelectAll = { selectedPaths = browserItems.map { it.fullPath }.toSet() },
-                    onClear = { selectedPaths = emptySet() },
-                    onDelete = {
-                        deleteSelectionError = null
-                        confirmingDeleteSelection = true
-                    },
-                )
-            } else {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = volumeInfo.label.ifBlank { "Encrypted Volume" },
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = "${volumeInfo.fsType.uppercase()} · ${formatSize(volumeInfo.sizeBytes)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        SortMenuButton(
-                            field = sortField,
-                            ascending = sortAscending,
-                            onChange = { field, ascending ->
-                                sortField = field
-                                sortAscending = ascending
-                            },
-                        )
-
-                        IconButton(
-                            onClick = { loadDirectory(currentPath) },
-                            enabled = !isRefreshing,
+                        // Expanded Speed Dial actions
+                        AnimatedVisibility(
+                            visible = isSpeedDialOpen,
+                            enter = fadeIn() + expandVertically(expandFrom = Alignment.Bottom),
+                            exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Bottom),
                         ) {
-                            if (isRefreshing) {
-                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = "Refresh Directory",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            Column(
+                                horizontalAlignment = Alignment.End,
+                                verticalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                SpeedDialItem(
+                                    label = "New folder",
+                                    icon = BrowserIcons.CreateFolder,
+                                    onClick = {
+                                        isSpeedDialOpen = false
+                                        newFolderError = null
+                                        showNewFolderDialog = true
+                                    },
+                                )
+
+                                SpeedDialItem(
+                                    label = "Import folder",
+                                    icon = BrowserIcons.Folder,
+                                    onClick = {
+                                        isSpeedDialOpen = false
+                                        folderImporter.launch(null)
+                                    },
+                                )
+
+                                SpeedDialItem(
+                                    label = "Import files",
+                                    icon = BrowserIcons.Upload,
+                                    onClick = {
+                                        isSpeedDialOpen = false
+                                        importer.launch(arrayOf("*/*"))
+                                    },
                                 )
                             }
                         }
 
-                        OutlinedButton(
-                            onClick = {
-                                if (scope.isActive) {
-                                    scope.launch {
-                                        try {
-                                            LuksSession.lock()
-                                            onLockRequested()
-                                        } catch (e: CancellationException) {
-                                            throw e
-                                        } catch (e: Exception) {
-                                            if (e is CancellationException) throw e
-                                            Trace.err(-1, "lock")
-                                            onLockRequested()
-                                        }
-                                    }
-                                }
-                            },
-                            shape = RoundedCornerShape(8.dp),
+                        // Main Toggle FAB
+                        val rotation by animateFloatAsState(
+                            targetValue = if (isSpeedDialOpen) 45f else 0f,
+                            label = "fabRotation",
+                        )
+                        FloatingActionButton(
+                            onClick = { isSpeedDialOpen = !isSpeedDialOpen },
+                            containerColor = if (isSpeedDialOpen) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.primaryContainer,
+                            contentColor = if (isSpeedDialOpen) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onPrimaryContainer,
+                            shape = CircleShape,
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Lock,
+                                imageVector = Icons.Default.Add,
+                                contentDescription = if (isSpeedDialOpen) "Close actions" else "Add or import",
+                                modifier = Modifier
+                                    .size(26.dp)
+                                    .rotate(rotation),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+    ) { innerPadding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                // Header Bar — replaced by a selection action bar while
+                // selectedPaths is non-empty.
+                if (selectedPaths.isNotEmpty()) {
+                    SelectionActionBar(
+                        selectedCount = selectedPaths.size,
+                        totalCount = browserItems.size,
+                        canDelete = canDeleteSelection,
+                        onSelectAll = { selectedPaths = browserItems.map { it.fullPath }.toSet() },
+                        onClear = { selectedPaths = emptySet() },
+                        onDelete = {
+                            deleteSelectionError = null
+                            confirmingDeleteSelection = true
+                        },
+                    )
+                } else {
+                    // Unified Directory & Navigation Toolbar
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            BreadcrumbBar(
+                                currentPath = currentPath,
+                                onNavigate = { loadDirectory(it) },
+                                enabled = !isRefreshing,
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(6.dp))
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            SortMenuButton(
+                                field = sortField,
+                                ascending = sortAscending,
+                                onChange = { field, ascending ->
+                                    sortField = field
+                                    sortAscending = ascending
+                                },
+                            )
+
+                            IconButton(
+                                onClick = { loadDirectory(currentPath) },
+                                enabled = !isRefreshing,
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                if (isRefreshing) {
+                                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Refresh,
+                                        contentDescription = "Refresh Directory",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Capacity Bar
+                CapacityBar(
+                    statFsInfo = statFsInfo,
+                    fsType = volumeInfo.fsType,
+                    isReadOnly = isSubvolumeReadOnly || !canWriteVolume,
+                )
+
+                // Refusal Warning Banners
+                if (isSubvolumeReadOnly) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Read-only Location",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Column {
+                                Text(
+                                    text = "Subvolume: Read-only location",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                                Text(
+                                    text = subvolumeReason ?: "Writes outside the root filesystem tree are not supported.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
+                                )
+                            }
+                        }
+                    }
+                } else if (isSlackLimitReached) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = "Directory Slack Limit",
+                                tint = MaterialTheme.colorScheme.tertiary,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Column {
+                                Text(
+                                    text = "Directory Slack Limit Reached",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                )
+                                Text(
+                                    text = "This folder cannot take more entries due to directory block limit.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.9f),
+                                )
+                            }
+                        }
+                    }
+                } else if (!canWriteVolume) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Info,
                                 contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Lock")
-                        }
-                    }
-                }
-            }
-
-            // Capacity Bar
-            CapacityBar(
-                statFsInfo = statFsInfo,
-                fsType = volumeInfo.fsType,
-                isReadOnly = isSubvolumeReadOnly || !canWriteVolume,
-            )
-
-            // Refusal Warning Banners
-            if (isSubvolumeReadOnly) {
-                Surface(
-                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Read-only Location",
-                            tint = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.size(20.dp),
-                        )
-                        Column {
-                            Text(
-                                text = "Subvolume: Read-only location",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(18.dp),
                             )
                             Text(
-                                text = subvolumeReason ?: "Writes outside the root filesystem tree are not supported.",
+                                text = "Volume is mounted read-only. Write operations are disabled.",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
                     }
                 }
-            } else if (isSlackLimitReached) {
-                Surface(
-                    color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f),
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Warning,
-                            contentDescription = "Directory Slack Limit",
-                            tint = MaterialTheme.colorScheme.tertiary,
-                            modifier = Modifier.size(20.dp),
-                        )
-                        Column {
-                            Text(
-                                text = "Directory Slack Limit Reached",
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.onTertiaryContainer,
-                            )
-                            Text(
-                                text = "This folder cannot take more entries due to directory block limit.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onTertiaryContainer.copy(alpha = 0.9f),
-                            )
-                        }
-                    }
-                }
-            } else if (!canWriteVolume) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Row(
-                        modifier = Modifier.padding(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Text(
-                            text = "Volume is mounted read-only. Write operations are disabled.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-
-            // Breadcrumbs Navigation Bar
-            BreadcrumbBar(
-                currentPath = currentPath,
-                onNavigate = { loadDirectory(it) },
-                enabled = !isRefreshing,
-            )
 
             // Active Transfer Progress Banner. Reads live from TransferManager's
             // flow (not local composable state) so it reflects the same
@@ -1385,7 +1440,7 @@ fun BrowserScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
-                    contentPadding = PaddingValues(vertical = 4.dp),
+                    contentPadding = PaddingValues(top = 4.dp, bottom = 88.dp),
                     verticalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
                     items(browserItems, key = { it.fullPath }) { item ->
@@ -1394,51 +1449,66 @@ fun BrowserScreen(
                             canWrite = canWriteVolume && !isSubvolumeReadOnly,
                             onOpen = {
                                 if (item.isDir) {
-                                    loadDirectory(item.fullPath)
-                                } else {
-                                    pendingExportItem = item
-                                    exporter.launch(item.name)
-                                }
-                            },
-                            onExport = {
-                                if (item.isDir) {
-                                    pendingExportFolder = item
-                                    folderExporter.launch(null)
-                                } else {
-                                    pendingExportItem = item
-                                    exporter.launch(item.name)
-                                }
-                            },
-                            onRename = {
-                                renameError = null
-                                renamingItem = item
-                            },
-                            onDelete = {
-                                deleteError = null
-                                deletingItem = item
-                            },
-                            onChecksum = {
-                                calculateChecksum(item)
-                            },
-                            selectionActive = selectedPaths.isNotEmpty(),
-                            isSelected = item.fullPath in selectedPaths,
-                            onToggleSelect = {
-                                selectedPaths = if (item.fullPath in selectedPaths) {
-                                    selectedPaths - item.fullPath
-                                } else {
-                                    selectedPaths + item.fullPath
-                                }
-                            },
-                        )
-                        HorizontalDivider(
-                            modifier = Modifier.padding(horizontal = 8.dp),
-                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f),
-                        )
-                    }
+                                loadDirectory(item.fullPath)
+                            } else {
+                                pendingExportItem = item
+                                exporter.launch(item.name)
+                            }
+                        },
+                        onExport = {
+                            if (item.isDir) {
+                                pendingExportFolder = item
+                                folderExporter.launch(null)
+                            } else {
+                                pendingExportItem = item
+                                exporter.launch(item.name)
+                            }
+                        },
+                        onRename = {
+                            renameError = null
+                            renamingItem = item
+                        },
+                        onDelete = {
+                            deleteError = null
+                            deletingItem = item
+                        },
+                        onChecksum = {
+                            calculateChecksum(item)
+                        },
+                        selectionActive = selectedPaths.isNotEmpty(),
+                        isSelected = item.fullPath in selectedPaths,
+                        onToggleSelect = {
+                            selectedPaths = if (item.fullPath in selectedPaths) {
+                                selectedPaths - item.fullPath
+                            } else {
+                                selectedPaths + item.fullPath
+                            }
+                        },
+                    )
+                    HorizontalDivider(
+                        modifier = Modifier.padding(horizontal = 8.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f),
+                    )
                 }
             }
         }
     }
+
+    // Backdrop Scrim for Speed Dial
+    if (isSpeedDialOpen) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.35f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = { isSpeedDialOpen = false },
+                ),
+        )
+    }
+}
+}
 
     // Dialogs
     if (showNewFolderDialog) {
@@ -1752,9 +1822,9 @@ fun BrowserItemRow(
                 onClick = { if (selectionActive) onToggleSelect() else onOpen() },
                 onLongClick = onToggleSelect,
             )
-            .padding(horizontal = 8.dp, vertical = 10.dp),
+            .padding(horizontal = 8.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         // Type Icon, replaced by a checkbox once selection mode is active.
         if (selectionActive) {
@@ -1768,7 +1838,7 @@ fun BrowserItemRow(
                     item.type == "symlink" -> MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f)
                     else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
                 },
-                modifier = Modifier.size(40.dp),
+                modifier = Modifier.size(36.dp),
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
@@ -1785,7 +1855,7 @@ fun BrowserItemRow(
                             item.type == "symlink" -> MaterialTheme.colorScheme.secondary
                             else -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
-                        modifier = Modifier.size(22.dp),
+                        modifier = Modifier.size(20.dp),
                     )
                 }
             }
@@ -1794,7 +1864,7 @@ fun BrowserItemRow(
         // Title and Subtitle
         Column(
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(2.dp),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1802,7 +1872,7 @@ fun BrowserItemRow(
             ) {
                 Text(
                     text = item.name,
-                    style = MaterialTheme.typography.bodyLarge,
+                    style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
@@ -1818,7 +1888,7 @@ fun BrowserItemRow(
                         Text(
                             text = "SUBVOL",
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                            style = MaterialTheme.typography.labelSmall,
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
                             color = MaterialTheme.colorScheme.onTertiaryContainer,
                             fontWeight = FontWeight.Bold,
                         )
@@ -1844,7 +1914,7 @@ fun BrowserItemRow(
 
             Text(
                 text = subtitle,
-                style = MaterialTheme.typography.bodySmall,
+                style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
@@ -1852,11 +1922,15 @@ fun BrowserItemRow(
         // Action Menu (3-dots) — hidden during selection; batch actions live
         // in the SelectionActionBar instead.
         if (!selectionActive) Box {
-            IconButton(onClick = { menuExpanded = true }) {
+            IconButton(
+                onClick = { menuExpanded = true },
+                modifier = Modifier.size(36.dp),
+            ) {
                 Icon(
                     imageVector = Icons.Default.MoreVert,
                     contentDescription = "Actions",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp),
                 )
             }
 
