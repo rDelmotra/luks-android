@@ -4,6 +4,10 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// Resolved before `android { }` so the assemble-time warning below can see it too.
+val releaseKeystoreFile = (findProperty("luksReleaseStoreFile") as String?)?.let(::file)
+val hasReleaseSigningKey = releaseKeystoreFile?.exists() == true
+
 android {
     namespace = "dev.luksandroid"
     compileSdk = 36
@@ -28,6 +32,37 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Release signing, from properties that never enter the repository.
+    //
+    // Put these in ~/.gradle/gradle.properties (user-level, outside the project),
+    // or supply them as ORG_GRADLE_PROJECT_* environment variables in CI:
+    //
+    //     luksReleaseStoreFile=/absolute/path/to/luks-release.jks
+    //     luksReleaseStorePassword=...
+    //     luksReleaseKeyAlias=luks-release
+    //     luksReleaseKeyPassword=...
+    //
+    // On Android the signing key *is* the application's identity: an update is
+    // accepted only if it carries the same signature. The debug keystore is the
+    // wrong key for that job — not because a debug-signed APK is a debug build
+    // (this one is minified, shrunk and not debuggable), but because that
+    // keystore is disposable by design. The SDK regenerates it silently when it
+    // is missing, and the day that happens `dev.luksandroid` can never be
+    // updated in place again: every user has to uninstall and reinstall. Its
+    // only protection is the documented constant password `android`, which is a
+    // poor root of trust for the update chain of a tool that handles LUKS
+    // passphrases.
+    signingConfigs {
+        if (hasReleaseSigningKey) {
+            create("release") {
+                storeFile = releaseKeystoreFile
+                storePassword = findProperty("luksReleaseStorePassword") as String?
+                keyAlias = findProperty("luksReleaseKeyAlias") as String?
+                keyPassword = findProperty("luksReleaseKeyPassword") as String?
+            }
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
@@ -39,7 +74,14 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            signingConfig = signingConfigs.getByName("debug")
+            // Falls back to the debug key so a checkout with no keystore still
+            // builds — but says so every time, because a silent fallback is how
+            // a debug-signed APK reaches users in the first place.
+            signingConfig = if (hasReleaseSigningKey) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 
@@ -192,6 +234,39 @@ val checkNoWriteCodeInRelease by tasks.registering {
 
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("ReleaseJniLibFolders") }
     .configureEach { dependsOn(checkNoWriteCodeInRelease) }
+
+// A release APK carrying the debug signature is installable and looks fine, so
+// nothing else in the build would ever mention it. Say it at `lifecycle` level,
+// which survives `--console=plain -q`, rather than leaving it to be discovered
+// by whoever eventually runs `apksigner verify --print-certs`.
+val warnIfDebugSignedRelease by tasks.registering {
+    doLast {
+        if (!hasReleaseSigningKey) {
+            logger.lifecycle(
+                """
+                |
+                |  ============================================================
+                |   WARNING: this release APK is signed with the DEBUG key.
+                |
+                |   On Android the signing key is the app's identity. That
+                |   keystore is regenerated silently if it is ever deleted, and
+                |   when it changes no build can update an installed copy of
+                |   dev.luksandroid — every user must uninstall and reinstall.
+                |
+                |   Set luksReleaseStoreFile / luksReleaseStorePassword /
+                |   luksReleaseKeyAlias / luksReleaseKeyPassword in
+                |   ~/.gradle/gradle.properties. Do it before distributing:
+                |   the migration cost grows with every install.
+                |  ============================================================
+                |
+                """.trimMargin()
+            )
+        }
+    }
+}
+
+tasks.matching { it.name.matches(Regex("^(assemble|bundle|package)Release$")) }
+    .configureEach { dependsOn(warnIfDebugSignedRelease) }
 
 dependencies {
     implementation(libs.androidx.core.ktx)

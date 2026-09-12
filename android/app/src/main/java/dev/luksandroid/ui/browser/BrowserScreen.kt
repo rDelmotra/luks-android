@@ -115,6 +115,7 @@ import dev.luksandroid.transfer.Refusal
 import dev.luksandroid.transfer.TransferProgress
 import dev.luksandroid.transfer.TransferPrompt
 import dev.luksandroid.transfer.treeProgressLabel
+import dev.luksandroid.ui.UiErrorMessage
 import dev.luksandroid.ui.components.BreadcrumbBar
 import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
@@ -603,10 +604,18 @@ fun BrowserScreen(
     val allTransfers by TransferManager.transfers.collectAsState()
     val activeTransferItem = activeTransferId?.let { id -> allTransfers.find { it.id == id } }
 
-    // Plain volume write arming state
-    var isPlainWriteArmedState by remember { mutableStateOf(volume.isPlainWriteArmed) }
-    var showPlainWriteConfirmDialog by remember { mutableStateOf(false) }
-    var pendingActionAfterArm by remember { mutableStateOf<(() -> Unit)?>(null) }
+    // Plain volume write arming state.
+    //
+    // Keyed on `volume`, not bare `remember`: consent is a property of one
+    // native handle. Mounting a different plain drive without this composable
+    // leaving composition would otherwise carry the previous drive's "armed"
+    // into a handle the native gate still has closed — and because the
+    // "Enable Writing" affordance only appears while unarmed, that state is
+    // stuck: writes refused, with no way left to consent to them.
+    var isPlainWriteArmedState by remember(volume) { mutableStateOf(volume.isPlainWriteArmed) }
+    var showPlainWriteConfirmDialog by remember(volume) { mutableStateOf(false) }
+    var pendingActionAfterArm by remember(volume) { mutableStateOf<(() -> Unit)?>(null) }
+    var plainWriteArmError by remember(volume) { mutableStateOf<String?>(null) }
 
     fun performWriteAction(action: () -> Unit) {
         if (!volumeInfo.encrypted && !isPlainWriteArmedState) {
@@ -1593,6 +1602,7 @@ fun BrowserScreen(
             onDismissRequest = {
                 showPlainWriteConfirmDialog = false
                 pendingActionAfterArm = null
+                plainWriteArmError = null
             },
             icon = {
                 Icon(
@@ -1609,12 +1619,21 @@ fun BrowserScreen(
                 )
             },
             text = {
-                Text(
-                    text = "You are about to allow write operations on '$deviceDesc' (${formatSize(volumeInfo.sizeBytes)}).\n\n" +
-                        "This partition is NOT encrypted. Any files written, modified, or deleted will not have LUKS encryption.\n\n" +
-                        "This confirmation will remain active for the current session only.",
-                    style = MaterialTheme.typography.bodyMedium,
-                )
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "You are about to allow write operations on '$deviceDesc' (${formatSize(volumeInfo.sizeBytes)}).\n\n" +
+                            "This partition is NOT encrypted. Any files written, modified, or deleted will not have LUKS encryption.\n\n" +
+                            "This confirmation will remain active for the current session only.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    plainWriteArmError?.let { msg ->
+                        Text(
+                            text = msg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
             },
             confirmButton = {
                 Button(
@@ -1622,12 +1641,19 @@ fun BrowserScreen(
                         try {
                             volume.armPlainWrites()
                             isPlainWriteArmedState = true
+                            plainWriteArmError = null
                             showPlainWriteConfirmDialog = false
                             val action = pendingActionAfterArm
                             pendingActionAfterArm = null
                             action?.invoke()
                         } catch (e: Exception) {
+                            // Fail closed — `isPlainWriteArmedState` is only set
+                            // after the native call returns — but say so. Left
+                            // silent, the dialog stays open with no explanation
+                            // and every further tap is another no-op.
                             Trace.err(-1, "arm_plain")
+                            plainWriteArmError =
+                                UiErrorMessage.getUserMessage(e, "Enable writing")
                         }
                     },
                     colors = ButtonDefaults.buttonColors(

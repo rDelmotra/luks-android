@@ -392,8 +392,19 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     @Volatile
     private var explicitlyArmed: Boolean = false
 
+    /**
+     * Whether writes are permitted without a further confirmation: true on an
+     * encrypted volume (the passphrase was the consent gesture), and on a plain
+     * volume only once [armPlainWrites] has run for this handle.
+     *
+     * Defaults to *unarmed* if the volume's own info cannot be read. The
+     * opposite default would mean a consent gate that opens when it cannot tell
+     * whether it should — and the cost of the two mistakes is not symmetric:
+     * guessing "unarmed" shows one extra prompt, guessing "armed" skips the
+     * only prompt there is.
+     */
     open val isPlainWriteArmed: Boolean
-        get() = explicitlyArmed || (runCatching { info.encrypted }.getOrDefault(true))
+        get() = explicitlyArmed || runCatching { info.encrypted }.getOrDefault(false)
 
     open fun armPlainWrites() {
         check(handle != 0L) { "volume is closed" }
