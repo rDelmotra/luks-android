@@ -416,6 +416,33 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeUnlock<'l>(
     })
 }
 
+/// Open an unencrypted (plain) partition volume and mount the filesystem.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenPlain<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    partition_offset: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let dev = bridge::device_ref(handle).map_err(bad_handle)?;
+        let offset = u64::try_from(partition_offset).map_err(|_| {
+            Fail::Msg(
+                bridge::code::GENERIC,
+                format!("negative partition offset {partition_offset}"),
+            )
+        })?;
+
+        let start = std::time::Instant::now();
+        let volume = dev.open_plain(offset)?;
+        log::i(&format!(
+            "nativeOpenPlain: volume opened in {} ms",
+            start.elapsed().as_millis()
+        ));
+        Ok(bridge::into_raw(bridge::Payload::Volume(volume)))
+    })
+}
+
 // --------------------------------------------------------------------- volume
 
 #[no_mangle]
@@ -429,6 +456,26 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeVolumeInfo<'l>(
         let json = vol.info_json();
         out_string(env, &json)
     })
+}
+
+/// Record the user's explicit consent to write to an unencrypted volume.
+///
+/// Until this is called, every mutating operation on a plain volume is refused
+/// with `ReadOnlyVolume`. Call it only in response to a deliberate user
+/// confirmation naming the drive — never automatically on mount, which would
+/// restore exactly the ungated state this exists to prevent.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeArmPlainWrites<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+) {
+    let _ = guard(&mut env, 0i32, |_env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        vol.arm_plain_writes();
+        log::i("nativeArmPlainWrites: plain-volume writes armed for this session");
+        Ok(0i32)
+    });
 }
 
 #[no_mangle]

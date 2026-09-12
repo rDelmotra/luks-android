@@ -69,6 +69,18 @@ internal object LuksNative {
      */
     external fun nativeUnlock(handle: Long, partitionOffset: Long, password: java.nio.ByteBuffer, length: Int): Long
 
+    /** Opens an unencrypted (plain) partition volume and mounts the filesystem. */
+    external fun nativeOpenPlain(handle: Long, partitionOffset: Long): Long
+
+    /**
+     * Records the user's explicit consent to write to an unencrypted volume.
+     *
+     * Until this is called, every write on a plain volume is refused with
+     * [LuksException.READ_ONLY_VOLUME]. Call it only from a deliberate user
+     * confirmation, never automatically on mount.
+     */
+    external fun nativeArmPlainWrites(handle: Long)
+
     /** JSON: filesystem label, UUID, block size. */
     external fun nativeVolumeInfo(handle: Long): String
 

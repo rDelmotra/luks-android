@@ -24,13 +24,20 @@ data class PartitionInfo(
     val sizeBytes: Long,
     val isLuks: Boolean,
     val luksVersion: Int?,
+    val fsType: String? = null,
+    val unsupportedReason: String? = null,
 ) {
+    val isPlain: Boolean get() = !isLuks && fsType in listOf("ext4", "btrfs")
+    val isOpenable: Boolean get() = isLuks || isPlain
+
     val label: String
         get() = buildString {
             append("#$index")
             if (name.isNotBlank()) append(" $name")
             append(" · ${formatSize(sizeBytes)}")
             if (isLuks) append(" · LUKS$luksVersion")
+            else if (isPlain) append(" · ${fsType?.uppercase()}")
+            else if (unsupportedReason != null) append(" · ${fsType?.uppercase() ?: "Unknown"} (Unsupported)")
         }
 }
 
@@ -61,6 +68,7 @@ data class VolumeInfo(
     val fsType: String,
     /** Empty on ext4, which has no such concept. */
     val subvolumes: List<SubvolumeInfo>,
+    val encrypted: Boolean = true,
 )
 
 data class StatFsInfo(
@@ -118,14 +126,14 @@ data class FileInfo(
 
 
 /** A drive that has been identified but not decrypted. */
-class LuksDevice internal constructor(
+open class LuksDevice internal constructor(
     private var handle: Long,
-    private val connection: UsbDeviceConnection,
-    private val usbInterface: UsbInterface,
+    private val connection: UsbDeviceConnection? = null,
+    private val usbInterface: UsbInterface? = null,
     val usbDevice: UsbDevice? = null,
 ) : AutoCloseable {
 
-    val info: DeviceInfo = if (handle == 0L) {
+    open val info: DeviceInfo = if (handle == 0L) {
         DeviceInfo("", "", 512, 0L, "", emptyList(), null)
     } else {
         parseDeviceInfo(LuksNative.nativeDeviceInfo(handle))
@@ -133,6 +141,9 @@ class LuksDevice internal constructor(
 
     /** Partitions carrying a LUKS header, found by probing, not by type GUID. */
     val luksPartitions: List<PartitionInfo> get() = info.partitions.filter { it.isLuks }
+
+    /** Partitions that can be opened (LUKS containers or plain ext4/btrfs). */
+    val openablePartitions: List<PartitionInfo> get() = info.partitions.filter { it.isOpenable }
 
     /**
      * False once [close] has run (native handle zeroed) — including a close
@@ -155,12 +166,22 @@ class LuksDevice internal constructor(
      *
      * [password] buffer is valid for the duration of this call and zeroed on close.
      */
-    fun unlock(partitionOffset: Long, password: dev.luksandroid.security.SecurePassphraseBuffer): LuksVolume {
+    open fun unlock(partitionOffset: Long, password: dev.luksandroid.security.SecurePassphraseBuffer): LuksVolume {
         check(handle != 0L) { "device is closed" }
         require(password.length > 0) { "empty passphrase" }
         return password.withBuffer { buf, len ->
             LuksVolume(LuksNative.nativeUnlock(handle, partitionOffset, buf, len))
         }
+    }
+
+    /**
+     * Opens an unencrypted (plain) partition volume and mounts the filesystem inside [partitionOffset].
+     *
+     * Near-instantaneous (~2ms) compared to LUKS unlock since no key derivation is performed.
+     */
+    open fun openPlain(partitionOffset: Long): LuksVolume {
+        check(handle != 0L) { "device is closed" }
+        return LuksVolume(LuksNative.nativeOpenPlain(handle, partitionOffset))
     }
 
     /** Raw transport throughput, bypassing LUKS and the filesystem entirely. */
@@ -216,8 +237,12 @@ class LuksDevice internal constructor(
             } catch (_: UnsatisfiedLinkError) {}
             handle = 0
         }
-        runCatching { connection.releaseInterface(usbInterface) }
-        runCatching { connection.close() }
+        runCatching {
+            if (connection != null && usbInterface != null) {
+                connection.releaseInterface(usbInterface)
+            }
+        }
+        runCatching { connection?.close() }
     }
 }
 
@@ -233,29 +258,10 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             sizeBytes = 0L,
             fsType = "ext4",
             subvolumes = emptyList(),
+            encrypted = true,
         )
     } else {
-        JSONObject(LuksNative.nativeVolumeInfo(handle)).let {
-            val subvols = it.optJSONArray("subvolumes")
-            VolumeInfo(
-                // A volume with no label reports JSON null, and optString would
-                // turn that into the literal text "null" on screen.
-                label = if (it.isNull("label")) "" else it.optString("label"),
-                uuid = it.optString("uuid"),
-                blockSize = it.optInt("blockSize"),
-                sizeBytes = it.optLong("sizeBytes"),
-                fsType = it.optString("fsType"),
-                subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
-                    val s = subvols!!.getJSONObject(i)
-                    SubvolumeInfo(
-                        id = s.optLong("id"),
-                        name = s.optString("name"),
-                        path = s.optString("path"),
-                        readOnly = s.optBoolean("readOnly"),
-                    )
-                },
-            )
-        }
+        parseVolumeInfo(LuksNative.nativeVolumeInfo(handle))
     }
 
     open fun listDir(path: String): List<Entry> {
@@ -367,6 +373,27 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
      * Blocking: this is the whole write, including the flush through the USB
      * bridge. Off the main thread, same as [unlock].
      */
+    /**
+     * Records the user's explicit consent to write to this unencrypted volume.
+     *
+     * A plain volume mounts read-only: every write is refused with
+     * [LuksException.READ_ONLY_VOLUME] until this is called. Under LUKS the
+     * passphrase was itself the consent gesture — it proved both "this drive"
+     * and "mine". A plain drive has no such proof, and mounting to browse
+     * would otherwise be the same gesture as mounting to modify.
+     *
+     * Call this only from a deliberate user confirmation that names the drive.
+     * Calling it automatically after [LuksDevice.openPlain] would restore
+     * exactly the ungated behaviour it exists to prevent.
+     *
+     * Consent lasts for this handle only; closing the volume revokes it.
+     * A no-op on an encrypted volume.
+     */
+    open fun armPlainWrites() {
+        check(handle != 0L) { "volume is closed" }
+        LuksNative.nativeArmPlainWrites(handle)
+    }
+
     open fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
         check(handle != 0L) { "volume is closed" }
         val ino = LuksNative.nativeWriteFile(handle, parentPath, name, data)
@@ -560,7 +587,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 }
 
-private fun parseDeviceInfo(json: String): DeviceInfo {
+internal fun parseDeviceInfo(json: String): DeviceInfo {
     val o = JSONObject(json)
     val arr = o.getJSONArray("partitions")
     val parts = (0 until arr.length()).map { i ->
@@ -572,6 +599,8 @@ private fun parseDeviceInfo(json: String): DeviceInfo {
             sizeBytes = p.getLong("sizeBytes"),
             isLuks = p.getBoolean("isLuks"),
             luksVersion = if (p.isNull("luksVersion")) null else p.getInt("luksVersion"),
+            fsType = if (p.isNull("fsType")) null else p.optString("fsType"),
+            unsupportedReason = if (p.isNull("unsupportedReason")) null else p.optString("unsupportedReason"),
         )
     }
     return DeviceInfo(
@@ -582,6 +611,30 @@ private fun parseDeviceInfo(json: String): DeviceInfo {
         tableKind = o.optString("tableKind"),
         partitions = parts,
         writeProbe = if (o.isNull("writeProbe")) null else o.optString("writeProbe"),
+    )
+}
+
+internal fun parseVolumeInfo(json: String): VolumeInfo {
+    val o = JSONObject(json)
+    val subvols = o.optJSONArray("subvolumes")
+    return VolumeInfo(
+        // A volume with no label reports JSON null, and optString would
+        // turn that into the literal text "null" on screen.
+        label = if (o.isNull("label")) "" else o.optString("label"),
+        uuid = o.optString("uuid"),
+        blockSize = o.optInt("blockSize"),
+        sizeBytes = o.optLong("sizeBytes"),
+        fsType = o.optString("fsType"),
+        subvolumes = (0 until (subvols?.length() ?: 0)).map { i ->
+            val s = subvols!!.getJSONObject(i)
+            SubvolumeInfo(
+                id = s.optLong("id"),
+                name = s.optString("name"),
+                path = s.optString("path"),
+                readOnly = s.optBoolean("readOnly"),
+            )
+        },
+        encrypted = if (o.has("encrypted") && !o.isNull("encrypted")) o.optBoolean("encrypted", true) else true,
     )
 }
 

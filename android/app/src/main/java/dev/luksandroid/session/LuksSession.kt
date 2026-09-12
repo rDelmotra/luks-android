@@ -260,6 +260,72 @@ open class SessionController(
     }
 
     /**
+     * Opens an unencrypted (plain) partition volume on [device] and mounts the filesystem.
+     * Mount is instantaneous (~2ms) on Dispatchers.IO; no UnlockService foreground lock required.
+     */
+    suspend fun openPlain(
+        context: Context,
+        device: LuksDevice,
+        partition: PartitionInfo,
+    ): SessionState = mutex.withLock {
+        Trace.i("LuksSession: opening plain partition at offset ${partition.offsetBytes}")
+        _state.value = SessionState.Unlocking(partition)
+        this.activeUsbDevice = device.usbDevice
+        val started = timeProvider()
+        try {
+            val vol = withContext(Dispatchers.IO) {
+                device.openPlain(partition.offsetBytes)
+            }
+            val mountMs = timeProvider() - started
+            val info = vol.info
+            Trace.i(
+                "LuksSession: plain volume opened in $mountMs ms · fs=${info.fsType} " +
+                    "block=${info.blockSize} size=${info.sizeBytes} " +
+                    "subvolumes=${info.subvolumes.size}"
+            )
+            val entries = withContext(Dispatchers.IO) { vol.listDir("/") }
+            Trace.i("LuksSession: root listed, ${entries.size} entries")
+
+            this.device = device
+            this.volume = vol
+            this.volumeCloseable = vol
+            this.deviceCloseable = device
+            this.activeUsbDevice = device.usbDevice
+
+            val unlocked = SessionState.Unlocked(vol, partition, entries)
+            _state.value = unlocked
+            restartIdleTimer()
+            unlocked
+        } catch (e: LuksException) {
+            this.activeUsbDevice = null
+            Trace.err(e.code, "open_plain")
+            Trace.e("LuksSession: openPlain failed [${e.code}]")
+            val failed = SessionState.Failed("[${e.code}] ${e.message}", partition)
+            _state.value = failed
+            failed
+        } catch (e: Exception) {
+            this.activeUsbDevice = null
+            Trace.err(-1, "open_plain")
+            Trace.e("LuksSession: openPlain failed: ${Trace.throwableSummary(e)}")
+            val failed = SessionState.Failed(e.message ?: e.toString(), partition)
+            _state.value = failed
+            failed
+        }
+    }
+
+    /**
+     * Opens the first plain partition found on [device].
+     */
+    suspend fun openPlain(
+        context: Context,
+        device: LuksDevice,
+    ): SessionState {
+        val partition = device.info.partitions.firstOrNull { it.isPlain }
+            ?: throw IllegalStateException("No plain partition found on device")
+        return openPlain(context, device, partition)
+    }
+
+    /**
      * Waits for all active leases to drain, then tears down the volume and device handles.
      */
     suspend fun lock(): Unit {

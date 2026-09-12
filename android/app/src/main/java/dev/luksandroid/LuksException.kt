@@ -112,5 +112,15 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * panicked" sent one investigation at the wrong layer already.
          */
         const val WRITE_SESSION_FENCED = 21
+
+        /**
+         * A write was attempted on an unencrypted volume before the user
+         * confirmed it for this session. Reads are unaffected.
+         *
+         * Distinct from [UNSUPPORTED]: that means the drive can never be
+         * written, this means it can be written as soon as the user says so.
+         * The UI's answer is a confirmation prompt, not an error.
+         */
+        const val READ_ONLY_VOLUME = 22
     }
 }

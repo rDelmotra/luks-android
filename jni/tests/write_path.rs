@@ -902,22 +902,16 @@ fn a_btrfs_duplicate_name_is_refused_as_a_conflict_not_as_corruption() {
 }
 
 #[test]
-fn writing_into_a_btrfs_subvolume_is_refused_by_name_not_miswritten() {
-    // The engine refuses anything outside the default subvolume's FS_TREE
-    // (feature-btrfs-write.md) rather than writing into the wrong tree. `sub`
-    // is a real subvolume in this fixture (see bridge.rs's own
-    // `reads_across_a_subvolume_boundary_through_the_bridge`).
-    let path = scratch_btrfs("subvolume-refused");
+fn writing_into_a_btrfs_subvolume_succeeds_and_reads_back() {
+    let path = scratch_btrfs("subvolume-write");
     let vol = unlock(&path);
 
-    let err = vol
-        .write_file("/sub", "should-not-land-here.txt", b"x")
-        .expect_err("a subvolume write must be refused, not silently misplaced");
-    assert_eq!(
-        error_code(&err),
-        code::UNSUPPORTED,
-        "wrong error for a subvolume write: {err}"
-    );
+    vol.write_file("/sub", "landed-here.txt", b"hello from subvolume")
+        .expect("subvolume write should succeed");
+    let read_back = vol
+        .read_file("/sub/landed-here.txt", 1024)
+        .expect("read back");
+    assert_eq!(read_back, b"hello from subvolume");
 }
 
 #[test]

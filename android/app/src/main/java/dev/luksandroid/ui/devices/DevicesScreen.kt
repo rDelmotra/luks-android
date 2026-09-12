@@ -309,10 +309,16 @@ fun DevicesScreen(
                             val targetDev = deviceStates.values
                                 .filterIsInstance<DeviceItemState.Opened>()
                                 .map { it.device }
-                                .firstOrNull { it.luksPartitions.any { lp -> lp.offsetBytes == s.partition.offsetBytes } }
+                                .firstOrNull { it.openablePartitions.any { op -> op.offsetBytes == s.partition.offsetBytes } }
                             if (targetDev != null) {
-                                scope.launch { LuksSession.reset() }
-                                promptDialogTarget = targetDev to s.partition
+                                scope.launch {
+                                    LuksSession.reset()
+                                    if (s.partition.isPlain) {
+                                        LuksSession.openPlain(context, targetDev, s.partition)
+                                    } else {
+                                        promptDialogTarget = targetDev to s.partition
+                                    }
+                                }
                             } else {
                                 scope.launch { LuksSession.reset() }
                             }
@@ -367,6 +373,11 @@ fun DevicesScreen(
                     },
                     onUnlockPartition = { device, partition ->
                         promptDialogTarget = device to partition
+                    },
+                    onMountPartition = { device, partition ->
+                        scope.launch {
+                            LuksSession.openPlain(context, device, partition)
+                        }
                     },
                 )
             }
@@ -461,6 +472,7 @@ private fun TargetDeviceCard(
     onRequestPermission: () -> Unit,
     onOpen: () -> Unit,
     onUnlockPartition: (LuksDevice, PartitionInfo) -> Unit,
+    onMountPartition: (LuksDevice, PartitionInfo) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
     Card(
@@ -571,15 +583,17 @@ private fun TargetDeviceCard(
 
                     is DeviceItemState.Opening -> {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
                             Text(
-                                text = "Claiming interface and reading partition table…",
+                                text = "Reading partition table…",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -612,6 +626,7 @@ private fun TargetDeviceCard(
                                     partition = partition,
                                     sessionState = sessionState,
                                     onUnlock = { onUnlockPartition(dev, partition) },
+                                    onMount = { onMountPartition(dev, partition) },
                                 )
                             }
                         }
@@ -646,6 +661,7 @@ private fun PartitionItemCard(
     partition: PartitionInfo,
     sessionState: SessionState,
     onUnlock: () -> Unit,
+    onMount: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val isSessionUnlocked = sessionState is SessionState.Unlocked &&
@@ -679,6 +695,8 @@ private fun PartitionItemCard(
                     tint = when {
                         isSessionUnlocked -> SuccessGreen
                         partition.isLuks -> MaterialTheme.colorScheme.primary
+                        partition.isPlain -> MaterialTheme.colorScheme.secondary
+                        partition.unsupportedReason != null -> MaterialTheme.colorScheme.error
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                     modifier = Modifier.size(20.dp),
@@ -709,11 +727,50 @@ private fun PartitionItemCard(
                                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                                 )
                             }
+                        } else if (partition.isPlain) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(MaterialTheme.colorScheme.secondaryContainer)
+                                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                            ) {
+                                Text(
+                                    text = "${partition.fsType?.uppercase()}",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp,
+                                    ),
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                )
+                            }
+                        } else if (partition.unsupportedReason != null) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(MaterialTheme.colorScheme.errorContainer)
+                                    .padding(horizontal = 6.dp, vertical = 1.dp),
+                            ) {
+                                Text(
+                                    text = "${partition.fsType?.uppercase() ?: "UNKNOWN"} (Unsupported)",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 10.sp,
+                                    ),
+                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                )
+                            }
                         }
                     }
 
                     Text(
-                        text = "${formatSize(partition.sizeBytes)} · Offset 0x${partition.offsetBytes.toString(16)}",
+                        text = buildString {
+                            append("${formatSize(partition.sizeBytes)} · Offset 0x${partition.offsetBytes.toString(16)}")
+                            if (partition.unsupportedReason != null) {
+                                append(" · ${partition.unsupportedReason}")
+                            }
+                        },
                         style = MaterialTheme.typography.bodySmall.copy(
                             fontFamily = FontFamily.Monospace,
                             fontSize = 11.sp,
@@ -751,6 +808,36 @@ private fun PartitionItemCard(
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text("Unlock")
+                    }
+                }
+            } else if (partition.isPlain) {
+                if (isSessionUnlocked) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.CheckCircle,
+                            contentDescription = "Mounted",
+                            tint = SuccessGreen,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Mounted",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            color = SuccessGreen,
+                        )
+                    }
+                } else if (sessionState is SessionState.Locked) {
+                    FilledTonalButton(
+                        onClick = onMount,
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Storage,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Mount")
                     }
                 }
             }
@@ -970,12 +1057,37 @@ private fun UnlockedStateCard(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
+            if (!info.encrypted) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "⚠️ UNENCRYPTED DRIVE: Data on this partition is stored in plaintext.",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                            ),
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
+
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Icon(
-                    imageVector = Icons.Default.LockOpen,
+                    imageVector = if (info.encrypted) Icons.Default.LockOpen else Icons.Default.Storage,
                     contentDescription = null,
                     tint = SuccessGreen,
                     modifier = Modifier.size(24.dp),
@@ -987,7 +1099,8 @@ private fun UnlockedStateCard(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = "Filesystem: ${info.fsType.uppercase()} · ${formatSize(info.sizeBytes)}",
+                        text = "Filesystem: ${info.fsType.uppercase()} · ${formatSize(info.sizeBytes)}" +
+                            if (!info.encrypted) " · Unencrypted" else "",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1014,9 +1127,13 @@ private fun UnlockedStateCard(
                     onClick = onLock,
                     shape = RoundedCornerShape(8.dp),
                 ) {
-                    Icon(imageVector = Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Icon(
+                        imageVector = if (info.encrypted) Icons.Default.Lock else Icons.Default.LockOpen,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text("Lock")
+                    Text(if (info.encrypted) "Lock" else "Unmount")
                 }
             }
         }

@@ -76,6 +76,11 @@ pub enum LuksError {
     #[error("unrecognised filesystem: this reader understands ext4 and btrfs")]
     UnknownFs,
 
+    /// A known filesystem format (such as FAT32, exFAT, NTFS, or XFS) was recognized
+    /// by signature, but this reader cannot mount it.
+    #[error("unsupported filesystem '{0}' is recognized but cannot be mounted")]
+    UnsupportedFs(&'static str),
+
     /// Two filesystem signatures on one volume, usually a reformat that did not
     /// wipe the old one. Refused rather than resolved: one of the two answers
     /// is a filesystem that no longer exists, and there is no way to tell from
@@ -283,6 +288,9 @@ pub enum LuksError {
     /// writing, not to strand the user's data behind an error screen.
     #[error("write session fenced after {0}; unlock the volume again to resume writing")]
     WriteSessionFenced(String),
+
+    #[error("cannot write to read-only plain volume")]
+    ReadOnlyVolume,
 }
 
 impl LuksError {
@@ -385,6 +393,8 @@ mod fence_classification {
             LuksError::WriterBusy,
             LuksError::Cancelled,
             LuksError::OutOfBounds,
+            LuksError::ReadOnlyVolume,
+            LuksError::UnsupportedFs("test"),
         ];
         assert!(!benign.is_empty(), "vacuity: the benign list is empty");
         for e in &benign {

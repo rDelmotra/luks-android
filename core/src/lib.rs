@@ -21,8 +21,10 @@ pub mod luks;
 pub mod partition;
 pub mod usb;
 pub mod secret;
+pub mod volume;
 
 pub use error::{LuksError, Result};
+pub use volume::{PlainVolume, VolumeSource};
 
 /// Crate version, surfaced across the JNI bridge for the Phase 0 milestone.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

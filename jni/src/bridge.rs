@@ -32,6 +32,7 @@ use luks_core::fs::FileType;
 use luks_core::luks::{self, keyslot, LuksVolume};
 use luks_core::partition::{self, PartitionTable, TableKind};
 use luks_core::usb::ScsiBlockDevice;
+use luks_core::volume::{PlainVolume, VolumeSource};
 use luks_usbfs::UsbFsTransport;
 
 use serde_json::{json, Value};
@@ -117,6 +118,17 @@ pub mod code {
     /// reporting a timed-out cable as "a previous operation panicked" sent
     /// one investigation at the wrong layer already.
     pub const WRITE_SESSION_FENCED: i32 = 21;
+    /// A plain (unencrypted) volume was asked to write before the user gave
+    /// explicit consent for this session.
+    ///
+    /// Split from `UNSUPPORTED`, which it would otherwise share with "this
+    /// filesystem is not one we can mount" — the same conflation that
+    /// `WRITER_BUSY` was already pulled out of. The remedies have nothing in
+    /// common: 4 means "this drive will never work", 22 means "confirm and it
+    /// will work immediately". Reporting a missing confirmation as an
+    /// unsupported format would tell the user their drive is incompatible
+    /// when it is one tap from writable.
+    pub const READ_ONLY_VOLUME: i32 = 22;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -136,7 +148,9 @@ pub fn error_code(e: &LuksError) -> i32 {
         | NotExt4(_)
         | NotBtrfs(_)
         | UnknownFs
+        | UnsupportedFs(_)
         | AmbiguousFs => code::UNSUPPORTED,
+        ReadOnlyVolume => code::READ_ONLY_VOLUME,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
         BtrfsItemTooLarge { .. } => code::ITEM_TOO_LARGE,
@@ -381,6 +395,7 @@ pub struct VolumeHandle {
     pub id: u64,
     fs: Mutex<MountedFs>,
     pub partition_offset: u64,
+    pub encrypted: bool,
     /// The device's writer flag, shared with every other volume on it.
     /// See [`VolumeHandle::write_file`].
     #[cfg_attr(
@@ -412,6 +427,22 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path claims it")
     )]
     holds_writer: std::sync::atomic::AtomicBool,
+    /// Whether the user has explicitly consented to writing to this *plain*
+    /// volume. Always irrelevant when `encrypted` is true.
+    ///
+    /// Under LUKS the passphrase doubled as a consent gesture: it proved both
+    /// "this drive" and "mine". A plain volume has no such proof — any USB
+    /// stick anyone plugs in mounts on one tap, and mounting to browse is the
+    /// same gesture as mounting to modify. This latch splits them again, so
+    /// reading a stranger's drive cannot silently become writing to it.
+    ///
+    /// Default-closed, per-handle, and cleared by re-opening the volume, so a
+    /// consent given for one session never carries into the next.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path consults it")
+    )]
+    plain_writes_armed: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for VolumeHandle {
@@ -455,6 +486,19 @@ impl VolumeHandle {
     /// reintroduces that race even though the first one still "works" in
     /// isolation.
     pub fn fs_for_writing(&self) -> Result<std::sync::MutexGuard<'_, MountedFs>> {
+        // The plain-volume consent gate. Placed here rather than on each
+        // mutator because this is the one function every mutating path must
+        // call — including `abandon_file`, which can commit a btrfs
+        // transaction. A gate on `write_file`/`delete_file`/`rename`
+        // individually would be a list to keep in sync, and the first entry
+        // point added without it would be writable by accident.
+        if !self.encrypted
+            && !self
+                .plain_writes_armed
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(LuksError::ReadOnlyVolume);
+        }
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
@@ -476,6 +520,31 @@ impl VolumeHandle {
     /// Whether this volume's write session has been fenced.
     pub fn is_write_fenced(&self) -> bool {
         self.fence_reason().is_some()
+    }
+
+    /// Record that the user has explicitly consented to writing to this plain
+    /// volume. See [`VolumeHandle::plain_writes_armed`].
+    ///
+    /// One-way and per-handle: there is no disarm, because the only thing that
+    /// should end the consent is ending the session, and closing the volume
+    /// already does that. A `disarm` would invite a UI that toggles the latch
+    /// as a mode, which is exactly the state this is meant not to have.
+    ///
+    /// A no-op on an encrypted volume rather than an error — the caller asking
+    /// for write consent it already has is not a fault, and returning `Err`
+    /// here would push every caller into branching on `encrypted` first.
+    pub fn arm_plain_writes(&self) {
+        self.plain_writes_armed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether writes to this volume are currently permitted by the consent
+    /// gate. Always true for an encrypted volume.
+    pub fn writes_permitted(&self) -> bool {
+        self.encrypted
+            || self
+                .plain_writes_armed
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// End the write session: refuse all later writes and drop any active
@@ -553,7 +622,7 @@ impl VolumeHandle {
 ///
 /// The dispatch itself lives in `luks_core::fs::mounted`, so the host-side
 /// examples and any future desktop build make the same decision the same way.
-pub type MountedFs = luks_core::fs::MountedFs<LuksVolume<SharedDevice>>;
+pub type MountedFs = luks_core::fs::MountedFs<luks_core::volume::VolumeSource<SharedDevice>>;
 pub use luks_core::fs::OpenFile;
 
 /// JSON shaping is a bridge concern, so it stays here rather than in core.
@@ -745,6 +814,30 @@ impl DeviceHandle {
             .partitions
             .iter()
             .map(|p| {
+                let (fs_type, unsupported_reason) = if !p.is_luks {
+                    if let Ok(plain) =
+                        PlainVolume::new(self.dev.clone(), p.offset_bytes(), p.size_bytes())
+                    {
+                        match luks_core::fs::detect::detect_fs(&plain) {
+                            Ok(luks_core::fs::detect::DetectedFs::Ext4) => {
+                                (Some("ext4".to_string()), None)
+                            }
+                            Ok(luks_core::fs::detect::DetectedFs::Btrfs(_)) => {
+                                (Some("btrfs".to_string()), None)
+                            }
+                            Err(LuksError::UnsupportedFs(name)) => (
+                                Some(name.to_string()),
+                                Some(format!("{name} is not supported yet")),
+                            ),
+                            _ => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+
                 json!({
                     "index": p.index,
                     "name": p.name,
@@ -754,6 +847,8 @@ impl DeviceHandle {
                     "luksVersion": p.luks_version,
                     "typeGuid": p.type_guid_string(),
                     "mbrType": p.mbr_type,
+                    "fsType": fs_type,
+                    "unsupportedReason": unsupported_reason,
                 })
             })
             .collect();
@@ -798,15 +893,56 @@ impl DeviceHandle {
             &header,
             password,
         )?;
-        let fs = MountedFs::mount(volume)?;
+        let fs = MountedFs::mount(luks_core::volume::VolumeSource::Luks(volume))?;
         let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(VolumeHandle {
             id,
             fs: Mutex::new(fs),
             partition_offset,
+            encrypted: true,
             device_writer: Arc::clone(&self.dev.writer),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
+            // Irrelevant when encrypted; armed so the gate is a no-op here.
+            plain_writes_armed: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    /// Open an unencrypted (plain) partition volume and mount the filesystem inside.
+    pub fn open_plain(&self, partition_offset: u64) -> Result<VolumeHandle> {
+        let partition = self
+            .table
+            .partitions
+            .iter()
+            .find(|p| p.offset_bytes() == partition_offset)
+            .ok_or_else(|| {
+                LuksError::NotFound(format!("partition at offset {partition_offset} not found"))
+            })?;
+
+        if partition.is_luks {
+            return Err(LuksError::UnsupportedFsFeature(
+                "cannot open encrypted LUKS partition as plain volume".into(),
+            ));
+        }
+
+        let plain = PlainVolume::new(
+            self.dev.clone(),
+            partition_offset,
+            partition.size_bytes(),
+        )?;
+        let fs = MountedFs::mount(VolumeSource::Plain(plain))?;
+        let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(VolumeHandle {
+            id,
+            fs: Mutex::new(fs),
+            partition_offset,
+            encrypted: false,
+            device_writer: Arc::clone(&self.dev.writer),
+            write_fence: Mutex::new(None),
+            holds_writer: std::sync::atomic::AtomicBool::new(false),
+            // Default-closed: a plain volume mounts read-only until the user
+            // explicitly consents. See `plain_writes_armed`.
+            plain_writes_armed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 }
@@ -870,6 +1006,7 @@ impl VolumeHandle {
             "blockSize": fs.block_size(),
             "sizeBytes": fs.size_bytes(),
             "subvolumes": fs.subvolumes_json(),
+            "encrypted": self.encrypted,
             // Absent from a read-only build rather than false: the UI should
             // find out what this library can do by asking it, not by assuming
             // its own build flavour matches.
@@ -1500,6 +1637,7 @@ mod tests {
         let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
         assert_eq!(v["label"], "DISKDATA");
         assert_eq!(v["partitionOffset"], 6144u64 * 512);
+        assert_eq!(v["encrypted"], true);
     }
 
     #[test]
@@ -1756,6 +1894,8 @@ mod tests {
         let e: Value = serde_json::from_str(&ext4.info_json()).unwrap();
         assert_eq!(e["fsType"], "ext4");
         assert_eq!(e["label"], "DISKDATA");
+        assert_eq!(v["encrypted"], true);
+        assert_eq!(e["encrypted"], true);
         // Same keys, both filesystems — the point of the enum.
         let keys = |v: &Value| {
             let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -1907,14 +2047,14 @@ mod tests {
         let total = v_all["total_count"].as_u64().unwrap() as usize;
         assert!(total >= 3);
         assert_eq!(v_all["entries"].as_array().unwrap().len(), total);
-        assert_eq!(v_all["has_more"].as_bool().unwrap(), false);
+        assert!(!v_all["has_more"].as_bool().unwrap());
         assert_eq!(v_all["next_offset"].as_u64().unwrap() as usize, total);
 
         // Page 1: limit 1
         let v_page1: Value = serde_json::from_str(&vol.list_directory_paged("/", 0, 1).unwrap()).unwrap();
         assert_eq!(v_page1["entries"].as_array().unwrap().len(), 1);
         assert_eq!(v_page1["total_count"].as_u64().unwrap() as usize, total);
-        assert_eq!(v_page1["has_more"].as_bool().unwrap(), true);
+        assert!(v_page1["has_more"].as_bool().unwrap());
         assert_eq!(v_page1["next_offset"].as_u64().unwrap(), 1);
 
         // Page 2: offset 1, limit 1
@@ -1951,4 +2091,347 @@ mod tests {
 
         unregister_cancel_token(token);
     }
+
+    // --- Phase 3: Plain (non-LUKS) volume support tests ----------------------
+
+    /// A test device overlay that adds an MBR partition table pointing to an
+    /// unencrypted filesystem fixture.
+    struct TestMbrDisk<D> {
+        header: [u8; 512],
+        fs: D,
+        total_len: u64,
+    }
+
+    impl<D: ReadAt> TestMbrDisk<D> {
+        fn new(fs: D, part_type: u8) -> Self {
+            let fs_len = fs.len().expect("filesystem device must have known length");
+            let sectors = (fs_len / 512) as u32;
+            let mut header = [0u8; 512];
+            header[446 + 4] = part_type;
+            header[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+            header[446 + 12..446 + 16].copy_from_slice(&sectors.to_le_bytes());
+            header[510] = 0x55;
+            header[511] = 0xAA;
+            let total_len = 512 + fs_len;
+            Self {
+                header,
+                fs,
+                total_len,
+            }
+        }
+    }
+
+    impl<D: ReadAt> ReadAt for TestMbrDisk<D> {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            let end = offset
+                .checked_add(buf.len() as u64)
+                .ok_or(LuksError::OutOfBounds)?;
+            if end > self.total_len {
+                return Err(LuksError::OutOfBounds);
+            }
+            if end <= 512 {
+                self.header.read_at(offset, buf)?;
+                return Ok(());
+            }
+            if offset < 512 {
+                let in_header = (512 - offset) as usize;
+                self.header.read_at(offset, &mut buf[..in_header])?;
+                self.fs.read_at(0, &mut buf[in_header..])?;
+                return Ok(());
+            }
+            self.fs.read_at(offset - 512, buf)
+        }
+
+        fn len(&self) -> Option<u64> {
+            Some(self.total_len)
+        }
+    }
+
+    #[cfg(feature = "dangerous-write-support")]
+    impl<D: luks_core::device::WriteAt> luks_core::device::WriteAt for TestMbrDisk<D> {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            if offset < 512 {
+                return Err(LuksError::ReadOnlyVolume);
+            }
+            self.fs.write_at(offset - 512, buf)
+        }
+
+        fn flush(&self) -> Result<()> {
+            self.fs.flush()
+        }
+    }
+
+    #[test]
+    fn open_plain_refuses_encrypted_luks_partition() {
+        let dev = open();
+        let luks_offset = dev
+            .table
+            .luks_partitions()
+            .next()
+            .expect("a LUKS partition")
+            .offset_bytes();
+        let err = dev
+            .open_plain(luks_offset)
+            .err()
+            .expect("must refuse to open LUKS partition as plain");
+        match err {
+            LuksError::UnsupportedFsFeature(msg) => {
+                assert!(
+                    msg.contains("cannot open encrypted LUKS partition as plain volume"),
+                    "unexpected refusal message: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFsFeature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_plain_refuses_unknown_partition_offset() {
+        let dev = open();
+        let err = dev
+            .open_plain(0xdead_beef)
+            .err()
+            .expect("must refuse unknown partition offset");
+        assert!(matches!(err, LuksError::NotFound(_)));
+    }
+
+    #[test]
+    fn open_plain_succeeds_on_unencrypted_ext4_partition() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/ext4/small-1k.img"
+        );
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open ext4 fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let total_blocks = (512 + fs_len) / 512;
+        let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "EXT4".into())
+            .expect("scan MBR disk");
+
+        // Verify partition table discovered the plain partition
+        let part = dev
+            .table
+            .partitions
+            .iter()
+            .find(|p| p.offset_bytes() == 512)
+            .expect("plain partition at offset 512");
+        assert!(!part.is_luks);
+        assert_eq!(part.size_bytes(), fs_len);
+
+        // Open plain volume
+        let vol = dev.open_plain(512).expect("open plain ext4");
+
+        // Verify info_json has encrypted: false
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        assert_eq!(v["encrypted"], false);
+        assert_eq!(v["fsType"], "ext4");
+        assert_eq!(v["partitionOffset"], 512);
+        assert_eq!(v["sizeBytes"], fs_len);
+
+        // List files in root
+        let dir_val: Value = serde_json::from_str(&vol.list_dir_json("/").unwrap()).unwrap();
+        let entries = dir_val["entries"].as_array().unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"hello.txt"), "entries: {names:?}");
+
+        // Read file contents
+        let hello_bytes = vol.read_file("/hello.txt", 1024).expect("read /hello.txt");
+        assert_eq!(hello_bytes, b"hello ext4\n");
+    }
+
+    #[test]
+    fn open_plain_succeeds_on_unencrypted_btrfs_partition() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/btrfs/plain.img"
+        );
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open btrfs fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let total_blocks = (512 + fs_len) / 512;
+        let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "BTRFS".into())
+            .expect("scan MBR disk");
+
+        // Open plain volume
+        let vol = dev.open_plain(512).expect("open plain btrfs");
+
+        // Verify info_json has encrypted: false
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        assert_eq!(v["encrypted"], false);
+        assert_eq!(v["fsType"], "btrfs");
+        assert_eq!(v["partitionOffset"], 512);
+
+        // List files in root
+        let dir_val: Value = serde_json::from_str(&vol.list_dir_json("/").unwrap()).unwrap();
+        let entries = dir_val["entries"].as_array().unwrap();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"hello.txt"), "entries: {names:?}");
+        assert!(names.contains(&"docs"), "entries: {names:?}");
+
+        // Read file contents
+        let hello_bytes = vol.read_file("/hello.txt", 1024).expect("read /hello.txt");
+        assert_eq!(hello_bytes, b"hello btrfs\n");
+    }
+
+    #[test]
+    fn device_info_json_probes_plain_partitions() {
+        // Plain ext4
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/ext4/small-1k.img"
+        );
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open ext4 fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let total_blocks = (512 + fs_len) / 512;
+        let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "EXT4".into())
+            .expect("scan MBR disk");
+
+        let v: Value = serde_json::from_str(&dev.info_json()).unwrap();
+        let part = &v["partitions"][0];
+        assert_eq!(part["isLuks"], false);
+        assert_eq!(part["fsType"], "ext4");
+        assert!(part["unsupportedReason"].is_null());
+
+        // Plain btrfs
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/btrfs/plain.img"
+        );
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open btrfs fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let total_blocks = (512 + fs_len) / 512;
+        let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "BTRFS".into())
+            .expect("scan MBR disk");
+
+        let v: Value = serde_json::from_str(&dev.info_json()).unwrap();
+        let part = &v["partitions"][0];
+        assert_eq!(part["isLuks"], false);
+        assert_eq!(part["fsType"], "btrfs");
+        assert!(part["unsupportedReason"].is_null());
+
+        // Plain unsupported filesystem (FAT32). Backed by a file rather than a
+        // `Vec<u8>`, because with `dangerous-write-support` on, `DeviceHandle::new`
+        // requires `WriteAt` and a `Vec` only implements `ReadAt`.
+        let mut fat32_buf = vec![0u8; 1024 * 1024];
+        fat32_buf[510] = 0x55;
+        fat32_buf[511] = 0xAA;
+        fat32_buf[0x52..0x5A].copy_from_slice(b"FAT32   ");
+        let fat32_path = std::env::temp_dir().join("luks-jni-plain-fat32.img");
+        std::fs::write(&fat32_path, &fat32_buf).expect("write FAT32 scratch image");
+        let fs_dev = luks_core::device::FileDevice::open(&fat32_path).expect("open FAT32 scratch");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x0C);
+        let total_blocks = (512 + fs_len) / 512;
+        let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "FAT32".into())
+            .expect("scan MBR disk");
+
+        let v: Value = serde_json::from_str(&dev.info_json()).unwrap();
+        let part = &v["partitions"][0];
+        assert_eq!(part["isLuks"], false);
+        assert_eq!(part["fsType"], "FAT32");
+        assert_eq!(part["unsupportedReason"], "FAT32 is not supported yet");
+    }
+
+    /// A writable plain ext4 volume behind an MBR, for the consent-gate tests.
+    #[cfg(feature = "dangerous-write-support")]
+    fn plain_ext4_writable(test: &str) -> VolumeHandle {
+        let src = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/ext4/small-1k.img");
+        let scratch = std::env::temp_dir().join(format!("luks-jni-plain-{test}.img"));
+        std::fs::copy(src, &scratch).expect("copy fixture");
+        let fs_len = std::fs::metadata(&scratch).unwrap().len();
+        let fs_dev = luks_core::device::FileDevice::open_writable(&scratch, fs_len)
+            .expect("open scratch writable");
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "E".into())
+            .expect("scan MBR disk");
+        dev.open_plain(512).expect("open plain ext4")
+    }
+
+    /// A freshly mounted plain volume is read-only. The passphrase used to be
+    /// the consent gesture; without one, mounting to browse must not also be
+    /// consent to modify.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn a_plain_volume_refuses_writes_until_consent_is_given() {
+        let vol = plain_ext4_writable("refuses-writes");
+        assert!(!vol.writes_permitted());
+
+        // Every mutator, not just the obvious one — the gate lives on the
+        // shared chokepoint precisely so none of these can drift out of it.
+        let checks: Vec<(&str, Result<()>)> = vec![
+            ("write_file", vol.write_file("/", "no.txt", b"x").map(|_| ())),
+            ("delete_file", vol.delete_file("/hello.txt")),
+            ("create_directory", vol.create_directory("/", "nodir").map(|_| ())),
+            ("rename", vol.rename("/", "hello.txt", "/", "renamed.txt")),
+            ("begin_file", vol.begin_file(16).map(|_| ())),
+            ("begin_file_streaming", vol.begin_file_streaming().map(|_| ())),
+        ];
+        for (name, res) in checks {
+            match res {
+                Err(LuksError::ReadOnlyVolume) => {}
+                other => panic!("{name} on an unarmed plain volume: expected ReadOnlyVolume, got {other:?}"),
+            }
+        }
+
+        // The refusal is a refusal, not a partial write.
+        assert!(
+            vol.read_file("/no.txt", 16).is_err(),
+            "a refused write must leave nothing behind"
+        );
+        vol.read_file("/hello.txt", 1024)
+            .expect("a refused delete must leave the file intact");
+    }
+
+    /// Consent is what unlocks writing — and only for the handle that got it.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn an_armed_plain_volume_writes_and_the_consent_does_not_outlive_the_handle() {
+        let vol = plain_ext4_writable("armed-writes");
+        vol.arm_plain_writes();
+        assert!(vol.writes_permitted());
+
+        vol.write_file("/", "consented.txt", b"landed")
+            .expect("an armed plain volume must accept writes");
+        assert_eq!(
+            vol.read_file("/consented.txt", 1024).expect("read back"),
+            b"landed"
+        );
+
+        // A second handle on the same partition starts closed again: consent
+        // is per-session, so re-opening is what revokes it.
+        let fresh = plain_ext4_writable("armed-writes-second-handle");
+        assert!(!fresh.writes_permitted());
+        assert!(matches!(
+            fresh.write_file("/", "leaked.txt", b"x"),
+            Err(LuksError::ReadOnlyVolume)
+        ));
+    }
+
+    /// An encrypted volume is unaffected: the passphrase was already the
+    /// consent gesture, so the gate must not add a second one.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn the_consent_gate_does_not_apply_to_an_encrypted_volume() {
+        let vol = unlock_fixture();
+        assert!(vol.writes_permitted());
+        assert!(
+            vol.fs_for_writing().is_ok(),
+            "a LUKS volume must not need arming"
+        );
+    }
 }
+
