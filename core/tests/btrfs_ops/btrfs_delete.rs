@@ -23,6 +23,7 @@ use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
 use common::accounting::AccountingOracle;
+use common::csum_pack::{get_file_disk_bytenr, pack_adjacent_csums};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -409,105 +410,6 @@ fn deleting_deep_tree_collapses_root_and_allows_subsequent_creation() {
     assert!(run_verify_script(&temp_img), "oracle check failed");
 }
 
-fn get_file_disk_bytenr(fs: &Btrfs<FileDevice>, path: &str) -> u64 {
-    let loc = fs.resolve_no_follow(fs.fs_tree(), path).expect("resolve path");
-    let mut disk_bytenr = None;
-    fs.for_each_item(
-        loc.tree.bytenr,
-        loc.inode.objectid,
-        luks_core::fs::btrfs::tree::EXTENT_DATA_KEY,
-        &mut |key, data| {
-            let fe = luks_core::fs::btrfs::extent::FileExtent::parse(key.offset, data)?;
-            if fe.has_disk_bytes() {
-                disk_bytenr = Some(fe.disk_bytenr);
-            }
-            Ok(true)
-        },
-    )
-    .expect("for_each_item");
-    disk_bytenr.expect("file must have a data extent on disk")
-}
-
-fn pack_adjacent_csums(
-    image_path: &PathBuf,
-    start_bytenr: u64,
-    num_sectors: usize,
-) {
-    let file_len = fs::metadata(image_path).unwrap().len();
-    let dev = FileDevice::open_writable(image_path, file_len).expect("open writable");
-    let fs = Btrfs::mount(dev).expect("mount btrfs");
-    let sb = fs.superblock();
-    let sector_size = sb.sector_size as u64;
-    let csum_size = sb.csum_type.size();
-
-    let csum_root = fs
-        .tree_root(luks_core::fs::btrfs::tree::CSUM_TREE_OBJECTID)
-        .expect("csum root");
-    assert_eq!(csum_root.level, 0, "vacuity: expected csum root to be leaf in test fixture");
-    let physicals = fs
-        .chunk_map()
-        .map_all_stripes(csum_root.bytenr)
-        .expect("map csum root stripes");
-    assert!(!physicals.is_empty(), "vacuity: csum root must map to physical stripes");
-
-    let node = fs.read_node(csum_root.bytenr).expect("read csum root node");
-    let mut leaf = luks_core::fs::btrfs::write::node::Leaf::from_node(&node, sb.csum_type).expect("parse leaf");
-
-    let mut combined_data = Vec::with_capacity(num_sectors * csum_size);
-    let mut keys_to_remove = Vec::new();
-
-    for i in 0..num_sectors {
-        let expected_offset = start_bytenr + i as u64 * sector_size;
-        let key = luks_core::fs::btrfs::Key::new(
-            luks_core::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
-            luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY,
-            expected_offset,
-        );
-        let idx = leaf
-            .find_item(&key)
-            .unwrap_or_else(|| panic!("csum item not found at offset {expected_offset:#x}"));
-        assert_eq!(
-            leaf.items[idx].data.len(),
-            csum_size,
-            "expected single-sector csum item at {expected_offset:#x}"
-        );
-        combined_data.extend_from_slice(&leaf.items[idx].data);
-        if i > 0 {
-            keys_to_remove.push(key);
-        }
-    }
-
-    assert_eq!(combined_data.len(), num_sectors * csum_size);
-
-    let first_key = luks_core::fs::btrfs::Key::new(
-        luks_core::fs::btrfs::tree::EXTENT_CSUM_OBJECTID,
-        luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY,
-        start_bytenr,
-    );
-    let first_idx = leaf.find_item(&first_key).expect("first key");
-    leaf.items[first_idx].data = combined_data;
-
-    for k in keys_to_remove {
-        leaf.delete_item(&k).expect("delete subsequent csum key");
-    }
-
-    let emitted = leaf.emit(sb.node_size).expect("emit leaf");
-    drop(fs);
-
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(image_path)
-            .expect("open image for raw write");
-        for phys in physicals {
-            file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
-            file.write_all(&emitted).expect("write emitted node");
-        }
-        file.flush().expect("flush");
-    }
-}
-
 #[test]
 fn test_delete_file_sharing_csum_item_with_adjacent_file() {
     let temp_img = copy_to_temp("plain.img");
@@ -635,3 +537,87 @@ fn test_delete_file_csum_middle_hole_punch() {
 }
 
 
+
+/// The exact defect found on the physical 61.5 GB stick, in fixture form.
+///
+/// On that drive `mkfs.btrfs` had packed the checksums of `/existing/one-block.bin`
+/// (FS_TREE, logical 13631488) and `/home/user/docs/one-block.bin` (subvolume 256,
+/// logical 13635584) into a single 8-byte `EXTENT_CSUM` item keyed at 13631488.
+/// Deleting the subvolume file left an orphan checksum for 13635584..13639680,
+/// which `btrfs check` reported as "there are no extents for csum range".
+///
+/// CSUM_TREE is global, so the freed extent belongs to a subvolume tree while the
+/// checksum item is keyed under a neighbour in FS_TREE. This test reproduces that
+/// straddle in both directions and asserts the surviving neighbour still reads back
+/// intact — an over-trim here would silently strip a live file's checksums.
+#[test]
+fn test_delete_subvolume_file_sharing_packed_csum_with_root_tree_file() {
+    for delete_subvol_side in [true, false] {
+        let temp_img = copy_to_temp("subvol.img");
+        let file_len = fs::metadata(&temp_img).unwrap().len();
+
+        let root_data = vec![0x5Au8; 4096];
+        let subvol_data = vec![0xA5u8; 4096];
+
+        let b_root;
+        let b_subvol;
+        {
+            let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+            let mut fs = Btrfs::mount(dev).expect("mount subvol.img");
+
+            fs.create_file_with_data("/", "root_neighbour.bin", &root_data)
+                .expect("create file in FS_TREE");
+            fs.create_file_with_data("/home", "subvol_neighbour.bin", &subvol_data)
+                .expect("create file in /home subvolume");
+
+            b_root = get_file_disk_bytenr(&fs, "/root_neighbour.bin");
+            b_subvol = get_file_disk_bytenr(&fs, "/home/subvol_neighbour.bin");
+            assert_eq!(
+                b_subvol,
+                b_root + 4096,
+                "vacuity: subvolume file extent must immediately follow the FS_TREE file extent \
+                 for the packed-checksum straddle to be reproducible"
+            );
+        }
+
+        // Fuse the two single-sector checksum items into one packed item, exactly as
+        // the Linux kernel's allocator would have written it.
+        pack_adjacent_csums(&temp_img, b_root, 2);
+
+        {
+            let dev = FileDevice::open(&temp_img).expect("open packed");
+            let fs = Btrfs::mount(dev).expect("mount packed");
+            AccountingOracle::assert_clean(&fs);
+        }
+        assert!(
+            run_verify_script(&temp_img),
+            "kernel check on packed cross-tree initial state failed"
+        );
+
+        // Delete one side; the checksums of the other must survive untouched.
+        let (victim, survivor, survivor_data) = if delete_subvol_side {
+            ("/home/subvol_neighbour.bin", "/root_neighbour.bin", &root_data)
+        } else {
+            ("/root_neighbour.bin", "/home/subvol_neighbour.bin", &subvol_data)
+        };
+
+        {
+            let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
+            let mut fs = Btrfs::mount(dev).expect("mount for delete");
+            fs.delete_file(victim).unwrap_or_else(|e| panic!("delete {victim}: {e}"));
+            assert!(matches!(fs.read_file(victim), Err(LuksError::NotFound(_))));
+            assert_eq!(
+                fs.read_file(survivor).unwrap_or_else(|e| panic!("read {survivor}: {e}")),
+                *survivor_data,
+                "surviving neighbour must read back intact after the packed item was trimmed"
+            );
+            // A-8 catches an orphan checksum left behind; A-9 catches the converse,
+            // a surviving extent whose checksums were trimmed away with the victim's.
+            AccountingOracle::assert_clean(&fs);
+        }
+        assert!(
+            run_verify_script(&temp_img),
+            "kernel check after deleting {victim} from packed cross-tree item failed"
+        );
+    }
+}

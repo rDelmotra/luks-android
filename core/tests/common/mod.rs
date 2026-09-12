@@ -18,6 +18,8 @@ pub mod scratch;
 pub mod accounting;
 #[cfg(feature = "dangerous-write-support")]
 pub mod fs_model;
+#[cfg(feature = "dangerous-write-support")]
+pub mod csum_pack;
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};

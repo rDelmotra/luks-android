@@ -24,6 +24,24 @@
 //! 6. **Invariant A-6 (Allocator Consistency)**: When checked against an active
 //!    `FreeSpaceMap`, asserts that no live extent overlaps with any `FreeRange`
 //!    or `pinned_freed` range held by the allocator.
+//! 7. **Invariant A-7 (Free Space Tree Parity)**: Asserts that `FREE_SPACE_TREE`
+//!    extent/bitmap records agree with the live-extent view of each block group
+//!    and stay within that block group's address range.
+//! 8. **Invariant A-8 (Csum -> Extent)**: Asserts that no two `EXTENT_CSUM` items
+//!    overlap, and that every sector covered by an `EXTENT_CSUM` item has a live
+//!    data extent in the Extent Tree. Catches *orphan* checksums — the failure
+//!    mode of under-trimming on delete/rename.
+//! 9. **Invariant A-9 (Extent -> Csum)**: The converse of A-8. Asserts that every
+//!    live, non-prealloc data extent referenced by a file is *fully* covered by
+//!    `EXTENT_CSUM` items. Catches *over-trimming*, where removing checksums for
+//!    a freed extent also strips a surviving neighbour's checksums out of the
+//!    same packed item. A-8 and A-9 together are the bijection; either alone is
+//!    only one direction.
+//!
+//! Note on A-9 scope: preallocated extents legitimately carry no checksums and
+//! are excluded. `nodatacow`/`nodatasum` inodes would also legitimately have no
+//! checksums; no fixture uses them, so A-9 is deliberately fail-closed there —
+//! it will fire rather than stay silent if such a fixture is ever introduced.
 
 #![allow(dead_code)]
 #![cfg(feature = "dangerous-write-support")]
@@ -153,6 +171,14 @@ pub enum AccountingError {
         first_len: u64,
         second_start: u64,
         second_len: u64,
+    },
+    /// Invariant A-9: A live data extent has a sector with no checksum covering it.
+    CsumMissingForLiveExtent {
+        bytenr: u64,
+        extent_start: u64,
+        extent_len: u64,
+        tree_id: u64,
+        inode: u64,
     },
     /// Underlying filesystem read/corruption error.
     CorruptFs(String),
@@ -328,6 +354,17 @@ impl std::fmt::Display for AccountingError {
                 first_start + first_len,
                 second_start + second_len
             ),
+            Self::CsumMissingForLiveExtent {
+                bytenr,
+                extent_start,
+                extent_len,
+                tree_id,
+                inode,
+            } => write!(
+                f,
+                "Invariant A-9: live data extent [{extent_start:#x}..{:#x}] (tree {tree_id}, inode {inode}) has no checksum covering sector {bytenr:#x}",
+                extent_start + extent_len
+            ),
             Self::CorruptFs(msg) => write!(f, "Filesystem corruption during accounting check: {msg}"),
         }
     }
@@ -379,6 +416,8 @@ struct ReferencedDataExtent {
     tree_id: u64,
     inode: u64,
     file_offset: u64,
+    /// Preallocated extents carry no checksums and are excluded from A-9.
+    is_prealloc: bool,
 }
 
 pub struct AccountingOracle;
@@ -938,6 +977,44 @@ impl AccountingOracle {
             }
         }
 
+        // 11. Invariant A-9: every live non-prealloc data extent is fully covered by checksums.
+        // This is the converse of A-8 and catches over-trimming, where removing the
+        // checksums of a freed extent also strips a surviving neighbour's checksums out
+        // of the same packed EXTENT_CSUM item. csum_items is already sorted by A-8 and
+        // proven non-overlapping, so coverage is a forward sweep over contiguous items.
+        let mut live_extents: Vec<&ReferencedDataExtent> = referenced_data
+            .values()
+            .filter(|d| !d.is_prealloc && d.length > 0)
+            .collect();
+        live_extents.sort_by_key(|d| d.disk_bytenr);
+
+        for ext in live_extents {
+            let start = ext.disk_bytenr;
+            let end = start.saturating_add(ext.length);
+            let mut pos = start;
+            let mut idx = csum_items.partition_point(|&(cs, cl)| cs + cl <= pos);
+
+            while pos < end {
+                let uncovered = match csum_items.get(idx) {
+                    Some(&(cs, cl)) if cs <= pos => {
+                        pos = cs + cl;
+                        idx += 1;
+                        false
+                    }
+                    _ => true,
+                };
+                if uncovered {
+                    return Err(AccountingError::CsumMissingForLiveExtent {
+                        bytenr: pos,
+                        extent_start: start,
+                        extent_len: ext.length,
+                        tree_id: ext.tree_id,
+                        inode: ext.inode,
+                    });
+                }
+            }
+        }
+
         Ok(AccountingReport {
             superblock_bytes_used: sb_bytes_used,
             total_block_group_used: total_bg_used,
@@ -1040,6 +1117,7 @@ impl AccountingOracle {
                                     tree_id,
                                     inode: key.objectid,
                                     file_offset: key.offset,
+                                    is_prealloc: file_ext.kind == ExtentKind::Prealloc,
                                 },
                             );
                         }

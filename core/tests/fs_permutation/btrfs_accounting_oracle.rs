@@ -1267,3 +1267,87 @@ fn test_negative_control_csum_self_overlap() {
 
 
 
+
+/// Negative control for Invariant A-9 (Extent -> Csum).
+///
+/// Simulates the exact failure mode the packed-checksum trimming engine risks:
+/// a surviving data extent loses part of its checksum coverage because an
+/// adjacent extent's removal shrank the shared packed `EXTENT_CSUM` item too far.
+/// Tier C (`btrfs check`) reports this as "some csum missing", but Tier C is only
+/// available where a Linux kernel is; A-9 must catch it in-process.
+#[test]
+fn test_negative_control_csum_missing_for_live_extent() {
+    let scratch = ScratchFixture::new("btrfs/plain.img", "neg_csum_missing");
+    let dev = FileDevice::open(scratch.path()).expect("open fixture");
+    let fs = Btrfs::mount(dev).expect("mount fixture");
+
+    // The unmodified fixture must be clean, or the control proves nothing.
+    AccountingOracle::check(&fs).expect("vacuity: pristine fixture must pass A-9");
+
+    let csum_root = fs
+        .tree_root(luks_core::fs::btrfs::tree::CSUM_TREE_OBJECTID)
+        .expect("csum root");
+    let (phys, _) = fs.chunk_map().map(csum_root.bytenr).expect("csum root phys");
+
+    let node = fs.read_node(csum_root.bytenr).expect("read csum root node");
+    let mut leaf =
+        luks_core::fs::btrfs::write::node::Leaf::from_node(&node, fs.superblock().csum_type)
+            .expect("parse leaf");
+
+    // Find the packed csum item and halve its payload: an over-trim of the tail.
+    let idx = leaf
+        .items
+        .iter()
+        .position(|it| it.key.item_type == luks_core::fs::btrfs::tree::EXTENT_CSUM_KEY)
+        .expect("vacuity: fixture must contain an EXTENT_CSUM item");
+    let item_start = leaf.items[idx].key.offset;
+    let orig_len = leaf.items[idx].data.len();
+    assert!(
+        orig_len >= 8,
+        "vacuity: csum item must be packed (multi-sector), got {orig_len} bytes"
+    );
+    let kept = orig_len / 2;
+    leaf.items[idx].data.truncate(kept);
+
+    let csum_size = fs.superblock().csum_type.size();
+    let sector_size = fs.superblock().sector_size as u64;
+    let expected_uncovered = item_start + (kept / csum_size) as u64 * sector_size;
+
+    let emitted = leaf.emit(fs.superblock().node_size).expect("emit leaf");
+    drop(fs);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(scratch.path())
+            .expect("open scratch for write");
+        file.seek(SeekFrom::Start(phys)).expect("seek to node phys");
+        file.write_all(&emitted).expect("write emitted node");
+        file.flush().expect("flush");
+    }
+
+    let dev = FileDevice::open(scratch.path()).expect("open corrupted");
+    let fs = Btrfs::mount(dev).expect("mount corrupted");
+
+    match AccountingOracle::check(&fs) {
+        Err(AccountingError::CsumMissingForLiveExtent {
+            bytenr,
+            extent_start,
+            extent_len,
+            tree_id,
+            inode,
+        }) => {
+            println!(
+                "Negative control passed: detected CsumMissingForLiveExtent at {bytenr:#x} \
+                 (extent [{extent_start:#x}..{:#x}], tree {tree_id}, inode {inode})",
+                extent_start + extent_len
+            );
+            assert_eq!(
+                bytenr, expected_uncovered,
+                "A-9 must report the first sector left without checksum coverage"
+            );
+        }
+        other => panic!("expected Err(AccountingError::CsumMissingForLiveExtent), got: {other:?}"),
+    }
+}

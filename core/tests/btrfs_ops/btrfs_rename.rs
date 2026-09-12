@@ -22,6 +22,7 @@ use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
 use common::accounting::AccountingOracle;
+use common::csum_pack::{get_file_disk_bytenr, pack_adjacent_csums};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -296,5 +297,75 @@ fn rename_on_mixed_4k_img() {
     }
 
     assert!(run_verify_script(&img), "oracle check passed for mixed-4k");
+    let _ = fs::remove_file(&img);
+}
+
+/// Rename-with-overwrite frees the destination's data extents, so it runs the
+/// same packed-checksum trimming path as delete. `csum_delete::delete_extent_csums`
+/// was wired into both `delete.rs` and `rename.rs`, but only the delete side had
+/// coverage for packed items — this closes the rename side.
+///
+/// A-8 catches an orphan checksum left behind for the overwritten file; A-9
+/// catches the converse, the neighbour losing its checksums along with the victim.
+#[test]
+fn rename_overwrite_trims_packed_csum_without_touching_neighbour() {
+    let img = copy_to_temp("plain.img");
+    let file_len = fs::metadata(&img).unwrap().len();
+
+    let neighbour_data = vec![0x7Eu8; 4096];
+    let victim_data = vec![0x3Cu8; 4096];
+    let source_data = vec![0x1Fu8; 4096];
+
+    let b_neighbour;
+    {
+        let dev = FileDevice::open_writable(&img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount writable");
+
+        fs.create_file_with_data("/", "neighbour.bin", &neighbour_data)
+            .expect("create neighbour");
+        fs.create_file_with_data("/", "victim.bin", &victim_data)
+            .expect("create victim");
+        fs.create_file_with_data("/", "source.bin", &source_data)
+            .expect("create source");
+
+        b_neighbour = get_file_disk_bytenr(&fs, "/neighbour.bin");
+        let b_victim = get_file_disk_bytenr(&fs, "/victim.bin");
+        assert_eq!(
+            b_victim,
+            b_neighbour + 4096,
+            "vacuity: victim extent must immediately follow neighbour for packing to apply"
+        );
+    }
+
+    // Fuse neighbour + victim checksums into one packed item keyed at the neighbour.
+    pack_adjacent_csums(&img, b_neighbour, 2);
+
+    {
+        let dev = FileDevice::open_writable(&img, file_len).expect("open writable");
+        let mut fs = Btrfs::mount(dev).expect("mount for rename");
+
+        // Overwriting victim.bin frees its extent; its checksums live in the
+        // second half of an item keyed at the neighbour's address.
+        fs.rename("/", "source.bin", "/", "victim.bin")
+            .expect("rename source.bin over victim.bin");
+
+        assert!(fs.read_file("/source.bin").is_err());
+        assert_eq!(
+            fs.read_file("/victim.bin").expect("read replaced victim"),
+            source_data
+        );
+        assert_eq!(
+            fs.read_file("/neighbour.bin").expect("read neighbour"),
+            neighbour_data,
+            "neighbour must survive the packed-item trim intact"
+        );
+
+        AccountingOracle::assert_clean(&fs);
+    }
+
+    assert!(
+        run_verify_script(&img),
+        "kernel check after packed-csum rename overwrite failed"
+    );
     let _ = fs::remove_file(&img);
 }
