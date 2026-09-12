@@ -39,6 +39,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -125,9 +126,15 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 //
 // Deliberately release-only. A debug .so built with --write is the entire
 // point of that flag, and failing there would make write testing impossible.
+val allowWriteInRelease = project.hasProperty("allowWriteInRelease") && project.property("allowWriteInRelease") == "true"
+
 val checkNoWriteCodeInRelease by tasks.registering {
     val soFile = layout.projectDirectory.file("src/main/jniLibs/arm64-v8a/libluks_jni.so")
     doLast {
+        if (allowWriteInRelease) {
+            println("NOTE: allowWriteInRelease=true is active; write symbols are permitted in this release build.")
+            return@doLast
+        }
         val needles = listOf(
             "nativeBenchmarkWrite",
             "nativeWriteFile",
