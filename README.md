@@ -38,25 +38,28 @@ Traditional solutions require rooting the Android device, installing custom kern
 
 ## Quickstart
 
-**[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `luks-android-v0.1.0-arm64.apk` directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
+**[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `app-release.apk` (v0.2.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
 
 > [!NOTE]
-> The `v0.1.0` release APK is **read-only** (browse and export only) — release builds are compiled with write code stripped out by default, by design. Btrfs/ext4 write support exists on `main` but hasn't shipped in a tagged release yet. See [Feature Support Matrix](doc/architecture.md#feature-support-matrix) for exact per-feature status, and [Security & Safety](#security--safety) for why release builds ship this way.
+> The `v0.2.0` release introduces **full write support** (file creation, directory CRUD, rename, delete) across ext4, single-device Btrfs, and Btrfs subvolumes, plus **plain (unencrypted) partition support** with an explicit per-session confirmation gate.
+
+> [!WARNING]
+> **Write at your own risk.** Writing directly to raw block storage from unprivileged userspace over mobile USB OTG carries inherent physical risk. While this engine is verified against Linux kernel oracles and enforces fail-closed write fencing, real-world hardware disruptions (unstable OTG adapters, loose USB-C cables, surprise disconnections, or drive controllers rejecting cache flush) can interrupt in-flight transactions. **Always maintain verified backups of critical data before performing write operations.**
 
 | Target | Artifact | Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Android Release (Recommended)** | [`luks-android-v0.1.0-arm64.apk`](https://github.com/rDelmotra/luks-android/releases/latest) | `~3.5 MB` | Prebuilt, ready to install |
+| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/luks-android/releases/latest) | `~4.1 MB` | Prebuilt, signed v2/v3, ready to install |
 | **Android Debug** *(build from source)* | `app-debug.apk` | `~31 MB` | For development and live diagnostics |
 | **Native Core (Rust crate)** | `luks_core` / `luks_jni` | `< 2 MB` | Use the engine standalone via Rust or JNI |
 
 ### Install via ADB
 
 ```bash
-# Download luks-android-v0.1.0-arm64.apk from the Releases page above, then:
-adb install -r luks-android-v0.1.0-arm64.apk
+# Download app-release.apk from the Releases page above, then:
+adb install -r app-release.apk
 
 # Or, after building the release APK from source yourself (see below):
-adb install -r android/app/build/outputs/apk/release/app-release-unsigned.apk
+adb install -r android/app/build/outputs/apk/release/app-release.apk
 ```
 
 > [!TIP]
@@ -78,12 +81,14 @@ adb install -r android/app/build/outputs/apk/release/app-release-unsigned.apk
 - **Rootless operation.** Runs entirely in unprivileged userspace using Android's USB Host APIs. No root access, unlocked bootloaders, or custom ROMs required.
 - **LUKS2 container cryptography.** Full support for Argon2id and PBKDF2 key derivation functions with AES-256-XTS ciphers, hardware-accelerated via ARMv8 crypto extensions (`pmull`, `aes`).
 - **Memory security and key zeroization.** Master keys, subkeys, and expanded cipher schedules implement `Zeroize` and `ZeroizeOnDrop`, purging sensitive material from memory immediately upon exit.
-- **Btrfs filesystem engine.** Complete B-tree Copy-on-Write (CoW) mutation engine, live Castagnoli CRC32c checksum calculations, dynamic multi-gigabyte chunk allocation, and subvolume navigation.
+- **Btrfs filesystem engine.** Complete B-tree Copy-on-Write (CoW) mutation engine, live Castagnoli CRC32c checksum calculations, dynamic multi-gigabyte chunk allocation, and Free-Space Tree (FST) CoW management.
+- **Btrfs subvolume write support.** First-class write transactions directly targeting subvolumes (`@`, `@home`, snapshots) via single-tree encapsulation, extent backrefs, and packed checksum trimming.
+- **Plain (non-LUKS) volume support.** Open, browse, and write to unencrypted ext4 and Btrfs drives with hardened 7-point superblock detection and explicit per-session write confirmation.
 - **Transparent decompression.** Reads compressed Btrfs extents on-the-fly supporting Zstandard (zstd), LZO, and Zlib algorithms.
-- **ext4 filesystem engine.** Extent tree traversals, directory hash-tree indexing, and block group bitmap allocations, validated against reference Linux `e2fsck`.
+- **ext4 filesystem engine.** Extent tree traversals, directory hash-tree indexing, block group bitmap allocations, and file creation/deletion validated against reference Linux `e2fsck`.
 - **SCSI Bulk-Only Transport (BOT).** Custom userspace USBFS engine driving 128 KiB chunked SCSI transfers with a non-blocking URB arena and generational drain recovery.
 - **Fail-closed safety model.** Release builds enforce compile-time write gating (`dangerous-write-support`). Any transport stall, cable disconnect, or corruption fences the session instantly.
-- **Lightweight footprint.** Complete Android application is under 3.5 MB, with no bloated third-party UI libraries.
+- **Lightweight footprint.** Complete Android application is ~4.1 MB, with ProGuard/R8 code and resource shrinking.
 - **In-memory forensic ring buffer.** A 256-slot non-allocating circular ring buffer records hardware events, SCSI CDBs, sense codes, and filesystem operations with zero plaintext leakage.
 
 Full system architecture, hardware benchmarks, and the per-feature read/write support matrix are in [doc/architecture.md](doc/architecture.md).
@@ -107,7 +112,7 @@ The cryptographic and filesystem engine compiles to an arm64 shared library:
 # Safe, Read-Only Default Build
 ./tools/build-android-libs.sh
 
-# Write-Enabled Testing Build
+# Write-Enabled Testing Build (opt-level 3, LTO, stripped)
 ./tools/build-android-libs.sh --write
 ```
 
@@ -116,9 +121,9 @@ The cryptographic and filesystem engine compiles to an arm64 shared library:
 ```bash
 cd android
 
-# Production Release Build (~3.5 MB, R8-optimized)
-./gradlew assembleRelease
-# Output: app/build/outputs/apk/release/app-release-unsigned.apk
+# Production Release Build (R8-optimized, requires -PallowWriteInRelease=true if native write is enabled)
+./gradlew assembleRelease -PallowWriteInRelease=true
+# Output: app/build/outputs/apk/release/app-release.apk
 
 # Debug Build (Fast local compilation with debug tracing)
 ./gradlew assembleDebug

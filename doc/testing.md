@@ -43,13 +43,20 @@ tools/test-graded.sh --workspace --features luks_core/dangerous-write-support,lu
 ### 4. Write-Path Safety Gate
 Verifies that release builds contain zero write symbols or entry points:
 ```bash
+# Standalone ELF symbol and entry-point check
 bash tools/verify-no-write-code.sh
+```
+
+In Android builds, Gradle enforces this at build time via the `checkNoWriteCodeInRelease` task. If write-enabled native libraries (`libluks_jni.so`) are present when assembling a release APK, Gradle will fail closed. To deliberately produce a write-enabled release build (as in `v0.2.0`):
+```bash
+cd android && ./gradlew assembleRelease -PallowWriteInRelease=true
 ```
 
 ### 5. Android Unit Tests
 ```bash
 cd android && ./gradlew testDebugUnitTest
 ```
+Currently 221 unit tests passing, covering session lifecycle, device state, plain volume write consent, breadcrumbs, and error handling.
 
 ---
 
